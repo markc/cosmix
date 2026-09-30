@@ -149,7 +149,7 @@ fn initial($root, $templates, $host, $me, $io)
       fail("SCENES_GENERATION", "invalid generation counter", {})
     end
   end
-  return {root:$root, templates:$templates, host:$host, me:$me, io:$io,
+  return {root:$root, root_handle:dir_open($root), templates:$templates, host:$host, me:$me, io:$io,
     desired:{schema_version:1, enabled:[], origins:{}, recovery:{}}, state_digest:"",
     state_ok:true, state_error:nil,
     scenes:{editor:editor_entry($templates)}, retiring:{}, panels:{}, panel_revision:0, panel_generation:nil, open:nil,
@@ -1102,9 +1102,9 @@ fn recovery_move($s, $from, $to)
     fail("SCENES_FILES", "recovery source must be a real directory", {file:$from})
   end
   if exists($to, {follow_symlinks:false}) then fail("SCENES_COLLISION", "recovery destination exists", {file:$to}) end
-  -- rename itself does not follow either final component. Parent checks
-  -- above reject existing aliases; Mix has no dirfd-relative rename yet.
-  rename($from, $to)
+  -- The kernel resolves parents under the retained root and atomically
+  -- refuses overwrite, escaping parents and a raced final symlink.
+  dir_rename($s.root_handle, substr($from, len($s.root) + 1), substr($to, len($s.root) + 1))
 end
 
 -- Swap a validated stage into $to, keeping the original at $backup, with a

@@ -1,6 +1,6 @@
 # Builtin index
 
-Every Mix builtin grouped by category, generated from `mix builtins` (mix 0.105.1). See the linked topical page for prose and examples; `mix what NAME` prints a one-line description of any single builtin (or keyword), and `mix help` prints the compact names-only summary of the same ten categories.
+Every Mix builtin grouped by category, generated from `mix builtins` (mix 0.108.0). See the linked topical page for prose and examples; `mix what NAME` prints a one-line description of any single builtin (or keyword), and `mix help` prints the compact names-only summary of the same ten categories.
 
 Some builtins are feature-gated on the `cosmix-lib-mix` crate (`json`, `regex`, `toml`, `yaml`, `datetime`, `url`, `crypto`, `http`, `sqlite`, `dkim`, `markdown`, `datastar`, `xml`) so embedders can pull only what they need — the `mix` binary turns them all on.
 
@@ -198,6 +198,9 @@ Since 0.29.0 every builtin carries a structured contract — per-argument names/
   fs_watch        Register Linux inotify watch; returns evaluator-owned opaque handle. Delivers fs.changed via $event.args; bounded, overflow requires rescan; no polling fallback
   fs_unwatch      Cancel watch and pending changes; wake fs_wait with FS_WATCH_CANCELLED
   fs_wait         Suspend until a filesystem batch; cancellation-safe; refused in serve and expression modes
+  dir_open        Open a retained native directory root; evaluator-owned numeric handle. Refuses symlink components. Linux openat2 required; no fallback (v0.108.0)
+  dir_rename      Move a regular file or directory between relative paths beneath a retained root, atomically refusing overwrite. Landlock ABI 2 and erratum 3 required. Refuses symlink sources and escaping parents. Root pathname checked before operation; retained inode remains the containment boundary during concurrent root moves (v0.108.0)
+  dir_close       Close an evaluator-owned retained directory root; invalid or closed handles raise (v0.108.0)
   read_file_bytes Read file contents as raw bytes. Optional 2nd arg caps the read: read_file_bytes(path, 8192) reads at most 8192 bytes (header-sniffing without slurping a huge file) (v0.3.1; cap v0.17.1)
   read_lines      Read file as a list of lines (trailing newline stripped, empty last line dropped) (v0.2.3)
   load_data       Read + parse a strict-data .mix file (bare-key `k: v`, the zones.mix/conf.mix form) into a Value — the non-executing twin of source/include, for substrate-internal data that must NOT run as code (v0.9.0)

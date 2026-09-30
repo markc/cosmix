@@ -1513,6 +1513,47 @@ if $r.rc != 0 then
 end
 ```
 
+## Retained directory roots (0.108.0)
+
+`dir_open(path)` retains a native root directory and returns a numeric handle
+owned by the evaluator. `dir_rename(handle, source, destination)` moves a
+regular file or directory between relative names beneath that root, atomically
+refusing an existing destination. `dir_close(handle)` closes it; evaluator
+retirement also closes remaining handles.
+
+```mix
+$root = dir_open("/srv/scenes")
+try
+  dir_rename($root, "panel", ".recovery/panel-backup")
+finally
+  dir_close($root)
+end
+```
+
+The destination parent must already exist. Absolute operands, dot or dotdot
+components, empty components, backslashes and control characters are refused.
+Root and parent resolution follows no symlinks or magic links; parents cannot
+cross mounts. A final symlink or special source is refused, including a source
+swapped after the initial type check. A parent moved outside the retained root
+is denied by the kernel at rename time.
+
+This requires Linux `openat2`, `renameat2` and Landlock ABI 2 with the
+[disconnected-directory erratum 3 fix](https://docs.kernel.org/userspace-api/landlock.html#landlock-errata).
+Unsupported kernels raise `DIR_UNSUPPORTED`; there is no unrestricted fallback.
+Each rename confines a fresh worker thread; it does not confine the evaluator's
+other threads. Opening and closing require FsRead; renaming requires FsWrite.
+
+A root replaced at its original pathname before an operation raises
+`DIR_ROOT_REPLACED`. That pathname check is not atomic with rename: if the root
+itself moves afterwards, containment remains anchored to its retained inode.
+The API does not promise that the original pathname remains unchanged, nor
+does it confine other path-based filesystem builtins.
+
+Other structured failures are `DIR_INVALID_HANDLE`, `DIR_INVALID_PATH`,
+`DIR_OPEN_FAILED` and `DIR_RENAME_FAILED`. Existing destinations are never
+overwritten, including dangling symlinks. Handles are local to their evaluator;
+closing an unknown or already closed handle raises.
+
 ## See also
 
 ```

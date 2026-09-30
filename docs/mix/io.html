@@ -1654,6 +1654,39 @@ if $r.rc != 0 then
   print("install failed: " .. $r.stderr)
 end
 </code></pre>
+<h2 id="retained-directory-roots-01080">Retained directory roots (0.108.0)</h2>
+<p><code>dir_open(path)</code> retains a native root directory and returns a numeric handle
+owned by the evaluator. <code>dir_rename(handle, source, destination)</code> moves a
+regular file or directory between relative names beneath that root, atomically
+refusing an existing destination. <code>dir_close(handle)</code> closes it; evaluator
+retirement also closes remaining handles.</p>
+<pre><code class="language-mix">$root = dir_open("/srv/scenes")
+try
+  dir_rename($root, "panel", ".recovery/panel-backup")
+finally
+  dir_close($root)
+end
+</code></pre>
+<p>The destination parent must already exist. Absolute operands, dot or dotdot
+components, empty components, backslashes and control characters are refused.
+Root and parent resolution follows no symlinks or magic links; parents cannot
+cross mounts. A final symlink or special source is refused, including a source
+swapped after the initial type check. A parent moved outside the retained root
+is denied by the kernel at rename time.</p>
+<p>This requires Linux <code>openat2</code>, <code>renameat2</code> and Landlock ABI 2 with the
+<a href="https://docs.kernel.org/userspace-api/landlock.html#landlock-errata">disconnected-directory erratum 3 fix</a>.
+Unsupported kernels raise <code>DIR_UNSUPPORTED</code>; there is no unrestricted fallback.
+Each rename confines a fresh worker thread; it does not confine the evaluator's
+other threads. Opening and closing require FsRead; renaming requires FsWrite.</p>
+<p>A root replaced at its original pathname before an operation raises
+<code>DIR_ROOT_REPLACED</code>. That pathname check is not atomic with rename: if the root
+itself moves afterwards, containment remains anchored to its retained inode.
+The API does not promise that the original pathname remains unchanged, nor
+does it confine other path-based filesystem builtins.</p>
+<p>Other structured failures are <code>DIR_INVALID_HANDLE</code>, <code>DIR_INVALID_PATH</code>,
+<code>DIR_OPEN_FAILED</code> and <code>DIR_RENAME_FAILED</code>. Existing destinations are never
+overwritten, including dangling symlinks. Handles are local to their evaluator;
+closing an unknown or already closed handle raises.</p>
 <h2 id="see-also">See also</h2>
 <pre><code>mix builtins io       list every io builtin with its one-line description
 mix what NAME         one-line description of a single builtin (e.g. mix what stat)

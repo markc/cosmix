@@ -2969,6 +2969,9 @@ pub(crate) const INLINE_SPECIAL_FORMS: &[&str] = &[
     "fs_watch",
     "fs_unwatch",
     "fs_wait",
+    "dir_open",
+    "dir_rename",
+    "dir_close",
     "net_watch",
     "net_unwatch",
     "net_state",
@@ -3112,6 +3115,9 @@ impl Drop for ExprDepthGuard {
 pub const EXPR_MODE_DENIED_BUILTINS: &[&str] = &[
     "task_start",
     "fs_wait",
+    "dir_open",
+    "dir_rename",
+    "dir_close",
     // Native desktop sources: threads, sockets and child processes owned by
     // the evaluator generation, and bounded waits on host daemons.
     "net_watch",
@@ -3634,6 +3640,1299 @@ fn expr_mode_depth_error() -> MixError {
     }
 }
 
+// === Retained-root directory recovery primitives ===
+//
+// Backs the dir_open / dir_rename / dir_close builtins (registry + dispatch
+// are wired by the coordinator; the Rust surface here is complete and fully
+// tested). Contract summary — everything below is enforced natively:
+//
+// * dir_open pins the root as an O_PATH|O_DIRECTORY descriptor resolved
+//   once through openat2(RESOLVE_NO_SYMLINKS|RESOLVE_NO_MAGICLINKS). The
+//   security domain is that RETAINED INODE, not its pathname.
+// * Root opening refuses any symlink path component, non-directories,
+//   NUL/dot/dotdot/empty path components, and non-Linux kernels
+//   explicitly — there is no path-based fallback anywhere.
+// * Every dir_rename re-verifies root identity (nlink > 0 plus
+//   re-resolution of the original absolute pathname to the SAME (dev, ino))
+//   BEFORE any effect, so an already-replaced or unlinked root is refused
+//   (DIR_ROOT_REPLACED). This check is deliberately not atomic with the
+//   rename itself: a hostile same-user writer can still rename the root
+//   AFTER the check; the operation then remains contained in the retained
+//   original root, but the original pathname cannot be re-verified
+//   atomically (no ABA claim).
+// * Operands are root-relative; absolute paths, dot/dotdot, NUL, empty
+//   components, backslashes and control characters are refused
+//   (DIR_INVALID_PATH) before any resolution.
+// * Both parents resolve beneath the retained root with
+//   openat2(RESOLVE_BENEATH|NO_SYMLINKS|NO_MAGICLINKS|NO_XDEV) and are
+//   fstat-checked as directories; the final source must be a regular file
+//   or directory (advisory precheck via fstatat(AT_SYMLINK_NOFOLLOW)).
+// * The rename itself runs on a FRESH std::thread per operation (never a
+//   reusable Tokio worker) that sets no_new_privs, builds a Landlock
+//   ruleset anchored on the retained root fd, and restricts only that
+//   thread. Handled rights: all ABI-1 filesystem bits plus REFER
+//   (ABI >= 2). Granted rights: ONLY REFER, REMOVE_FILE, REMOVE_DIR,
+//   MAKE_REG, MAKE_DIR — explicitly never MAKE_SYM/FIFO/SOCK/CHAR/BLOCK.
+//   The kernel's own rename-time locked check therefore denies a final
+//   source swapped to a symlink or other type, and denies parents that a
+//   sibling moved outside the anchored root (EACCES). renameat2 always
+//   uses RENAME_NOREPLACE, so an occupied destination is never
+//   overwritten. Any policy-setup failure aborts BEFORE any rename; there
+//   is no unrestricted rename after a setup failure and no fallback.
+// * Landlock ABI >= 2 and the queried erratum-3 fix are mandatory.
+//   An unavailable query or missing fix refuses explicitly; ABI numbers
+//   alone do not prove the fix. The query returns an integer, never an fd.
+//
+// Capability classes (declared at the builtin table, the single source of
+// truth for the capability gate): dir_open = FsRead, dir_rename = FsWrite,
+// dir_close = FsRead — the read class is required before the open runs and
+// the write class before the rename runs; neither class alone authorises a
+// move.
+
+mod dirroot {
+    //! Native retained-root directory primitives (Linux openat2 /
+    //! renameat2 / Landlock). See the module-level comment above for the
+    //! full contract, and the `DirRoot` methods for the enforcement
+    //! order. Handles are owned by [`DirHandles`](super::DirHandles), the
+    //! evaluator-local registry: dropping the evaluator closes every
+    //! retained root, and no evaluator can resolve another's handles.
+    //!
+    //! Tests inject pauses with `BARRIERS` and force syscall failures with
+    //! the `FORCE_*` statics; all of them are `#[cfg(test)]`-only, so the
+    //! production code path is identical to the untested build.
+
+    #[cfg(target_os = "linux")]
+    use std::ffi::CString;
+    use std::io;
+    #[cfg(target_os = "linux")]
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+    #[cfg(target_os = "linux")]
+    use std::os::unix::ffi::OsStrExt;
+    #[cfg(target_os = "linux")]
+    use std::path::{Path, PathBuf};
+
+    // openat2 RESOLVE_* bits (linux/openat2.h).
+    #[cfg(target_os = "linux")]
+    const NO_MAGICLINKS: u64 = 0x02;
+    #[cfg(target_os = "linux")]
+    const NO_SYMLINKS: u64 = 0x04;
+    #[cfg(target_os = "linux")]
+    const BENEATH: u64 = 0x08;
+    #[cfg(target_os = "linux")]
+    const NO_XDEV: u64 = 0x01;
+
+    // Landlock filesystem rights (linux/landlock.h access_mask_t bits).
+    #[cfg(target_os = "linux")]
+    const LL_REMOVE_DIR: u64 = 1 << 4;
+    #[cfg(target_os = "linux")]
+    const LL_REMOVE_FILE: u64 = 1 << 5;
+    #[cfg(target_os = "linux")]
+    const LL_MAKE_DIR: u64 = 1 << 7;
+    #[cfg(target_os = "linux")]
+    const LL_MAKE_REG: u64 = 1 << 8;
+    #[cfg(target_os = "linux")]
+    const LL_REFER: u64 = 1 << 13;
+    /// Handled: every ABI-1 filesystem right (bits 0..=12) plus REFER
+    /// (ABI 2, bit 13). Rights that are handled but not granted are
+    /// denied by the kernel inside the worker thread — this is exactly how
+    /// MAKE_SYM/FIFO/SOCK/CHAR/BLOCK stay refused without being granted.
+    #[cfg(target_os = "linux")]
+    const LL_HANDLED: u64 = ((1 << 13) - 1) | LL_REFER;
+    /// Granted on the retained root for the duration of ONE rename: what a
+    /// RENAME_NOREPLACE regular-file/directory move needs and nothing
+    /// more. The kernel's locked rename-time check needs MAKE_REG or
+    /// MAKE_DIR (matching the actual source type) on the destination
+    /// parent plus REFER; a source swapped to a symlink therefore asks for
+    /// the missing MAKE_SYM and is denied with EACCES.
+    #[cfg(target_os = "linux")]
+    const LL_GRANTED: u64 = LL_REFER | LL_REMOVE_FILE | LL_REMOVE_DIR | LL_MAKE_REG | LL_MAKE_DIR;
+    #[cfg(target_os = "linux")]
+    const SYS_LANDLOCK_CREATE_RULESET: libc::c_long = libc::SYS_landlock_create_ruleset;
+    #[cfg(target_os = "linux")]
+    const SYS_LANDLOCK_ADD_RULE: libc::c_long = libc::SYS_landlock_add_rule;
+    #[cfg(target_os = "linux")]
+    const SYS_LANDLOCK_RESTRICT_SELF: libc::c_long = libc::SYS_landlock_restrict_self;
+    #[cfg(target_os = "linux")]
+    const LL_CREATE_RULESET_VERSION: u32 = 1;
+    #[cfg(target_os = "linux")]
+    const LL_RULE_PATH_BENEATH: u64 = 1;
+    #[cfg(target_os = "linux")]
+    const LL_CREATE_RULESET_ERRATA: u32 = 2;
+    #[cfg(target_os = "linux")]
+    const LL_ERRATUM_DISCONNECTED: u32 = 1 << 2;
+    #[cfg(target_os = "linux")]
+    const LL_MIN_ABI: u32 = 2;
+
+    /// A retained root: the pinned directory descriptor plus enough
+    /// identity to detect a root that was replaced at its original path
+    /// before an operation.
+    #[derive(Debug)]
+    pub(crate) struct DirRoot {
+        #[cfg(target_os = "linux")]
+        root: OwnedFd,
+        #[cfg(target_os = "linux")]
+        path: PathBuf,
+        #[cfg(target_os = "linux")]
+        ident: (u64, u64),
+        #[cfg(not(target_os = "linux"))]
+        _unsupported: (),
+    }
+
+    impl DirRoot {
+        /// Open a retained root. Refuses (explicitly, no fallback):
+        /// non-Linux kernels, symlink path components, non-directories,
+        /// missing paths, and paths with dot/dotdot/empty components,
+        /// NUL bytes, backslashes or control characters.
+        pub(crate) fn open(path: &str) -> io::Result<Self> {
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = path;
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "dir_open requires Linux openat2/renameat2/Landlock",
+                ));
+            }
+            #[cfg(target_os = "linux")]
+            {
+                if path.is_empty()
+                    || path.len() > 4096
+                    || path.contains('\\')
+                    || path.chars().any(char::is_control)
+                    || path.bytes().any(|b| b == 0)
+                {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid root path"));
+                }
+                let original = Path::new(path);
+                let mut past_first_component = false;
+                for component in path.split('/') {
+                    if component == "." || component == ".." {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "root path must not contain . or .. components",
+                        ));
+                    }
+                    if component.is_empty() {
+                        if past_first_component {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "root path must not contain empty components",
+                            ));
+                        }
+                    } else {
+                        past_first_component = true;
+                    }
+                }
+                // Store the ABSOLUTE original pathname for the identity
+                // re-check; the input is already free of dot/dotdot/empty
+                // components, so the join needs no normalisation.
+                let absolute = if original.is_absolute() {
+                    original.to_path_buf()
+                } else {
+                    std::env::current_dir()
+                        .map_err(|e| {
+                            io::Error::other(format!("cannot resolve working directory: {e}"))
+                        })?
+                        .join(original)
+                };
+                let root = open_at(
+                    libc::AT_FDCWD,
+                    absolute.as_os_str().as_bytes(),
+                    libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                    NO_SYMLINKS | NO_MAGICLINKS,
+                )
+                .map_err(|e| {
+                    if e.raw_os_error() == Some(libc::ELOOP) {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("root path contains a symlink component (refused): {e}"),
+                        )
+                    } else {
+                        e
+                    }
+                })?;
+                let stat = fstat_directory(&root)?;
+                Ok(Self {
+                    root,
+                    path: absolute,
+                    ident: (stat.st_dev, stat.st_ino),
+                })
+            }
+        }
+
+        /// Rename `source` to `destination` beneath the retained root.
+        /// See the module comment for the enforcement order; every
+        /// failure here happens before or instead of the rename.
+        pub(crate) fn rename(&self, source: &str, destination: &str) -> io::Result<()> {
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (source, destination);
+                return Err(io::Error::new(io::ErrorKind::Unsupported, "dir_rename requires Linux"));
+            }
+            #[cfg(target_os = "linux")]
+            {
+                validate_relative(source)?;
+                validate_relative(destination)?;
+                self.check_root_intact()?;
+                let (source_parent_relative, source_base) = split_operand(source);
+                let (destination_parent_relative, destination_base) = split_operand(destination);
+                // Resolve both parents beneath the RETAINED root: no
+                // symlink, no magic link, no mount escape, no escape above
+                // the root. The renameat2 later uses exactly these
+                // descriptors.
+                let source_parent = open_parent(&self.root, source_parent_relative)?;
+                let destination_parent = open_parent(&self.root, destination_parent_relative)?;
+                // Advisory precheck of the final source type. Not
+                // authoritative against a racing writer — the worker's
+                // Landlock grant is: MAKE_SYM/FIFO/SOCK/CHAR/BLOCK are not
+                // granted, so the kernel refuses at its own locked
+                // rename-time check if the final source was swapped to a
+                // symlink or any other non-regular-file/non-directory type.
+                check_final_source_type(&source_parent, source_base)?;
+                let source_base = CString::new(source_base).map_err(io::Error::other)?;
+                let destination_base = CString::new(destination_base).map_err(io::Error::other)?;
+                let root_fd = self.root.as_raw_fd();
+                let source_parent_fd = source_parent.as_raw_fd();
+                let destination_parent_fd = destination_parent.as_raw_fd();
+                #[cfg(test)]
+                pause_before_worker();
+                // SAFETY: every descriptor is owned by a value this frame
+                // keeps alive across the join (self.root plus the two
+                // parent handles). The worker only reads them, and the two
+                // CStrings are moved in and outlive the worker body. A
+                // fresh thread per rename is load-bearing: Landlock cannot
+                // be lifted, so reusing a worker would permanently
+                // sandbox it.
+                let worker = std::thread::Builder::new()
+                    .name("mix-dir-rename".into())
+                    .spawn(move || -> io::Result<()> {
+                        setup_worker_policy(root_fd)?;
+                        #[cfg(test)]
+                        pause_before_rename();
+                        renameat2_noreplace(
+                            source_parent_fd,
+                            &source_base,
+                            destination_parent_fd,
+                            &destination_base,
+                        )
+                    })?;
+                match worker.join() {
+                    Ok(result) => result,
+                    Err(_) => Err(io::Error::other("dir_rename worker panicked")),
+                }
+            }
+        }
+
+        /// Fail closed unless the retained root still (a) has link count
+        /// and (b) is the SAME inode that now resolves at the captured
+        /// original absolute pathname. This catches roots replaced or
+        /// unlinked BEFORE the operation; a writer can still move the
+        /// root after this check passes, which the module docs treat as
+        /// the documented residual.
+        #[cfg(target_os = "linux")]
+        fn check_root_intact(&self) -> io::Result<()> {
+            let stat = fstat_directory(&self.root)?;
+            if stat.st_nlink == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "root directory has been unlinked",
+                ));
+            }
+            let current = match open_at(
+                libc::AT_FDCWD,
+                self.path.as_os_str().as_bytes(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                NO_SYMLINKS | NO_MAGICLINKS,
+            ) {
+                Ok(handle) => handle,
+                Err(e) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!("root is no longer resolvable at its original path: {e}"),
+                    ))
+                }
+            };
+            let current_stat = fstat_directory(&current)?;
+            if (current_stat.st_dev, current_stat.st_ino) != self.ident {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "root was replaced at its original path",
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    /// Reject absolute operands and any dot/dotdot/empty component, NUL,
+    /// backslash or control character, before any resolution.
+    #[cfg(target_os = "linux")]
+    fn validate_relative(operand: &str) -> io::Result<()> {
+        if operand.is_empty()
+            || operand.len() > 4096
+            || operand.contains('\\')
+            || operand.starts_with('/')
+            || operand.chars().any(char::is_control)
+            || operand.bytes().any(|b| b == 0)
+            || operand.split('/').any(|c| c.is_empty() || c == "." || c == "..")
+        {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "unsafe relative path operand"));
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn split_operand(operand: &str) -> (Option<&str>, &str) {
+        match operand.rfind('/') {
+            Some(index) => (Some(&operand[..index]), &operand[index + 1..]),
+            None => (None, operand),
+        }
+    }
+
+    /// Resolve one parent directory beneath the retained root. The
+    /// root itself is handled by duplicating the pinned descriptor —
+    /// openat2 rejects an empty pathname.
+    #[cfg(target_os = "linux")]
+    fn open_parent(root: &OwnedFd, relative: Option<&str>) -> io::Result<OwnedFd> {
+        match relative {
+            None | Some("") => {
+                // SAFETY: duplicating a live owned descriptor; the copy is
+                // fresh and owned exactly once.
+                let duplicated = unsafe { libc::fcntl(root.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+                if duplicated < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                // SAFETY: successful fcntl returned a fresh descriptor.
+                let duplicated = unsafe { OwnedFd::from_raw_fd(duplicated) };
+                fstat_directory(&duplicated)?;
+                Ok(duplicated)
+            }
+            Some(relative) => {
+                let parent = open_at(
+                    root.as_raw_fd(),
+                    relative.as_bytes(),
+                    libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                    BENEATH | NO_SYMLINKS | NO_MAGICLINKS | NO_XDEV,
+                )?;
+                fstat_directory(&parent)?;
+                Ok(parent)
+            }
+        }
+    }
+
+    /// AT_SYMLINK_NOFOLLOW: a final symlink is inspected as a symlink,
+    /// never followed. Only regular files and directories pass.
+    #[cfg(target_os = "linux")]
+    fn check_final_source_type(parent: &OwnedFd, base: &str) -> io::Result<()> {
+        let base = CString::new(base).map_err(io::Error::other)?;
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: live descriptor, live NUL-terminated pathname, stat is a
+        // plain out-structure owned by this frame.
+        if unsafe {
+            libc::fstatat(
+                parent.as_raw_fd(),
+                base.as_ptr(),
+                &mut stat,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        match stat.st_mode & libc::S_IFMT {
+            libc::S_IFREG | libc::S_IFDIR => Ok(()),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "final source must be a regular file or directory (symlinks and special files are refused)",
+            )),
+        }
+    }
+
+    /// fstat an O_PATH directory handle and verify it IS a directory.
+    #[cfg(target_os = "linux")]
+    fn fstat_directory(handle: &OwnedFd) -> io::Result<libc::stat> {
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: live descriptor; stat is a plain out-structure.
+        if unsafe { libc::fstat(handle.as_raw_fd(), &mut stat) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+            return Err(io::Error::new(io::ErrorKind::NotADirectory, "handle is not a directory"));
+        }
+        Ok(stat)
+    }
+
+    /// Typed openat2(2) via syscall (libc exposes the number, not the
+    /// wrapper). O_PATH + O_DIRECTORY so nothing is ever opened for real
+    /// access; the fstat check above confirms directory-ness.
+    #[cfg(target_os = "linux")]
+    fn open_at(
+        directory: libc::c_int,
+        path: &[u8],
+        flags: libc::c_int,
+        resolve: u64,
+    ) -> io::Result<OwnedFd> {
+        #[cfg(test)]
+        if FORCE_OPENAT2_UNSUPPORTED.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+        }
+        // Linux UAPI open_how: three __u64 fields; mode stays zero without
+        // O_CREAT.
+        #[repr(C)]
+        struct OpenHow {
+            flags: u64,
+            mode: u64,
+            resolve: u64,
+        }
+        let path = CString::new(path).map_err(io::Error::other)?;
+        let how = OpenHow {
+            flags: flags as u64,
+            mode: 0,
+            resolve,
+        };
+        // SAFETY: live NUL-terminated pathname and a correctly sized UAPI
+        // structure; the directory descriptor's ownership is unchanged and
+        // a fresh descriptor is returned on success.
+        let descriptor = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                directory,
+                path.as_ptr(),
+                &how,
+                std::mem::size_of::<OpenHow>(),
+            )
+        };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful openat2 returned a fresh descriptor.
+        Ok(unsafe { OwnedFd::from_raw_fd(descriptor as libc::c_int) })
+    }
+
+    /// renameat2(2) with RENAME_NOREPLACE: the kernel never overwrites an
+    /// occupied destination. libc exposes the wrapper only on gnu targets.
+    #[cfg(target_os = "linux")]
+    fn renameat2_noreplace(
+        source_dir: RawFd,
+        source: &CString,
+        destination_dir: RawFd,
+        destination: &CString,
+    ) -> io::Result<()> {
+        // SAFETY: both pathnames are live NUL-terminated CStrings and the
+        // descriptors are valid; RENAME_NOREPLACE forbids overwriting an
+        // occupied destination at the kernel level.
+        #[cfg(target_env = "gnu")]
+        let result = unsafe {
+            libc::renameat2(
+                source_dir,
+                source.as_ptr(),
+                destination_dir,
+                destination.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        #[cfg(not(target_env = "gnu"))]
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                source_dir,
+                source.as_ptr(),
+                destination_dir,
+                destination.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    /// Filesystem-only prefix of the extensible native UAPI structure.
+    #[cfg(target_os = "linux")]
+    #[repr(C)]
+    struct LandlockRulesetAttr {
+        handled_access_fs: u64,
+    }
+
+    /// linux/landlock.h landlock_path_beneath_attr is packed in the UAPI
+    /// (12 bytes); assemble it as bytes rather than an unaligned
+    /// `#[repr(packed)]` Rust struct. UAPI integers use native endianness.
+    #[cfg(target_os = "linux")]
+    fn path_beneath_attr(allowed_access: u64, parent_fd: RawFd) -> [u8; 12] {
+        let mut attr = [0u8; 12];
+        attr[..8].copy_from_slice(&allowed_access.to_ne_bytes());
+        attr[8..].copy_from_slice(&parent_fd.to_ne_bytes());
+        attr
+    }
+
+    #[cfg(target_os = "linux")]
+    fn landlock_create_ruleset(
+        attr: &LandlockRulesetAttr,
+    ) -> io::Result<OwnedFd> {
+        #[cfg(test)]
+        if FORCE_LANDLOCK_FAIL.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+        }
+        // SAFETY: attr is a live, correctly sized UAPI structure owned by
+        // this frame. Only flags=0 creates a fresh descriptor.
+        let descriptor = unsafe {
+            libc::syscall(
+                SYS_LANDLOCK_CREATE_RULESET,
+                attr as *const LandlockRulesetAttr,
+                std::mem::size_of::<LandlockRulesetAttr>(),
+                0u32,
+            )
+        };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful create_ruleset returned a fresh descriptor.
+        Ok(unsafe { OwnedFd::from_raw_fd(descriptor as libc::c_int) })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn landlock_add_rule(ruleset: &OwnedFd, parent_fd: RawFd, allowed: u64) -> io::Result<()> {
+        let attr = path_beneath_attr(allowed, parent_fd);
+        // SAFETY: live owned ruleset descriptor (ownership unchanged) and
+        // a correctly sized packed UAPI structure living through the call.
+        let result = unsafe {
+            libc::syscall(
+                SYS_LANDLOCK_ADD_RULE,
+                ruleset.as_raw_fd(),
+                LL_RULE_PATH_BENEATH,
+                attr.as_ptr() as *const libc::c_void,
+                0,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn landlock_restrict_self(ruleset: &OwnedFd) -> io::Result<()> {
+        // SAFETY: live owned ruleset descriptor (ownership unchanged).
+        let result = unsafe { libc::syscall(SYS_LANDLOCK_RESTRICT_SELF, ruleset.as_raw_fd(), 0) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    /// Sandbox the CURRENT worker thread around the retained root. Runs
+    /// strictly before any rename; every failure aborts the operation and
+    /// there is never an unrestricted rename after a policy-setup failure.
+    #[cfg(target_os = "linux")]
+    fn setup_worker_policy(root_fd: RawFd) -> io::Result<()> {
+        // no_new_privs is per-thread (since Linux 4.10): the evaluator's
+        // other threads are unaffected.
+        if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1 as libc::c_ulong,
+            0 as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let abi = landlock_query(LL_CREATE_RULESET_VERSION).map_err(unsupported_policy_error)?;
+        #[cfg(test)]
+        let abi = {
+            let forced = FORCE_ABI.load(std::sync::atomic::Ordering::Relaxed);
+            if forced == u32::MAX {
+                abi
+            } else {
+                forced
+            }
+        };
+        if abi < LL_MIN_ABI {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "Landlock ABI {abi} is below the required {LL_MIN_ABI}; refusing"
+                ),
+            ));
+        }
+        let errata = landlock_query(LL_CREATE_RULESET_ERRATA).map_err(unsupported_policy_error)?;
+        #[cfg(test)]
+        let errata = if FORCE_MISSING_ERRATUM.load(std::sync::atomic::Ordering::Relaxed) { 0 } else { errata };
+        if errata & LL_ERRATUM_DISCONNECTED == 0 {
+            return Err(io::Error::new(io::ErrorKind::Unsupported,
+                "Landlock disconnected-directory erratum 3 is not confirmed; refusing"));
+        }
+        let attr = LandlockRulesetAttr { handled_access_fs: LL_HANDLED };
+        let ruleset = landlock_create_ruleset(&attr).map_err(unsupported_policy_error)?;
+        landlock_add_rule(&ruleset, root_fd, LL_GRANTED)?;
+        landlock_restrict_self(&ruleset)?;
+        // The ruleset descriptor closes when this worker exits, and the
+        // policy dies with the thread. The rename is then evaluated by the
+        // kernel against the parents' CURRENT position in the hierarchy
+        // beneath the anchored root, so a parent a sibling moved elsewhere
+        // is refused with EACCES.
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn landlock_query(flags: u32) -> io::Result<u32> {
+        // SAFETY: version/errata queries require a null attribute pointer
+        // and size zero, and return an integer rather than a descriptor.
+        let value = unsafe { libc::syscall(SYS_LANDLOCK_CREATE_RULESET,
+            std::ptr::null::<LandlockRulesetAttr>(), 0usize, flags) };
+        if value < 0 { Err(io::Error::last_os_error()) }
+        else { u32::try_from(value).map_err(io::Error::other) }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn unsupported_policy_error(e: io::Error) -> io::Error {
+        match e.raw_os_error() {
+            Some(libc::ENOSYS) | Some(libc::EOPNOTSUPP) => {
+                io::Error::new(io::ErrorKind::Unsupported, "Landlock is unavailable on this kernel")
+            }
+            Some(libc::EINVAL) => io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("Landlock policy or required errata query is unsupported: {e}"),
+            ),
+            _ => e,
+        }
+    }
+
+    // Test-only barrier injection: a test registers a pause point, the
+    // worker parks there, the test performs the hostile filesystem action
+    // from an unrestricted sibling thread, then releases. All of this is
+    // compiled out of production builds.
+    #[cfg(test)]
+    type PauseSender = std::sync::mpsc::Sender<std::sync::mpsc::Sender<()>>;
+
+    #[cfg(test)]
+    struct TestBarriers {
+        before_worker: Option<PauseSender>,
+        before_rename: Option<PauseSender>,
+    }
+
+    #[cfg(test)]
+    static BARRIERS: std::sync::Mutex<TestBarriers> = std::sync::Mutex::new(TestBarriers {
+        before_worker: None,
+        before_rename: None,
+    });
+
+    #[cfg(test)]
+    static FORCE_OPENAT2_UNSUPPORTED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    #[cfg(test)]
+    static FORCE_LANDLOCK_FAIL: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    #[cfg(test)]
+    static FORCE_ABI: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+    #[cfg(test)]
+    static FORCE_MISSING_ERRATUM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    #[cfg(test)]
+    fn pause_before_worker() {
+        pause_if_registered(BARRIERS.lock().unwrap().before_worker.clone());
+    }
+
+    #[cfg(test)]
+    fn pause_before_rename() {
+        pause_if_registered(BARRIERS.lock().unwrap().before_rename.clone());
+    }
+
+    #[cfg(test)]
+    fn pause_if_registered(sender: Option<PauseSender>) {
+        if let Some(sender) = sender {
+            let (release, parked) = std::sync::mpsc::channel();
+            if sender.send(release).is_ok() {
+                let _ = parked.recv_timeout(std::time::Duration::from_secs(30));
+            }
+        }
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    mod tests {
+        use super::super::{DirHandles, EvaluatorGlobals};
+        use super::*;
+        use crate::value::Value;
+        use std::ffi::CString;
+        use std::fs;
+        use std::path::PathBuf;
+        use std::sync::mpsc;
+
+        static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        fn scratch_dir(tag: &str) -> PathBuf {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "cosmix-dirroot-{tag}-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).unwrap();
+            path
+        }
+
+        fn barriers() -> std::sync::MutexGuard<'static, TestBarriers> {
+            BARRIERS.lock().unwrap()
+        }
+
+        #[test]
+        fn open_refuses_symlinks_non_directories_and_bad_paths() {
+            let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+            let tmp = scratch_dir("open");
+            let root_path = tmp.join("root");
+            fs::create_dir(&root_path).unwrap();
+            assert!(DirRoot::open(root_path.to_str().unwrap()).is_ok());
+            assert!(DirRoot::open(tmp.join("missing").to_str().unwrap()).is_err());
+            std::os::unix::fs::symlink(root_path.join("nowhere"), tmp.join("link")).unwrap();
+            let error = DirRoot::open(tmp.join("link").to_str().unwrap()).unwrap_err();
+            assert!(error.to_string().contains("symlink"));
+            fs::write(tmp.join("plain"), b"x").unwrap();
+            assert_eq!(
+                DirRoot::open(tmp.join("plain").to_str().unwrap())
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::NotADirectory
+            );
+            for bad in [
+                tmp.join("root/.."),
+                tmp.join("root/./x"),
+                tmp.join("root//x"),
+                tmp.join("root/x/"),
+                tmp.join("root/x\0"),
+            ] {
+                assert!(DirRoot::open(bad.to_str().unwrap()).is_err(), "{bad:?}");
+            }
+            fs::remove_dir_all(tmp).unwrap();
+        }
+
+        #[test]
+        fn moves_files_and_directories_without_overwriting() {
+            let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+            let tmp = scratch_dir("moves");
+            let root_path = tmp.join("root");
+            fs::create_dir(&root_path).unwrap();
+            fs::write(root_path.join("a"), b"aaa").unwrap();
+            let root = DirRoot::open(root_path.to_str().unwrap()).unwrap();
+            root.rename("a", "b").unwrap();
+            assert!(!root_path.join("a").exists());
+            assert_eq!(fs::read(root_path.join("b")).unwrap(), b"aaa");
+            fs::create_dir_all(root_path.join("d1")).unwrap();
+            fs::write(root_path.join("d1/inner"), b"inner").unwrap();
+            root.rename("d1", "d2").unwrap();
+            assert_eq!(fs::read(root_path.join("d2/inner")).unwrap(), b"inner");
+            // Occupied destinations — file, symlink, directory — are never
+            // overwritten and the source stays in place.
+            fs::write(root_path.join("c"), b"ccc").unwrap();
+            assert!(root.rename("b", "c").is_err());
+            assert_eq!(fs::read(root_path.join("c")).unwrap(), b"ccc");
+            assert!(root_path.join("b").exists());
+            std::os::unix::fs::symlink("nowhere", root_path.join("l")).unwrap();
+            assert!(root.rename("b", "l").is_err());
+            assert!(
+                fs::symlink_metadata(root_path.join("l"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            fs::create_dir(root_path.join("dd")).unwrap();
+            assert!(root.rename("b", "dd").is_err());
+            assert!(root_path.join("dd").is_dir());
+            assert!(root_path.join("b").exists());
+            fs::remove_dir_all(tmp).unwrap();
+        }
+
+        #[test]
+        fn operand_validation_and_source_type_refusals() {
+            let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+            let tmp = scratch_dir("operands");
+            let root_path = tmp.join("root");
+            fs::create_dir(&root_path).unwrap();
+            fs::write(root_path.join("a"), b"aaa").unwrap();
+            let mut handles = DirHandles::default();
+            let handle = handles.open(root_path.to_str().unwrap()).unwrap() as f64;
+            for (source, destination) in [
+                ("/abs", "x"),
+                ("..", "x"),
+                (".", "x"),
+                ("a//b", "x"),
+                ("a/", "x"),
+                ("", "x"),
+                ("a\0b", "x"),
+                ("a", "/abs"),
+                ("a", ".."),
+                ("a", "a\\b"),
+            ] {
+                let error = handles
+                    .rename(
+                        &Value::Number(handle),
+                        &Value::String(source.into()),
+                        &Value::String(destination.into()),
+                    )
+                    .unwrap_err();
+                assert_eq!(
+                    error.info().map(|i| i.code.as_str()),
+                    Some("DIR_INVALID_PATH"),
+                    "{source:?} {destination:?}"
+                );
+            }
+            // A symlinked PARENT component and a symlink/fifo FINAL source
+            // are all refused before any rename.
+            std::os::unix::fs::symlink(tmp.join("outside"), root_path.join("plink")).unwrap();
+            let error = handles
+                .rename(
+                    &Value::Number(handle),
+                    &Value::String("plink/file".into()),
+                    &Value::String("x".into()),
+                )
+                .unwrap_err();
+            assert_eq!(error.info().map(|i| i.code.as_str()), Some("DIR_RENAME_FAILED"));
+            std::os::unix::fs::symlink("a", root_path.join("slink")).unwrap();
+            let error = handles
+                .rename(
+                    &Value::Number(handle),
+                    &Value::String("slink".into()),
+                    &Value::String("x".into()),
+                )
+                .unwrap_err();
+            assert_eq!(error.info().map(|i| i.code.as_str()), Some("DIR_RENAME_FAILED"));
+            let fifo = CString::new(
+                root_path
+                    .join("fifo")
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .to_vec(),
+            )
+            .unwrap();
+            // SAFETY: live NUL-terminated pathname in this test's private dir.
+            assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+            let error = handles
+                .rename(
+                    &Value::Number(1.0),
+                    &Value::String("fifo".into()),
+                    &Value::String("x".into()),
+                )
+                .unwrap_err();
+            assert_eq!(error.info().map(|i| i.code.as_str()), Some("DIR_RENAME_FAILED"));
+            assert!(root_path.join("a").exists());
+            fs::remove_dir_all(tmp).unwrap();
+        }
+
+        #[test]
+        fn replaced_or_moved_root_is_refused() {
+            let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+            let tmp = scratch_dir("replaced-root");
+            let root_path = tmp.join("root");
+            fs::create_dir(&root_path).unwrap();
+            fs::write(root_path.join("file"), b"inside").unwrap();
+            let root = DirRoot::open(root_path.to_str().unwrap()).unwrap();
+            let mut handles = DirHandles::default();
+            let handle = handles.open(root_path.to_str().unwrap()).unwrap() as f64;
+            // A hostile writer replaces the root at its original path
+            // BEFORE the operation.
+            fs::rename(&root_path, tmp.join("saved")).unwrap();
+            fs::create_dir(&root_path).unwrap();
+            fs::write(root_path.join("file"), b"outside").unwrap();
+            assert_eq!(
+                root.rename("file", "moved").unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            assert_eq!(fs::read(root_path.join("file")).unwrap(), b"outside");
+            assert!(!root_path.join("moved").exists());
+            let error = handles
+                .rename(
+                    &Value::Number(handle),
+                    &Value::String("file".into()),
+                    &Value::String("moved".into()),
+                )
+                .unwrap_err();
+            assert_eq!(error.info().map(|i| i.code.as_str()), Some("DIR_ROOT_REPLACED"));
+            // And a root moved away entirely (nothing at the original path).
+            let saved = tmp.join("saved");
+            let root = DirRoot::open(saved.to_str().unwrap()).unwrap();
+            fs::rename(&saved, tmp.join("gone")).unwrap();
+            assert_eq!(
+                root.rename("file", "moved").unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            assert_eq!(fs::read(tmp.join("gone/file")).unwrap(), b"inside");
+            fs::remove_dir_all(tmp).unwrap();
+        }
+
+        #[test]
+        fn parents_moved_outside_after_resolution_are_denied() {
+            let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+            let tmp = scratch_dir("moved-parents");
+            let root_path = tmp.join("root");
+            let outside = tmp.join("outside");
+            fs::create_dir_all(root_path.join("sub")).unwrap();
+            fs::create_dir(&outside).unwrap();
+            fs::write(root_path.join("sub/file"), b"inside").unwrap();
+            fs::write(outside.join("sentinel"), b"untouched").unwrap();
+            let root = DirRoot::open(root_path.to_str().unwrap()).unwrap();
+            let (tx, rx) = mpsc::channel();
+            barriers().before_worker = Some(tx);
+            let worker = std::thread::spawn(move || root.rename("sub/file", "sub/other"));
+            let release = rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("worker parked before rename");
+            // After both parents were already resolved (descriptors held),
+            // an unrestricted sibling moves the parent directory OUT of the
+            // retained root. The kernel's own REFER check must refuse.
+            fs::rename(root_path.join("sub"), outside.join("sub")).unwrap();
+            drop(release);
+            let result = worker.join().unwrap();
+            barriers().before_worker = None;
+            let error = result.unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+            assert_eq!(fs::read(outside.join("sub/file")).unwrap(), b"inside");
+            assert!(!outside.join("sub/other").exists());
+            assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"untouched");
+            fs::remove_dir_all(tmp).unwrap();
+        }
+
+        #[test]
+        fn final_source_swapped_to_symlink_is_denied() {
+            let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+            let tmp = scratch_dir("swapped-symlink");
+            let root_path = tmp.join("root");
+            let outside = tmp.join("outside");
+            fs::create_dir(&root_path).unwrap();
+            fs::create_dir(&outside).unwrap();
+            fs::write(root_path.join("file"), b"original").unwrap();
+            fs::write(outside.join("victim"), b"sentinel").unwrap();
+            let root = DirRoot::open(root_path.to_str().unwrap()).unwrap();
+            let (tx, rx) = mpsc::channel();
+            barriers().before_rename = Some(tx);
+            let worker = std::thread::spawn(move || root.rename("file", "moved"));
+            let release = rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("worker parked inside the sandbox");
+            // Swap the prechecked regular file for a symlink into an
+            // outside sentinel; MAKE_SYM is not granted, so the kernel's
+            // locked rename-time check must refuse (EACCES).
+            fs::remove_file(root_path.join("file")).unwrap();
+            std::os::unix::fs::symlink(outside.join("victim"), root_path.join("file")).unwrap();
+            drop(release);
+            let result = worker.join().unwrap();
+            barriers().before_rename = None;
+            let error = result.unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+            assert_eq!(fs::read(outside.join("victim")).unwrap(), b"sentinel");
+            assert!(!root_path.join("moved").exists());
+            assert!(
+                fs::symlink_metadata(root_path.join("file"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            fs::remove_dir_all(tmp).unwrap();
+        }
+
+        #[test]
+        fn parent_replaced_by_symlink_is_denied() {
+            let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+            let tmp = scratch_dir("parent-symlink");
+            let root_path = tmp.join("root");
+            let outside = tmp.join("outside");
+            fs::create_dir_all(root_path.join("sub")).unwrap();
+            fs::create_dir(&outside).unwrap();
+            fs::write(root_path.join("sub/file"), b"inside").unwrap();
+            fs::write(outside.join("sentinel"), b"untouched").unwrap();
+            let root = DirRoot::open(root_path.to_str().unwrap()).unwrap();
+            let (tx, rx) = mpsc::channel();
+            barriers().before_worker = Some(tx);
+            let worker = std::thread::spawn(move || root.rename("sub/file", "sub/moved"));
+            let release = rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("worker parked before rename");
+            // Move the resolved parent out of the root and plant a symlink
+            // in its place. The rename must never follow it.
+            fs::rename(root_path.join("sub"), outside.join("stolen")).unwrap();
+            std::os::unix::fs::symlink(&outside, root_path.join("sub")).unwrap();
+            drop(release);
+            let result = worker.join().unwrap();
+            barriers().before_worker = None;
+            let error = result.unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+            assert_eq!(fs::read(outside.join("stolen/file")).unwrap(), b"inside");
+            assert!(!outside.join("stolen/moved").exists());
+            assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"untouched");
+            fs::remove_dir_all(tmp).unwrap();
+        }
+
+        #[test]
+        fn policy_setup_failure_refuses_without_renaming() {
+            let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+            let tmp = scratch_dir("policy");
+            let root_path = tmp.join("root");
+            fs::create_dir(&root_path).unwrap();
+            fs::write(root_path.join("a"), b"aaa").unwrap();
+            let root = DirRoot::open(root_path.to_str().unwrap()).unwrap();
+            FORCE_LANDLOCK_FAIL.store(true, std::sync::atomic::Ordering::Relaxed);
+            assert!(root.rename("a", "b").is_err());
+            FORCE_LANDLOCK_FAIL.store(false, std::sync::atomic::Ordering::Relaxed);
+            assert!(root_path.join("a").exists());
+            assert!(!root_path.join("b").exists());
+            // A kernel lacking REFER refuses explicitly.
+            FORCE_ABI.store(1, std::sync::atomic::Ordering::Relaxed);
+            let error = root.rename("a", "b").unwrap_err();
+            FORCE_ABI.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+            assert!(root_path.join("a").exists());
+            assert!(!root_path.join("b").exists());
+            // openat2-less kernels refuse opening, never fall back.
+            FORCE_OPENAT2_UNSUPPORTED.store(true, std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(
+                DirRoot::open(root_path.to_str().unwrap())
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::ENOSYS)
+            );
+            FORCE_OPENAT2_UNSUPPORTED.store(false, std::sync::atomic::Ordering::Relaxed);
+            FORCE_MISSING_ERRATUM.store(true, std::sync::atomic::Ordering::Relaxed);
+            let error = root.rename("a", "b").unwrap_err();
+            FORCE_MISSING_ERRATUM.store(false, std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+            assert!(root_path.join("a").exists());
+            assert!(!root_path.join("b").exists());
+            // And the same root still works afterwards.
+            root.rename("a", "b").unwrap();
+            assert!(root_path.join("b").exists());
+            fs::remove_dir_all(tmp).unwrap();
+        }
+
+        #[test]
+        fn handles_are_evaluator_local_and_close_on_drop() {
+            let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+            let tmp = scratch_dir("lifecycle");
+            let root_path = tmp.join("root");
+            fs::create_dir(&root_path).unwrap();
+            fs::write(root_path.join("a"), b"aaa").unwrap();
+            let mut a = DirHandles::default();
+            let mut b = DirHandles::default();
+            let handle_a = a.open(root_path.to_str().unwrap()).unwrap();
+            let handle_a2 = a.open(root_path.to_str().unwrap()).unwrap();
+            let handle_b = b.open(root_path.to_str().unwrap()).unwrap();
+            assert_eq!((handle_a, handle_a2, handle_b), (1, 2, 1));
+            // Registry b cannot resolve registry a's handle 2.
+            let error = b
+                .rename(
+                    &Value::Number(2.0),
+                    &Value::String("a".into()),
+                    &Value::String("x".into()),
+                )
+                .unwrap_err();
+            assert_eq!(error.info().map(|i| i.code.as_str()), Some("DIR_INVALID_HANDLE"));
+            // Strict typing: only finite integral numbers are handles.
+            for bad in [Value::Nil, Value::Bool(true), Value::String("1".into())] {
+                let error = a
+                    .rename(
+                        &bad,
+                        &Value::String("a".into()),
+                        &Value::String("x".into()),
+                    )
+                    .unwrap_err();
+                assert_eq!(error.info().map(|i| i.code.as_str()), Some("TYPE_MISMATCH"));
+            }
+            for bad in [-1.0, 1.5, f64::NAN, f64::INFINITY, 4_294_967_296.0] {
+                let error = a
+                    .rename(
+                        &Value::Number(bad),
+                        &Value::String("a".into()),
+                        &Value::String("x".into()),
+                    )
+                    .unwrap_err();
+                assert_eq!(error.info().map(|i| i.code.as_str()), Some("DIR_INVALID_HANDLE"));
+            }
+            a.close(&Value::Number(handle_a as f64)).unwrap();
+            let error = a.close(&Value::Number(handle_a as f64)).unwrap_err();
+            assert_eq!(error.info().map(|i| i.code.as_str()), Some("DIR_INVALID_HANDLE"));
+            // The surviving handle still works; dropping both registries
+            // closes every retained root with no leak.
+            a.rename(
+                &Value::Number(handle_a2 as f64),
+                &Value::String("a".into()),
+                &Value::String("done".into()),
+            )
+            .unwrap();
+            assert!(root_path.join("done").exists());
+            drop(a);
+            drop(b);
+            fs::remove_dir_all(tmp).unwrap();
+        }
+
+        #[test]
+        fn globals_field_plumbing_reaches_the_registry() {
+            let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+            let tmp = scratch_dir("globals-field");
+            let root_path = tmp.join("root");
+            fs::create_dir(&root_path).unwrap();
+            fs::write(root_path.join("a"), b"aaa").unwrap();
+            let mut globals = EvaluatorGlobals::new();
+            let handle = globals
+                .dir_handles
+                .open(root_path.to_str().unwrap())
+                .unwrap();
+            globals
+                .dir_handles
+                .rename(
+                    &Value::Number(handle as f64),
+                    &Value::String("a".into()),
+                    &Value::String("b".into()),
+                )
+                .unwrap();
+            assert!(root_path.join("b").exists());
+            fs::remove_dir_all(tmp).unwrap();
+        }
+    }
+
+    #[cfg(all(test, not(target_os = "linux")))]
+    #[test]
+    fn non_linux_is_refused_explicitly() {
+        let mut handles = super::DirHandles::default();
+        let error = handles
+            .open(std::env::temp_dir().to_str().unwrap())
+            .unwrap_err();
+        assert_eq!(error.info().map(|i| i.code.as_str()), Some("DIR_UNSUPPORTED"));
+    }
+}
+
+/// Evaluator-local registry of retained-root directory handles backing the
+/// `dir_open` / `dir_rename` / `dir_close` builtins. Ownership is strictly
+/// per evaluator: dropping the evaluator (or this registry) closes every
+/// retained root, handle numbers are only meaningful to the evaluator that
+/// created them, and no evaluator can resolve another evaluator's handles.
+pub struct DirHandles {
+    next: u32,
+    roots: std::collections::HashMap<u32, dirroot::DirRoot>,
+}
+
+impl DirHandles {
+    /// Open a retained root and return its finite integral handle. Errors
+    /// map to `DIR_OPEN_FAILED` / `DIR_UNSUPPORTED`.
+    pub fn open(&mut self, path: &str) -> Result<u32, crate::error::MixError> {
+        let root = dirroot::DirRoot::open(path).map_err(map_dir_open_error)?;
+        let mut handle = self.next.max(1);
+        while self.roots.contains_key(&handle) {
+            handle = handle.wrapping_add(1);
+        }
+        self.roots.insert(handle, root);
+        self.next = handle.wrapping_add(1);
+        Ok(handle)
+    }
+
+    /// Rename beneath the retained root. Handle typing is strict (finite
+    /// integral numbers only) and both operands must be strings; errors
+    /// map to `DIR_INVALID_HANDLE`, `DIR_INVALID_PATH`, `DIR_ROOT_REPLACED`,
+    /// `DIR_RENAME_FAILED` or `DIR_UNSUPPORTED`.
+    pub fn rename(
+        &mut self,
+        handle: &crate::value::Value,
+        source: &crate::value::Value,
+        destination: &crate::value::Value,
+    ) -> Result<(), crate::error::MixError> {
+        let handle = dir_handle_number(handle)?;
+        let source = dir_string_argument(source, "source")?;
+        let destination = dir_string_argument(destination, "destination")?;
+        let root = self.roots.get(&handle).ok_or_else(|| {
+            crate::error::MixError::structured(
+                "DIR_INVALID_HANDLE",
+                format!("dir handle {handle} is not open in this evaluator"),
+            )
+        })?;
+        root.rename(source, destination)
+            .map_err(map_dir_rename_error)
+    }
+
+    /// Close one handle; further use raises `DIR_INVALID_HANDLE`. Roots
+    /// also close when their evaluator drops them.
+    pub fn close(&mut self, handle: &crate::value::Value) -> Result<(), crate::error::MixError> {
+        let handle = dir_handle_number(handle)?;
+        match self.roots.remove(&handle) {
+            Some(_) => Ok(()),
+            None => Err(crate::error::MixError::structured(
+                "DIR_INVALID_HANDLE",
+                format!("dir handle {handle} is not open in this evaluator"),
+            )),
+        }
+    }
+}
+
+impl Default for DirHandles {
+    fn default() -> Self {
+        DirHandles {
+            next: 1,
+            roots: std::collections::HashMap::new(),
+        }
+    }
+}
+
+fn dir_handle_number(value: &crate::value::Value) -> Result<u32, crate::error::MixError> {
+    let crate::value::Value::Number(number) = value else {
+        return Err(crate::error::MixError::structured(
+            "TYPE_MISMATCH",
+            "dir handle must be a number",
+        ));
+    };
+    // Handles are finite integral numbers; everything else is refused
+    // before any filesystem effect.
+    #[allow(clippy::cast_possible_truncation)] // bounded by the range check below
+    if !number.is_finite()
+        || number.fract() != 0.0
+        || !(0.0..=u32::MAX as f64).contains(number)
+    {
+        return Err(crate::error::MixError::structured(
+            "DIR_INVALID_HANDLE",
+            "dir handle must be a finite integral number",
+        ));
+    }
+    Ok(*number as u32)
+}
+
+fn dir_string_argument<'a>(
+    value: &'a crate::value::Value,
+    what: &str,
+) -> Result<&'a str, crate::error::MixError> {
+    match value {
+        crate::value::Value::String(text) => Ok(text),
+        _ => Err(crate::error::MixError::structured(
+            "TYPE_MISMATCH",
+            format!("{what} must be a string"),
+        )),
+    }
+}
+
+fn map_dir_open_error(e: std::io::Error) -> crate::error::MixError {
+    use std::io::ErrorKind as K;
+    match e.raw_os_error() {
+        Some(libc::ENOSYS) => crate::error::MixError::structured("DIR_UNSUPPORTED", e.to_string()),
+        _ if e.kind() == K::Unsupported => {
+            crate::error::MixError::structured("DIR_UNSUPPORTED", e.to_string())
+        }
+        _ => crate::error::MixError::structured("DIR_OPEN_FAILED", e.to_string()),
+    }
+}
+
+fn map_dir_rename_error(e: std::io::Error) -> crate::error::MixError {
+    use std::io::ErrorKind as K;
+    match e.raw_os_error() {
+        // Errors constructed by this module carry no OS code; their kind
+        // identifies them. Kernel errors (EACCES, ELOOP, ...) carry codes
+        // and are ordinary operation failures.
+        None => match e.kind() {
+            K::InvalidInput => crate::error::MixError::structured("DIR_INVALID_PATH", e.to_string()),
+            K::PermissionDenied => {
+                crate::error::MixError::structured("DIR_ROOT_REPLACED", e.to_string())
+            }
+            K::Unsupported => crate::error::MixError::structured("DIR_UNSUPPORTED", e.to_string()),
+            _ => crate::error::MixError::structured("DIR_RENAME_FAILED", e.to_string()),
+        },
+        Some(libc::ENOSYS) => crate::error::MixError::structured("DIR_UNSUPPORTED", e.to_string()),
+        Some(libc::EEXIST) => crate::error::MixError::structured(
+            "DIR_RENAME_FAILED",
+            "destination already exists (dir_rename never overwrites)",
+        ),
+        Some(_) => crate::error::MixError::structured("DIR_RENAME_FAILED", e.to_string()),
+    }
+}
+
 /// Shared evaluator state — the **S** bucket in the SPEC 18 Phase 2
 /// WS3-C field classification.
 ///
@@ -3661,6 +4960,11 @@ fn expr_mode_depth_error() -> MixError {
 /// preserved bit-for-bit (every former `self.<field>` now reads
 /// `self.globals.<field>`).
 pub(crate) struct EvaluatorGlobals {
+    /// Retained-root directory handles for dir_open/dir_rename/dir_close.
+    /// Per-evaluator by construction (this struct is the evaluator's
+    /// shared state): dropping it closes every retained root. The dir_*
+    /// builtin dispatch arms read it via `self.globals.borrow_mut()`.
+    dir_handles: DirHandles,
     stdout: Box<dyn Write>,
     stderr: Box<dyn Write>,
     extensions: HashMap<String, ExtFn>,
@@ -3865,6 +5169,7 @@ pub(crate) struct EvaluatorGlobals {
 impl EvaluatorGlobals {
     fn new() -> Self {
         EvaluatorGlobals {
+            dir_handles: DirHandles::default(),
             stdout: Box::new(std::io::stdout()),
             stderr: Box::new(std::io::stderr()),
             extensions: HashMap::new(),
@@ -11614,6 +12919,25 @@ impl Evaluator {
                             body: body.clone(),
                         }).await?;
                         return Ok(Value::Nil);
+                    }
+                    if matches!(name.as_str(), "dir_open" | "dir_rename" | "dir_close") {
+                        self.check_capability(name)?;
+                        self.check_builtin_arity(name, eval_args.len())?;
+                        return match name.as_str() {
+                            "dir_open" => {
+                                let path = dir_string_argument(&eval_args[0], "path")?;
+                                let handle = self.globals.borrow_mut().dir_handles.open(path)?;
+                                Ok(Value::Number(f64::from(handle)))
+                            }
+                            "dir_rename" => {
+                                self.globals.borrow_mut().dir_handles.rename(&eval_args[0], &eval_args[1], &eval_args[2])?;
+                                Ok(Value::Nil)
+                            }
+                            _ => {
+                                self.globals.borrow_mut().dir_handles.close(&eval_args[0])?;
+                                Ok(Value::Nil)
+                            }
+                        };
                     }
                     if matches!(name.as_str(), "fs_watch" | "fs_unwatch" | "fs_wait") {
                         self.check_capability(name)?;

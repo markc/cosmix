@@ -442,7 +442,7 @@
 
     <div id="doc-view" class="content-section">
         <div id="content-doc" data-prerendered="mix/builtins.md"><div class="prose"><h1 id="builtin-index">Builtin index</h1>
-<p>Every Mix builtin grouped by category, generated from <code>mix builtins</code> (mix 0.105.1). See the linked topical page for prose and examples; <code>mix what NAME</code> prints a one-line description of any single builtin (or keyword), and <code>mix help</code> prints the compact names-only summary of the same ten categories.</p>
+<p>Every Mix builtin grouped by category, generated from <code>mix builtins</code> (mix 0.108.0). See the linked topical page for prose and examples; <code>mix what NAME</code> prints a one-line description of any single builtin (or keyword), and <code>mix help</code> prints the compact names-only summary of the same ten categories.</p>
 <p>Some builtins are feature-gated on the <code>cosmix-lib-mix</code> crate (<code>json</code>, <code>regex</code>, <code>toml</code>, <code>yaml</code>, <code>datetime</code>, <code>url</code>, <code>crypto</code>, <code>http</code>, <code>sqlite</code>, <code>dkim</code>, <code>markdown</code>, <code>datastar</code>, <code>xml</code>) so embedders can pull only what they need — the <code>mix</code> binary turns them all on.</p>
 <h2 id="machine-readable-discovery-metadata_schema-1">Machine-readable discovery (metadata_schema 1)</h2>
 <p>From 0.97.0, <code>required_capabilities</code> lists additional unconditional capability
@@ -623,6 +623,9 @@ freeze          Snapshot a buffer to a value-semantic bytes (a copy of the curre
 fs_watch        Register Linux inotify watch; returns evaluator-owned opaque handle. Delivers fs.changed via $event.args; bounded, overflow requires rescan; no polling fallback
 fs_unwatch      Cancel watch and pending changes; wake fs_wait with FS_WATCH_CANCELLED
 fs_wait         Suspend until a filesystem batch; cancellation-safe; refused in serve and expression modes
+dir_open        Open a retained native directory root; evaluator-owned numeric handle. Refuses symlink components. Linux openat2 required; no fallback (v0.108.0)
+dir_rename      Move a regular file or directory between relative paths beneath a retained root, atomically refusing overwrite. Landlock ABI 2 and erratum 3 required. Refuses symlink sources and escaping parents. Root pathname checked before operation; retained inode remains the containment boundary during concurrent root moves (v0.108.0)
+dir_close       Close an evaluator-owned retained directory root; invalid or closed handles raise (v0.108.0)
 read_file_bytes Read file contents as raw bytes. Optional 2nd arg caps the read: read_file_bytes(path, 8192) reads at most 8192 bytes (header-sniffing without slurping a huge file) (v0.3.1; cap v0.17.1)
 read_lines      Read file as a list of lines (trailing newline stripped, empty last line dropped) (v0.2.3)
 load_data       Read + parse a strict-data .mix file (bare-key <code>k: v</code>, the zones.mix/conf.mix form) into a Value — the non-executing twin of source/include, for substrate-internal data that must NOT run as code (v0.9.0)

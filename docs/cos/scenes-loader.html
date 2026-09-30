@@ -813,10 +813,16 @@ events. No private installer is changed by this public workstream.</p>
 records, 256 KiB per scene/behaviour file and runtime model, and 64 KiB state or
 metadata. Recovery copies are retained for the operator to manage. Recovery
 mutations reject symlinks (including dangling links), non-directory recovery
-paths and destinations outside the canonical scene root. Source and parent
-checks use no-follow stat; rename does not follow its final components. Trusted
-desktop-user edits are still assumed: Mix has no directory-handle-relative
-rename, so these prechecks cannot exclude a simultaneous hostile parent swap.
+paths and destinations outside the canonical scene root. The loader retains
+a native directory handle at initialisation and uses <code>dir_rename</code> for recovery
+moves. The kernel rejects symlink sources, parents moved outside the retained
+root and existing destinations at rename time. Linux openat2 and Landlock ABI 2
+with the disconnected-directory erratum 3 fix are required; unsupported
+kernels refuse the operation. A root replaced before a move is refused. If
+its original pathname changes after that check, the retained root inode remains
+the containment boundary. Other staging and state writes still assume trusted
+desktop-user edits; this API secures the recovery rename, not every filesystem
+operation in the loader.
 Reset uses two
 renames with rollback on an ordinary error; power loss between those renames
 leaves the preserved copy under <code>.recovery</code>. Multiple processes directly
