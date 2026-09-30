@@ -1113,3 +1113,15 @@ fn reflex_surplus_arity_gets_the_mix_form_hint() {
         "reflex hint missing: {diags:?}"
     );
 }
+
+#[test]
+fn literal_type_contradictions_are_errors() {
+    // A2 lint half: a literal whose type cannot satisfy the contract.
+    for src in ["mkdir({a: 1})\n", "exists([1, 2])\n", "len(3)\n", "write_file(99, \"x\")\n"] {
+        let out = codes(src);
+        assert!(out.contains(&"MIX-E1203".to_string()), "{src}: got {out:?}");
+    }
+    // Variables are not judged, and well-typed literals pass.
+    let out = codes("exists(\".\")\nwrite_file($p, \"x\")\nmkdir($dir)\n");
+    assert!(!out.contains(&"MIX-E1203".to_string()), "got: {out:?}");
+}

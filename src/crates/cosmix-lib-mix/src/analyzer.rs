@@ -1949,6 +1949,93 @@ fn check_recurring_silent_bugs(stmts: &[Stmt], ctx: &FileContext, a: &mut Analys
     check_send_rc_reads(stmts, ctx, a);
     check_push_assign_back(stmts, ctx, a);
     check_collection_literal_traps(stmts, ctx, a);
+    check_literal_type_contradictions(stmts, ctx, a);
+}
+
+/// A2 lint half (TODO-mix 2026-09-24): a LITERAL argument whose type
+/// contradicts the contract's declared shape is provably wrong at
+/// authoring time — `mkdir({a: 1})`, `exists([1, 2])`, `len(3)` used to
+/// lint clean and then stringify a side effect onto the wrong target.
+/// The runtime gate (0.103.1) raises TYPE_MISMATCH on the same calls, so
+/// this rule makes the lint agree with the runtime instead of letting
+/// the script crash mid-run. Variables and expressions are left alone —
+/// only a literal PROVES the type. Nil is the documented omitted-arg
+/// sentinel and never a contradiction.
+fn check_literal_type_contradictions(stmts: &[Stmt], ctx: &FileContext, a: &mut Analysis) {
+    use crate::builtin_info::TypeShape;
+    for stmt in stmts {
+        walk_stmt_exprs(stmt, &mut |expr| {
+            let Expr::FunctionCall { name, args } = expr else {
+                return;
+            };
+            let Some(info) = crate::builtins::builtin_info_of(name) else {
+                return;
+            };
+            for (i, (arg, arg_info)) in args.iter().zip(info.contract.args).enumerate() {
+                if arg_info.variadic {
+                    continue;
+                }
+                let shape = arg_info.kind;
+                if matches!(shape, TypeShape::Any) {
+                    continue;
+                }
+                let Some((got, _)) = literal_type_name(arg) else {
+                    continue;
+                };
+                if literal_matches_shape(arg, &shape) {
+                    continue;
+                }
+                a.diagnostics.push(diag(
+                    ctx,
+                    "MIX-E1203",
+                    Severity::Error,
+                    stmt.line,
+                    format!(
+                        "{name}(): argument {} ({}) must be {}, but this literal is {} — the \
+                         call raises TYPE_MISMATCH at runtime (see: mix man io)",
+                        i + 1,
+                        arg_info.name,
+                        shape.human(),
+                        got
+                    ),
+                    None,
+                ));
+            }
+        });
+    }
+}
+
+/// The Mix type name of a LITERAL expression, when the literal proves it.
+fn literal_type_name(expr: &Expr) -> Option<(&'static str, ())> {
+    match expr {
+        Expr::NumberLiteral(_) => Some(("number", ())),
+        Expr::StringLiteral(_) | Expr::EscapedQuoteStringLiteral(_) => Some(("string", ())),
+        Expr::BoolLiteral(_) => Some(("bool", ())),
+        Expr::ListLiteral(_) => Some(("list", ())),
+        Expr::MapLiteral(_) => Some(("map", ())),
+        Expr::NilLiteral => Some(("nil", ())),
+        _ => None,
+    }
+}
+
+/// Whether a literal expression satisfies a contract `TypeShape`.
+fn literal_matches_shape(expr: &Expr, shape: &crate::builtin_info::TypeShape) -> bool {
+    use crate::builtin_info::TypeShape;
+    match shape {
+        TypeShape::Any => true,
+        TypeShape::AnyOf(shapes) => shapes.iter().any(|s| literal_matches_shape(expr, s)),
+        TypeShape::String => matches!(expr, Expr::StringLiteral(_) | Expr::EscapedQuoteStringLiteral(_)),
+        TypeShape::Number => matches!(expr, Expr::NumberLiteral(_)),
+        TypeShape::Bool => matches!(expr, Expr::BoolLiteral(_)),
+        TypeShape::Nil => matches!(expr, Expr::NilLiteral),
+        TypeShape::List(_) => matches!(expr, Expr::ListLiteral(_)),
+        TypeShape::Map { .. } => matches!(expr, Expr::MapLiteral(_)),
+        // Bytes/Buffer/Function literals have no expression spelling —
+        // a literal can never satisfy these, so any literal is a
+        // contradiction; None-shaped literals (variables) are filtered
+        // before this fn.
+        TypeShape::Bytes | TypeShape::Buffer | TypeShape::Function => false,
+    }
 }
 
 /// C9/C10 (TODO-mix 2026-09-24): collection-literal traps the lint can
