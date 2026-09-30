@@ -5007,6 +5007,13 @@ pub fn unregister_managed_pid(pid: i32) {
     }
 }
 
+/// Test seam: how many no-reap markers currently protect `pid`.
+#[cfg(test)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn managed_pid_count(pid: i32) -> usize {
+    MANAGED_PIDS.lock().unwrap().get(&pid).copied().unwrap_or(0)
+}
+
 /// process_alive(pid) — check if a process is running (signal 0 test).
 ///
 /// First attempts a non-blocking `waitpid(pid, WNOHANG)` to reap the

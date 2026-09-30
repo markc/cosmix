@@ -94,5 +94,7 @@ task's initial exec.
 The internal no-reap markers are reference counted so retirement after a
 numeric PID is reused cannot erase a newer owner's registration. Each owner
 balances its own registration; this does not prevent kernel PID reuse.
+Audio-watch cleanup retires its marker exactly once: the worker or destructor
+that takes and reaps the child owns that retirement.
 Signal 0 returning `EPERM` counts as alive, including for another user's
 process. This reports existence, not permission to signal that process.

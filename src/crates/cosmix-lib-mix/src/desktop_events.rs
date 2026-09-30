@@ -1160,19 +1160,19 @@ mod linux {
     impl Drop for AudioSource {
         fn drop(&mut self) {
             self.cancelled.store(true, Ordering::Release);
-            let mut pid = None;
             if let Some(child) = self.child.lock().unwrap().as_mut() {
-                pid = Some(child.id() as i32);
                 kill_group(child);
             }
             // The kill closes the pipe, so the reader sees EOF and exits.
             if let Some(w) = self.worker.take() {
                 let _ = w.join();
             }
+            // Both this path and the worker's take path race on the one slot.
+            // The worker already reaps and unregisters the child it takes, so
+            // unregister only in the branch that actually takes what remains.
             if let Some(mut child) = self.child.lock().unwrap().take() {
+                let pid = child.id() as i32;
                 let _ = child.wait();
-            }
-            if let Some(pid) = pid {
                 crate::builtins::unregister_managed_pid(pid);
             }
         }
@@ -1294,6 +1294,172 @@ mod linux {
                 }
                 timed_out(limit)
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::mpsc;
+
+        /// Reaps the real child and retires its markers if the test panics
+        /// before the explicit cleanup. The guard signals only a child it
+        /// just took from the slot, which is only ever present while the
+        /// child is unreaped, so it can never signal a recycled pid.
+        struct ReapGuard {
+            slot: Arc<Mutex<Option<Child>>>,
+            pid: i32,
+            markers: usize,
+        }
+
+        impl Drop for ReapGuard {
+            fn drop(&mut self) {
+                if let Some(mut child) = self.slot.lock().unwrap().take() {
+                    kill_group(&mut child);
+                    let _ = child.wait();
+                }
+                for _ in 0..self.markers {
+                    crate::builtins::unregister_managed_pid(self.pid);
+                }
+            }
+        }
+
+        /// The balanced-registration race in `AudioSource::drop`: the worker
+        /// passes its cancelled check before Drop stores true, then Drop
+        /// kills the child while the slot still holds it. The worker takes
+        /// the child, reaps and unregisters; Drop must not unregister the
+        /// same pid again, or it eats an overlapping owner's marker (here,
+        /// the counted registry's second entry). The pidfd wait pins the
+        /// interleaving: only Drop's kill ends `/bin/sleep 30`, and Drop
+        /// kills while observing the slot, so the worker's take strictly
+        /// follows Drop's observation and always wins the reap.
+        #[test]
+        fn audio_source_drop_does_not_double_unregister_when_worker_reaps() {
+            let mut command = command("/bin/sleep", &None);
+            command.arg("30").stderr(Stdio::null());
+            let child = command.spawn().unwrap();
+            let pid = child.id() as i32;
+            let child = Arc::new(Mutex::new(Some(child)));
+            let mut guard = ReapGuard {
+                slot: child.clone(),
+                pid,
+                markers: 0,
+            };
+            // The audio owner marker plus an overlapping reference owner.
+            crate::builtins::register_managed_pid(pid);
+            guard.markers += 1;
+            crate::builtins::register_managed_pid(pid);
+            guard.markers += 1;
+
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let reaped = Arc::new(AtomicBool::new(false));
+            let (ready_tx, ready_rx) = mpsc::channel::<std::io::Result<()>>();
+
+            let worker_child = child.clone();
+            let worker_cancelled = cancelled.clone();
+            let worker_reaped = reaped.clone();
+            let worker = thread::Builder::new()
+                .name("mix-audio-events".into())
+                .spawn(move || {
+                    // The raced check: this must load false before Drop can
+                    // store true, so the worker keeps the reap.
+                    if worker_cancelled.load(Ordering::Acquire) {
+                        let _ = ready_tx.send(Err(std::io::Error::other(
+                            "worker observed cancellation before the drop",
+                        )));
+                        return;
+                    }
+                    // Block until the real child exits. Nothing but Drop's
+                    // kill ends it, and Drop kills while holding the slot.
+                    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as i32 };
+                    if fd < 0 {
+                        let _ = ready_tx.send(Err(std::io::Error::last_os_error()));
+                        return;
+                    }
+                    let pidfd = unsafe { OwnedFd::from_raw_fd(fd) };
+                    let _ = ready_tx.send(Ok(()));
+                    let mut pfd = libc::pollfd {
+                        fd: pidfd.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    loop {
+                        let rc = unsafe { libc::poll(&mut pfd, 1, -1) };
+                        if rc == 1 {
+                            break;
+                        }
+                        if rc < 0
+                            && std::io::Error::last_os_error().kind()
+                                == std::io::ErrorKind::Interrupted
+                        {
+                            continue;
+                        }
+                        // Unreachable here: leave the child for Drop to reap.
+                        return;
+                    }
+                    // The worker that passed the cancelled check owns the
+                    // reap: take the child from the shared slot, wait and
+                    // unregister exactly once.
+                    let Some(mut child) = worker_child.lock().unwrap().take() else {
+                        return;
+                    };
+                    let waited = child.wait().is_ok();
+                    crate::builtins::unregister_managed_pid(pid);
+                    worker_reaped.store(waited, Ordering::Release);
+                });
+
+            let source = match worker {
+                Ok(worker) => AudioSource {
+                    pid,
+                    child,
+                    cancelled,
+                    worker: Some(worker),
+                },
+                Err(e) => {
+                    if let Some(mut child) = child.lock().unwrap().take() {
+                        kill_group(&mut child);
+                        let _ = child.wait();
+                    }
+                    crate::builtins::unregister_managed_pid(pid);
+                    crate::builtins::unregister_managed_pid(pid);
+                    guard.markers = 0;
+                    panic!("audio worker did not start: {e}");
+                }
+            };
+
+            // The handshake proves the worker is past the cancelled check and
+            // armed on the child's pidfd before the drop can store true.
+            if let Err(e) = ready_rx
+                .recv()
+                .unwrap_or(Err(std::io::Error::other("worker vanished")))
+            {
+                // The worker never took the child; Drop's take branch reaps
+                // and unregisters it, and the overlapping marker is retired
+                // here before failing loudly.
+                drop(source);
+                crate::builtins::unregister_managed_pid(pid);
+                guard.markers = 0;
+                panic!("audio worker could not arm its wait: {e}");
+            }
+
+            // Drop stores cancelled, kills the group while the slot still
+            // holds the child, then joins. The worker wakes on the kill and
+            // retires first, so Drop's take branch must find the slot empty
+            // and must not unregister the pid a second time.
+            drop(source);
+            let remaining = crate::builtins::managed_pid_count(pid);
+            crate::builtins::unregister_managed_pid(pid);
+            guard.markers = 0;
+            assert!(
+                reaped.load(Ordering::Acquire),
+                "controlled worker must reap the real child"
+            );
+            assert_eq!(
+                remaining,
+                1,
+                "exactly the overlapping reference marker may survive drop"
+            );
+            assert_eq!(crate::builtins::managed_pid_count(pid), 0);
         }
     }
 }
