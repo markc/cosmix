@@ -22,7 +22,7 @@ re-parse.
 - **Errors raise, they don't return a sentinel.** A failed `read_file` / `ls` / `mkdir` raises a catchable runtime error (the message names the call and path). Wrap a must-succeed step in `try/catch`, or pre-check with `exists` / `access` / `is_file` / `is_dir`. The exceptions are the predicates themselves (`exists`/`access`/`is_dir`/`is_file` return a `bool` for ordinary absence or denial) and `glob`, which returns an empty list for "no match", never an error.
 - **Mode arguments take the VALUE, not the digits.** `chmod`/`write_new` want an octal *literal* — `0o755` (= 493), `0o600` (= 384) — or an octal *string* (`"0755"`). A bare `755` is the decimal number 755, not the mode (see [numbers](numbers.md) for why `0755` is a lex error and `0o755` is the value). That lex error is a Mix-*expression* hazard only — `0755` inside a command string handed to `run` (`run("install -m 0755 a b")`) is plain text for `/bin/sh` and works fine.
 - **`stat`'s `ino`/`dev` are STRINGS.** They are `u64` and Mix numbers are f64, which loses precision above 2^53 — so they come back as text, ready to use verbatim as a dedupe key. Don't `to_number()` them.
-- **Bytes vs strings.** `read_file`/`read_lines` require valid UTF-8 (they error on a bad byte); `read_file_bytes` carries the raw buffer through `Value::Bytes`. `write_file`/`append_file`/`write_new` write a `Value::Bytes` argument verbatim and stringify anything else.
+- **Bytes vs strings.** `read_file`/`read_lines` require valid UTF-8 (they error on a bad byte); `read_file_bytes` carries the raw buffer through `Value::Bytes`. `write_file`/`append_file`/`write_new` accept exactly a string, `bytes` or `buffer` — a `bytes`/`buffer` argument is written verbatim, a string as UTF-8, and **nothing else is coerced**: a map, list, function, number, bool or nil raises `TYPE_MISMATCH` *before* the file is opened, so encode first with `json_encode`/`data_encode`/`to_string`.
 
 ## Native filesystem events
 
@@ -215,6 +215,9 @@ append_file(path, content)           create-if-missing, then append
 write_new(path, content, mode)       atomically create; FAILS if path exists
 write_atomic(path, data[, opts])     replace all-or-nothing: old OR new, never partial
 ```
+
+`content` is a string, `bytes` or `buffer` — nothing else is coerced (a wrong
+type raises `TYPE_MISMATCH` before the file is touched).
 
 ```mix
 write_file("/tmp/io/log.txt", "first\n")
@@ -564,6 +567,10 @@ the options map flips the defaults:
 - `max_depth` (number, default unlimited) — nesting depth relative to `dir`; `max_depth: 0` returns only the direct children.
 - `include_dirs` (bool, default `false`) — include directory entries too.
 - `follow_symlinks` (bool, default `false`) — follow symlink dirs (loop-safe; the walker tracks visited inodes).
+
+The two boolean options take a real `bool` only — `"false"`, `0`, `nil` and the
+like raise `TYPE_MISMATCH` before traversal starts rather than being read as a
+truthiness.
 
 `max_depth` accepts a number or numeric string. If the option is present but
 cannot be parsed as a number, `walk` raises `TYPE_MISMATCH`; it never silently
@@ -1266,7 +1273,9 @@ bytes_to_string(b, {lossy: true})   from_utf8_lossy decode (bad bytes -> U+FFFD)
 
 All three are **strict about their argument type** — `string_to_bytes` rejects a
 non-string, `bytes_to_string`/`bytes_len` reject a non-bytes — so a `to_mix_string`
-placeholder like `<bytes:N>` can never silently leak in.
+placeholder like `<bytes:N>` can never silently leak in. The `lossy` option is a
+strict bool too: `{lossy: "true"}` or `{lossy: 1}` raises `TYPE_MISMATCH` rather
+than being read as a truthiness.
 
 ```mix
 $b = string_to_bytes("héllo")

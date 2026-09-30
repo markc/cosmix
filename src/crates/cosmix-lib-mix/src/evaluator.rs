@@ -14234,8 +14234,16 @@ impl Evaluator {
     /// process/network/bus — where a wrong-typed operand means a side
     /// effect on the wrong target (`mkdir(42)` created a directory named
     /// `42`); pure builtins are gated only under strict mode in this
-    /// first release. A nil argument is the documented omitted-arg
-    /// sentinel and never a type fault on its own (A6).
+    /// first release.
+    ///
+    /// A6: a nil VALUE is checked like any other — there is no blanket
+    /// nil exemption, so `write_file(nil, "x")` can never coerce a
+    /// required string path into a literal "nil" target. Optional args
+    /// that intentionally treat an explicit nil as omission declare it
+    /// in the registry (`any_of(…, nil)` in the contract), and those are
+    /// the only nil values the gate passes; a nil in a plain
+    /// string/number/map slot raises TYPE_MISMATCH in the same modes as
+    /// any other wrong type.
     fn check_builtin_args(&self, name: &str, args: &[Value], critical_only: bool) -> MixResult<()> {
         use crate::builtin_info::TypeShape;
         let Some(info) = builtins::builtin_info_of(name) else {
@@ -14254,7 +14262,13 @@ impl Evaluator {
             return Ok(());
         }
         for (i, (value, arg_info)) in args.iter().zip(info.contract.args).enumerate() {
-            if matches!(value, Value::Nil) || arg_info.variadic {
+            // Variadic slots stay shape-unchecked (the body owns them);
+            // a `nil` VALUE is NOT skipped — it must satisfy the declared
+            // shape like any other value, so a required string path can
+            // never coerce nil into a literal "nil" target. Optional args
+            // that legitimately treat nil as omission declare it via
+            // `any_of(..., nil)` in their contract.
+            if arg_info.variadic {
                 continue;
             }
             let shape = arg_info.kind;
@@ -14262,17 +14276,31 @@ impl Evaluator {
                 continue;
             }
             if !value_matches_shape(value, &shape) {
-                return Err(self.coded_err(
-                    "TYPE_MISMATCH",
-                    format!(
-                        "{}(): argument {} ({}) must be {}, got {} (see: mix man io)",
-                        name,
-                        i + 1,
-                        arg_info.name,
-                        shape.human(),
-                        value.type_name()
-                    ),
-                ));
+                let mut msg = format!(
+                    "{}(): argument {} ({}) must be {}, got {}",
+                    name,
+                    i + 1,
+                    arg_info.name,
+                    shape.human(),
+                    value.type_name()
+                );
+                // Point at the manual page that covers THIS builtin (the
+                // old blanket "io" misdirected kill/hash_file callers),
+                // then append the argument-specific guidance the contract
+                // declares (encode-first for write payloads, no-coercion
+                // for kill's pid/signal, …) so the narrowed gate keeps the
+                // instructional clauses that used to live in the builtins
+                // themselves (A2 residual, A3a).
+                if let Some(topic) = builtins::man_topic_for_builtin(name) {
+                    msg.push_str(" (see: mix man ");
+                    msg.push_str(topic);
+                    msg.push(')');
+                }
+                if let Some(hint) = info.contract.arg_hint(arg_info.name) {
+                    msg.push_str(" — ");
+                    msg.push_str(hint);
+                }
+                return Err(self.coded_err("TYPE_MISMATCH", msg));
             }
         }
         Ok(())
