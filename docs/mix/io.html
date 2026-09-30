@@ -552,6 +552,8 @@ tail(path[, n])          -&gt; list      (last n lines, default 10 — reads bac
 line_count(path)         -&gt; number   (count lines by streaming; works on non-UTF-8 files)
 read_file_bytes(path)    -&gt; bytes     (raw; binary-safe)
 read_file_bytes(p, max)  -&gt; bytes     (read at most `max` bytes — header-sniff)
+stdin_copy(path)         -&gt; nil       (stream stdin to a file, flushing every chunk)
+tty_mode("raw"|"cooked") -&gt; nil       (raw/cooked terminal mode; original restored on exit)
 </code></pre>
 <pre><code class="language-mix">write_file("/tmp/io/hello.txt", "line one\nline two\nline three\n")
 

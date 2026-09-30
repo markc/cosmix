@@ -119,17 +119,19 @@ status=200
 body_len=559
 ```
 
-## The three calls
+## The four calls
 
 ```
 http_get(url, [headers], [{timeout, ssl_verify, ca_file, ca_pem}])                      -- GET
 http_post(url, body, [headers], [{timeout, ssl_verify, ca_file, ca_pem}])               -- POST with a body
 http_request(method, url, [body], [headers], [{timeout, ssl_verify, ca_file, ca_pem}])  -- any verb
+http_post_multipart(url, fields, files, [headers], [opts])                              -- POST multipart/form-data
 ```
 
 - `url` — a string (anything else is stringified via the usual coercion).
 - `headers` — an optional **map** of header name → value (see [Headers](#headers)).
 - `body` — a string (sent as UTF-8) or a `bytes` buffer (sent raw); see [Request bodies](#request-bodies).
+- `fields` / `files` (`http_post_multipart` only, v0.103.12) — `fields` is a map of string form fields; `files` is a map of `field_name → {filename, content_type?, data: bytes|buffer}`. The multipart boundary is generated and the `Content-Type` header set accordingly — the generic webhook/file-upload slot, so a vendor upload is a script over this, never a core dependency (see [Request bodies](#request-bodies)).
 - `method` (`http_request` only) — upper-cased internally, so `"get"`, `"Get"`, `"GET"` are equivalent. It must be a valid [RFC 7230](https://www.rfc-editor.org/rfc/rfc7230) token (no spaces / control bytes) or the call returns the error shape — this guards against request-line injection.
 - `{timeout, ssl_verify, ca_file, ca_pem}` — an optional trailing **opts map**. `timeout` bounds the whole request (default 30 s, `{timeout: 0}` disables — see [Timeouts](#timeouts)). `ssl_verify` defaults to `true`; `ssl_verify: false` **skips TLS certificate and hostname verification** for that call (like `curl -k`) — see [Skipping TLS verification](#skipping-tls-verification).
 - `ca_file` / `ca_pem` (v0.29.0) — trust a **private CA** for this call: `ca_file` reads PEM certificate(s) from a path, `ca_pem` takes them inline (string/bytes/buffer). The certificates are **ADDED to the default (Mozilla webpki) roots** — chain building and hostname verification still run in full, so this is the right way to talk to an internal endpoint with a proper private-CA-issued cert (the readiness-check case), unlike `ssl_verify: false` which proves nothing. Mutually exclusive with each other and with `ssl_verify: false`; input capped at 4 MiB; a missing/unreadable file, invalid PEM, or PEM with no certificates raises a catchable `HTTP_TLS` structured error (see [errors](errors.md)). In a capability-sandboxed embedder, `ca_file` additionally requires the `fs-read` class (declared as a conditional capability in the builtin metadata).

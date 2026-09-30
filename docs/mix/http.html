@@ -545,15 +545,17 @@ print("body_len=" .. length($r["body"]))
 <pre><code class="language-text">status=200
 body_len=559
 </code></pre>
-<h2 id="the-three-calls">The three calls</h2>
+<h2 id="the-four-calls">The four calls</h2>
 <pre><code>http_get(url, [headers], [{timeout, ssl_verify, ca_file, ca_pem}])                      -- GET
 http_post(url, body, [headers], [{timeout, ssl_verify, ca_file, ca_pem}])               -- POST with a body
 http_request(method, url, [body], [headers], [{timeout, ssl_verify, ca_file, ca_pem}])  -- any verb
+http_post_multipart(url, fields, files, [headers], [opts])                              -- POST multipart/form-data
 </code></pre>
 <ul>
 <li><code>url</code> — a string (anything else is stringified via the usual coercion).</li>
 <li><code>headers</code> — an optional <strong>map</strong> of header name → value (see <a href="/mix/http#headers">Headers</a>).</li>
 <li><code>body</code> — a string (sent as UTF-8) or a <code>bytes</code> buffer (sent raw); see <a href="/mix/http#request-bodies">Request bodies</a>.</li>
+<li><code>fields</code> / <code>files</code> (<code>http_post_multipart</code> only, v0.103.12) — <code>fields</code> is a map of string form fields; <code>files</code> is a map of <code>field_name → {filename, content_type?, data: bytes|buffer}</code>. The multipart boundary is generated and the <code>Content-Type</code> header set accordingly — the generic webhook/file-upload slot, so a vendor upload is a script over this, never a core dependency (see <a href="/mix/http#request-bodies">Request bodies</a>).</li>
 <li><code>method</code> (<code>http_request</code> only) — upper-cased internally, so <code>"get"</code>, <code>"Get"</code>, <code>"GET"</code> are equivalent. It must be a valid <a href="https://www.rfc-editor.org/rfc/rfc7230">RFC 7230</a> token (no spaces / control bytes) or the call returns the error shape — this guards against request-line injection.</li>
 <li><code>{timeout, ssl_verify, ca_file, ca_pem}</code> — an optional trailing <strong>opts map</strong>. <code>timeout</code> bounds the whole request (default 30 s, <code>{timeout: 0}</code> disables — see <a href="/mix/http#timeouts">Timeouts</a>). <code>ssl_verify</code> defaults to <code>true</code>; <code>ssl_verify: false</code> <strong>skips TLS certificate and hostname verification</strong> for that call (like <code>curl -k</code>) — see <a href="/mix/http#skipping-tls-verification">Skipping TLS verification</a>.</li>
 <li><code>ca_file</code> / <code>ca_pem</code> (v0.29.0) — trust a <strong>private CA</strong> for this call: <code>ca_file</code> reads PEM certificate(s) from a path, <code>ca_pem</code> takes them inline (string/bytes/buffer). The certificates are <strong>ADDED to the default (Mozilla webpki) roots</strong> — chain building and hostname verification still run in full, so this is the right way to talk to an internal endpoint with a proper private-CA-issued cert (the readiness-check case), unlike <code>ssl_verify: false</code> which proves nothing. Mutually exclusive with each other and with <code>ssl_verify: false</code>; input capped at 4 MiB; a missing/unreadable file, invalid PEM, or PEM with no certificates raises a catchable <code>HTTP_TLS</code> structured error (see <a href="/mix/errors">errors</a>). In a capability-sandboxed embedder, <code>ca_file</code> additionally requires the <code>fs-read</code> class (declared as a conditional capability in the builtin metadata).</li>

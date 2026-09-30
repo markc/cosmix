@@ -125,6 +125,8 @@ tail(path[, n])          -> list      (last n lines, default 10 — reads backwa
 line_count(path)         -> number   (count lines by streaming; works on non-UTF-8 files)
 read_file_bytes(path)    -> bytes     (raw; binary-safe)
 read_file_bytes(p, max)  -> bytes     (read at most `max` bytes — header-sniff)
+stdin_copy(path)         -> nil       (stream stdin to a file, flushing every chunk)
+tty_mode("raw"|"cooked") -> nil       (raw/cooked terminal mode; original restored on exit)
 ```
 
 ```mix
