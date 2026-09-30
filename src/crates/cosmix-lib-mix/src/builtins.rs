@@ -24623,6 +24623,7 @@ pub(crate) mod socket_sources {
             let tcp_port = tcp_l.local_addr().unwrap().port();
             let (ws_tx, ws_rx) = std::sync::mpsc::channel::<Vec<u8>>();
             let (tcp_tx, tcp_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+            let (ws_release, ws_hold) = std::sync::mpsc::channel::<()>();
             let ws_server = std::thread::spawn(move || {
                 let (stream, _) = ws_l.accept().unwrap();
                 let mut conn = tungstenite::accept(stream).unwrap();
@@ -24639,6 +24640,9 @@ pub(crate) mod socket_sources {
                     other => panic!("expected text, got {other:?}"),
                 };
                 ws_tx.send(t.as_bytes().to_vec()).unwrap();
+                // Keep the peer live until the subscription refusal is
+                // asserted; peer-close retirement is a different contract.
+                ws_hold.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
             });
             let tcp_server = std::thread::spawn(move || {
                 let (mut stream, _) = tcp_l.accept().unwrap();
@@ -24716,6 +24720,7 @@ pub(crate) mod socket_sources {
             let err = pull_conn("ws_recv", SHARED).err().expect("subscribed pull refused");
             assert!(matches!(err, MixError::Structured(info) if info.code == "SOCKET_SUBSCRIBED"));
             ne.close();
+            ws_release.send(()).unwrap();
             ws_server.join().unwrap();
             tcp_server.join().unwrap();
         }
