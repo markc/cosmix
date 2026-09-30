@@ -50,6 +50,7 @@ must appear in the error.
 | `replace()` replaces the first | it replaces **all** of them | `print(replace("a a a", "a", "b"))` | `b b b` |
 | `mix -c 'print(x)'` needs escaping gymnastics | it does not; a probe is one call and the binary is the oracle | `print(mix_version() != "")` | `true` |
 | a provable `-c` arity/dead-mutation snippet runs | the D1 lint gate REFUSES it with exit 2 before any line runs — `--no-lint` overrides (0.103.4) | `mix -c '$m = {}; remove($m, "k")'` | `!refusing to run` |
+| `is_reload_candidate()` is true while a `--serve` RELOAD is pending | it is true **only while the replacement's init body executes** — false in a plain script, at initial boot, and in every committed generation; the candidate must stay passive (no starts, no persisted writes) and commit-time work belongs in `on lifecycle.commit` | `print(is_reload_candidate())` | `false` |
 
 ## Three rules that are not a syntax trap
 

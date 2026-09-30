@@ -71,6 +71,12 @@ impl ReloadIdentity {
         self.generation.set(self.generation.get() + 1);
         *self.script_loaded_at.borrow_mut() = chrono::Utc::now().to_rfc3339();
     }
+
+    /// The current committed generation — what the serve driver stamps
+    /// into the post-swap `lifecycle.commit` event's `generation` arg.
+    pub fn generation(&self) -> u64 {
+        self.generation.get()
+    }
 }
 
 impl Default for ReloadIdentity {
@@ -343,7 +349,7 @@ impl MixServeRuntime {
     /// deliberately NOT reserved: an author may implement them, so they
     /// must remain advertisable in HELP and must fall through here.
     fn is_reserved(&self, command: &str) -> bool {
-        matches!(command, "HELP" | "INFO" | "QUIT" | "RELOAD")
+        matches!(command, "HELP" | "INFO" | "QUIT" | "RELOAD" | "lifecycle.commit")
             || command
                 .strip_prefix(&self.props_prefix)
                 .is_some_and(|s| matches!(s, "get" | "list" | "describe"))
@@ -558,6 +564,24 @@ impl ServeRuntime for MixServeRuntime {
                         quit: false,
                         reload: false,
                     }
+                });
+            }
+            "lifecycle.commit" => {
+                // Native-only post-swap hook. The ONE real delivery is the
+                // serve driver's local queue injection after the swap commits
+                // (it bypasses this chokepoint); a wire-arrived copy is
+                // refused here — an external ABP caller must not be able to
+                // run a loader's commit behaviour before or after the real
+                // commit. Reserved-and-refused: a correlated request gets a
+                // refusal reply, an uncorrelated delivery is consumed.
+                return Some(ReservedOutcome {
+                    rc: 10,
+                    body: json!({
+                        "error": "lifecycle.commit is a native runtime hook, not a callable verb"
+                    })
+                    .to_string(),
+                    quit: false,
+                    reload: false,
                 });
             }
             _ => {}
@@ -1001,6 +1025,54 @@ mod tests {
         assert!(
             r.handle_reserved("statecache.props.set", None, "", &[], true)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn lifecycle_commit_is_refused_for_wire_callers() {
+        // The native-only post-swap hook: only the serve driver's local
+        // queue injection may deliver it (it bypasses this chokepoint). A
+        // wire-arrived copy — the spoof an external ABP caller would use
+        // to run behaviour ahead of or behind the real commit — is
+        // refused for requests and consumed for uncorrelated deliveries.
+        let r = rt();
+        let out = r
+            .handle_reserved(
+                "lifecycle.commit",
+                Some(r#"{"generation":0}"#),
+                "",
+                &[],
+                true,
+            )
+            .expect("reserved and refused, never author-dispatched");
+        assert_eq!(out.rc, 10);
+        assert!(!out.quit && !out.reload, "a refusal must not quit or reload");
+        assert!(
+            r.handle_reserved("lifecycle.commit", None, "", &[], false)
+                .is_some(),
+            "an uncorrelated delivery is consumed, not dispatched"
+        );
+        // And HELP never advertises a verb no caller can use.
+        let help = r
+            .handle_reserved(
+                "HELP",
+                None,
+                "",
+                &[("lifecycle.commit", None), ("statecache.get", None)],
+                true,
+            )
+            .unwrap();
+        let v: Json = serde_json::from_str(&help.body).unwrap();
+        let names: Vec<&str> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["name"].as_str())
+            .collect();
+        assert!(names.contains(&"statecache.get"));
+        assert!(
+            !names.contains(&"lifecycle.commit"),
+            "the native-only hook must not be advertised as callable: {names:?}"
         );
     }
 

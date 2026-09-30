@@ -300,6 +300,7 @@ builtin_table! {
     ("bus_call", CapabilityClass::Bus,         "bus",     "Call a host-injected Bus verb under delegated identity: bus_call(verb, args) → reply. The embedder bounds which verbs are reachable and injects the delegation envelope; the script names no host/peer/actor", contract!((verb: string, args?: map) -> any; effects[blocking]; failure[raises])),
     ("publish", CapabilityClass::Bus,          "bus",     "One-call topic publish (0.63.0): publish(topic, body[, opts]) builds the SPEC-02 wire frame and sends it via noded topic.publish — no hand-built ---\\n frames, no body=/name= header-route trap. body is the payload STRING (json_encode a map first); opts: {retain: bool, command: string (inner frame header override, defaults to topic), headers: map}. Sets $rc/$result like `send`; returns rc (0 = published)", contract!((topic: string, body?: any_of(string, nil), opts?: map) -> number; effects[blocking]; failure[raises])),
     ("serve_name", CapabilityClass::Pure,      "bus",     "The Bus service name this `mix --serve` citizen registered under — the `--name` value, else the script-stem derivation — or nil in a plain script or the REPL. Read it instead of hard-coding the name: a second instance started with `--name other` must publish `other`, not the first instance's name, in anything that routes replies or clicks back to it. `$me = serve_name() ?? \"quoin-panel\"` keeps a script runnable outside serve mode (v0.91.0)", contract!(() -> any_of(string, nil))),
+    ("is_reload_candidate", CapabilityClass::Pure, "bus", "True only while a `--serve` hot-reload candidate's init body is executing (false during the initial boot, in a plain script, and in every committed generation). A loader branches on it: the candidate must prepare passive state only — no starts, no spawns, no stopping old behaviour, no persisted writes — because a failed candidate reverts to the old evaluator with its managed children intact, and the committed generation reaps the old children before its own `lifecycle.commit` handler starts anything. Commit-time work belongs in an `on lifecycle.commit` handler, which the runtime queues locally exactly once per committed swap", contract!(() -> bool)),
 
     ("env", CapabilityClass::Env,             "system",  "Get environment variable value (\"\" if unset); env(name, default) returns default when unset or empty", contract!((name: string, default?: any) -> any)),
     ("time", CapabilityClass::Pure,            "system",  "Return current Unix timestamp as float", contract!(() -> number)),
@@ -927,6 +928,7 @@ pub const EVAL_SPECIAL_BUILTINS: &[&str] = &[
     "eprint_raw",
     "serve_name",
     "script_version",
+    "is_reload_candidate",
 ];
 
 /// Membership gate the evaluator consults before dispatching to
@@ -4432,7 +4434,14 @@ pub(crate) fn spawn_argv_native(args: Vec<Value>, mut native: Option<&mut crate:
     }
     #[cfg(target_os = "linux")]
     if die_with_parent {
-        owned_spawns::register(child.id() as libc::pid_t);
+        // Tag the registration with the spawning evaluator's owner id so a
+        // serve hot-reload can retire legacy children per generation: the
+        // committed swap sweeps every owner except its own; a failed
+        // candidate sweeps only its own.
+        owned_spawns::register_owned(
+            child.id() as libc::pid_t,
+            native.as_ref().map(|n| n.owner_id()),
+        );
     }
     Ok(Some(Value::Number(child.id() as f64)))
 }
@@ -4499,7 +4508,13 @@ pub mod owned_spawns {
     /// How long the graceful sweep waits between SIGTERM and SIGKILL.
     pub const SWEEP_GRACE: Duration = Duration::from_secs(2);
 
-    static OWNED: Mutex<Vec<libc::pid_t>> = Mutex::new(Vec::new());
+    /// Registry entries carry the spawning evaluator's owner id (`None` for
+    /// spawns that reached the builtin without an evaluator context). Owner
+    /// tags make a serve hot-reload generation-scoped: the committed swap
+    /// retires every earlier generation's legacy children, and a failed
+    /// candidate retires only the ones IT spawned — neither sweep can touch
+    /// the other side of the swap.
+    static OWNED: Mutex<Vec<(libc::pid_t, Option<u64>)>> = Mutex::new(Vec::new());
 
     /// The one thread allowed to create owned children. PDEATHSIG is keyed to
     /// the creating THREAD and the registry is process-wide, so the facility
@@ -4536,10 +4551,17 @@ pub mod owned_spawns {
     /// dropped, so a long-lived citizen's registry stays bounded by the groups
     /// that are actually alive. A dead leader whose group still has members is
     /// KEPT unreaped — its zombie pins the pgid for the sweep.
+    #[cfg(test)]
     pub(crate) fn register(pid: libc::pid_t) {
+        register_owned(pid, None);
+    }
+
+    /// Register an owned child and record which evaluator generation spawned
+    /// it (see the registry doc on [`OWNED`]).
+    pub(crate) fn register_owned(pid: libc::pid_t, owner: Option<u64>) {
         let mut owned = OWNED.lock().unwrap_or_else(|e| e.into_inner());
-        owned.retain(|pid| retain_entry(*pid));
-        owned.push(pid);
+        owned.retain(|(pid, _)| retain_entry(*pid));
+        owned.push((pid, owner));
     }
 
     /// Keep an entry? Reaps (and drops) a finished one. Call with the lock
@@ -4566,7 +4588,7 @@ pub mod owned_spawns {
     /// check and get its group signalled. `None` when `pid` is not owned.
     pub(crate) fn observe(pid: libc::pid_t) -> Option<bool> {
         let mut owned = OWNED.lock().unwrap_or_else(|e| e.into_inner());
-        let index = owned.iter().position(|p| *p == pid)?;
+        let index = owned.iter().position(|(p, _)| *p == pid)?;
         let alive = leader_state(pid) == Some(false);
         if !retain_entry(pid) {
             owned.swap_remove(index);
@@ -4601,10 +4623,55 @@ pub mod owned_spawns {
     /// signals nothing. A group whose leader was already reaped elsewhere is
     /// skipped — its pgid can no longer be proven ours.
     pub fn sweep() -> usize {
-        // The lock is held for the whole sweep: no other path may reap an
-        // owned pid between the identity check below and the last signal.
-        let mut owned = OWNED.lock().unwrap_or_else(|e| e.into_inner());
-        let pids = std::mem::take(&mut *owned);
+        let pids = {
+            let mut owned = OWNED.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *owned)
+                .into_iter()
+                .map(|(pid, _)| pid)
+                .collect()
+        };
+        sweep_live(pids)
+    }
+
+    /// Generation-scoped retire: end exactly the children `owner` spawned,
+    /// leaving every other registration (and its children) running. The
+    /// failed-candidate half of the hot-reload contract — a candidate whose
+    /// init raised still had its `die_with_parent` starts swept, while the
+    /// old generation's children are untouched.
+    pub fn sweep_owned_by(owner: u64) -> usize {
+        let mine = {
+            let mut owned = OWNED.lock().unwrap_or_else(|e| e.into_inner());
+            let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut *owned)
+                .into_iter()
+                .partition(|(_, o)| *o == Some(owner));
+            *owned = rest;
+            mine
+        };
+        sweep_live(mine.into_iter().map(|(pid, _)| pid).collect())
+    }
+
+    /// Generation-scoped retire: end every owned child EXCEPT `owner`'s. The
+    /// committed-swap half of the hot-reload contract — the earlier
+    /// generation's legacy children retire after the swap commits, while the
+    /// replacement evaluator's own init-time starts survive to serve.
+    pub fn sweep_owned_except(owner: u64) -> usize {
+        let doomed = {
+            let mut owned = OWNED.lock().unwrap_or_else(|e| e.into_inner());
+            let (mine, doomed): (Vec<_>, Vec<_>) = std::mem::take(&mut *owned)
+                .into_iter()
+                .partition(|(_, o)| *o == Some(owner));
+            *owned = mine;
+            doomed
+        };
+        sweep_live(doomed.into_iter().map(|(pid, _)| pid).collect())
+    }
+
+    /// The shared kill sequence: SIGTERM+SIGCONT the groups, wait up to
+    /// [`SWEEP_GRACE`] for every GROUP to empty (not just its leader), then
+    /// SIGKILL and reap the leaders. The registry lock is NOT held here —
+    /// the caller already removed these entries, so no other path can reap
+    /// one of these pids between the identity check and the last signal.
+    fn sweep_live(pids: Vec<libc::pid_t>) -> usize {
         let live: Vec<libc::pid_t> = pids
             .into_iter()
             .filter(|pid| leader_state(*pid).is_some())
@@ -26550,6 +26617,53 @@ mod owned_spawns_tests {
         assert!(swept, "the sweep must end the pinned group's descendant");
         assert_eq!(state(pid), None, "the sweep reaps the leader");
     }
+
+    /// Generation-scoped retires (the hot-reload contract): a failed
+    /// candidate sweeps exactly its own children, leaving the old
+    /// generation's running; a committed swap sweeps every owner except
+    /// the replacement's.
+    #[test]
+    #[allow(clippy::zombie_processes)]
+    fn generation_scoped_sweeps_spare_the_other_side_of_the_swap() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = owned_spawns::sweep();
+        let spawn = || {
+            std::process::Command::new("sleep")
+                .arg("60")
+                .process_group(0)
+                .spawn()
+                .unwrap()
+                .id() as i32
+        };
+        let old_pid = spawn();
+        let cand_pid = spawn();
+        owned_spawns::register_owned(old_pid, Some(7));
+        owned_spawns::register_owned(cand_pid, Some(8));
+
+        // The failed-candidate retire: exactly the candidate's child dies.
+        assert_eq!(owned_spawns::sweep_owned_by(8), 1);
+        assert!(
+            state(old_pid).is_some(),
+            "the old generation's child survives a failed candidate"
+        );
+        assert!(gone(cand_pid, Duration::from_secs(5)), "the candidate's child is retired");
+        assert_eq!(owned_spawns::sweep_owned_by(8), 0, "the entry was consumed");
+
+        // The committed-swap retire: everything except the replacement's
+        // own init-time starts.
+        let fresh_pid = spawn();
+        owned_spawns::register_owned(fresh_pid, Some(9));
+        assert_eq!(owned_spawns::sweep_owned_except(9), 1);
+        assert!(gone(old_pid, Duration::from_secs(5)), "the old generation retires at commit");
+        assert!(
+            state(fresh_pid).is_some(),
+            "the replacement's own start survives the commit sweep"
+        );
+
+        // The process-end sweep still covers what remains.
+        assert_eq!(owned_spawns::sweep(), 1);
+        assert!(gone(fresh_pid, Duration::from_secs(5)));
+    }
 }
 
 /// TODO-mix P3 crash consistency: whatever fails, and wherever, the target
@@ -30976,6 +31090,7 @@ mod char_aware_tests {
             "sort",
             "split",
             "sprintf",
+            "is_reload_candidate",
             "sql_quote",
             "starts_with",
             "string_to_bytes",

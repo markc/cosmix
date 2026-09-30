@@ -992,6 +992,12 @@ reaches stderr, <code>lifecycle.health</code> flips to <code>degraded</code>, an
 the props surface. Before 0.63.0 a faulting handler looked exactly like a
 healthy one (noded reported <code>delivered=1</code> while its side effects silently
 never happened).</p>
+<p><strong><code>lifecycle.commit</code> is a native hook, never a verb.</strong> After a hot-reload
+swap commits, the runtime queues one local <code>lifecycle.commit</code> event into
+the new generation (see <a href="/mix/serve">Serve citizens</a> — post-commit
+handover). A wire-delivered <code>lifecycle.commit</code> is refused with <code>rc 10</code>
+before any author handler and is filtered from <code>HELP</code>: an external caller
+cannot run a loader's commit behaviour ahead of or behind the real commit.</p>
 <p>A live citizen answers the standard verbs like any Rust daemon:</p>
 <pre><code class="language-mix">send statecache HELP
 print("" .. $result)

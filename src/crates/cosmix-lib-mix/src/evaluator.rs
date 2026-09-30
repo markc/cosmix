@@ -2966,6 +2966,7 @@ pub(crate) const INLINE_SPECIAL_FORMS: &[&str] = &[
     "publish",
     "serve_name",
     "script_version",
+    "is_reload_candidate",
     "fs_watch",
     "fs_unwatch",
     "fs_wait",
@@ -3789,6 +3790,22 @@ pub(crate) struct EvaluatorGlobals {
     /// `notify_one` stores at most one permit, so a fire that races ahead
     /// of the `notified()` await is not lost.
     quit_notify: Arc<tokio::sync::Notify>,
+    /// True only while this evaluator is a hot-reload candidate executing
+    /// its init body (see [`Evaluator::set_reload_candidate`] and the
+    /// `is_reload_candidate()` builtin). False for the initial boot, plain
+    /// scripts and every committed generation — the serve driver clears it
+    /// before the swap commits.
+    reload_candidate: bool,
+    /// Exactly-once guard for [`Evaluator::queue_lifecycle_commit`]: one
+    /// commit event per generation, refused if a second injection is
+    /// attempted.
+    lifecycle_commit_queued: bool,
+    /// Runtime-synthesized local events (the post-swap `lifecycle.commit`).
+    /// Dispatched by [`Evaluator::run_event_pump`] at the top of every loop
+    /// iteration, BEFORE any transport wait — a local commit must not depend
+    /// on the Bus connection and survives broker loss. Dropped with the
+    /// evaluator on shutdown (drain/close owns the cleanup).
+    pending_local: std::collections::VecDeque<IncomingEvent>,
     /// Exit requested from a serve handler activation. Handler errors are
     /// normally isolated, and Class C activations run in spawned local tasks,
     /// so they cannot return `ExitRequest` directly to the event pump. The
@@ -3887,6 +3904,9 @@ impl EvaluatorGlobals {
             interrupted: Arc::new(AtomicBool::new(false)),
             quit_requested: Arc::new(AtomicBool::new(false)),
             quit_notify: Arc::new(tokio::sync::Notify::new()),
+            reload_candidate: false,
+            lifecycle_commit_queued: false,
+            pending_local: std::collections::VecDeque::new(),
             exit_requested: None,
             reload_requested: false,
             trace: false,
@@ -4591,6 +4611,63 @@ impl Evaluator {
         self.globals.borrow_mut().serve_runtime = Some(runtime);
     }
 
+    /// Mark this evaluator as a hot-reload candidate while its init body
+    /// executes (SPEC 18 RELOAD, post-commit handover). The serve driver
+    /// sets this on the replacement evaluator BEFORE `execute()` and clears
+    /// it once the init body returned — so `is_reload_candidate()` is true
+    /// exactly during candidate preparation, and false for the initial boot,
+    /// plain scripts and every committed generation.
+    pub fn set_reload_candidate(&mut self, candidate: bool) {
+        self.globals.borrow_mut().reload_candidate = candidate;
+    }
+
+    /// Queue the one post-swap `lifecycle.commit` event for this generation.
+    ///
+    /// Called by the serve driver AFTER the swap has committed: the old
+    /// evaluator's managed children were reaped (`close_native_events`), the
+    /// shared identity was bumped (`committed_reload`), and the legacy
+    /// `die_with_parent` children of earlier generations were swept — so a
+    /// handler that starts behaviour here can never overlap the old
+    /// generation's children.
+    ///
+    /// The event is a LOCAL queue injection, not a Bus self-emit: it is
+    /// dispatched by the pump independent of the broker connection, it is
+    /// never visible to other citizens, and an external caller cannot spoof
+    /// it (the serve runtime refuses a wire-delivered `lifecycle.commit`).
+    /// Exactly-once per generation: a second call is a programming error and
+    /// is refused. The event carries `{generation}` — the identity's
+    /// post-bump generation — as `$event.args.generation`.
+    ///
+    /// Contract: call this only BEFORE this evaluator's pump enters its
+    /// transport wait (the serve driver queues immediately after the swap,
+    /// before `run_event_pump` resumes), so no wake mechanism is needed;
+    /// shutdown between queueing and dispatch simply drops the event with
+    /// the evaluator — durable intent re-derives it on the next boot.
+    pub fn queue_lifecycle_commit(&mut self, generation: u64) {
+        let mut g = self.globals.borrow_mut();
+        if g.lifecycle_commit_queued {
+            tracing::error!(
+                generation,
+                "serve: duplicate lifecycle.commit injection refused (one per generation)"
+            );
+            return;
+        }
+        g.lifecycle_commit_queued = true;
+        g.pending_local.push_back(IncomingEvent {
+            command: "lifecycle.commit".to_string(),
+            headers: std::collections::BTreeMap::new(),
+            body: serde_json::json!({ "generation": generation }).to_string(),
+        });
+    }
+
+    /// This evaluator generation's owner id for the process-global legacy
+    /// child registry (`builtins::owned_spawns`): the serve driver sweeps
+    /// `sweep_owned_except(owner)` at a committed swap and
+    /// `sweep_owned_by(owner)` when a candidate is discarded.
+    pub fn native_owner_id(&self) -> u64 {
+        self.globals.borrow().native_events.owner_id()
+    }
+
     /// Retire this generation only AFTER its handler drain. Also called on a
     /// rejected reload candidate; queued records can never enter its successor.
     pub fn close_native_events(&mut self) {
@@ -5278,6 +5355,22 @@ impl Evaluator {
                     g.quit_requested.store(false, Ordering::Relaxed);
                     break "quit";
                 }
+            }
+
+            // Runtime-synthesized local events (the post-swap
+            // `lifecycle.commit`) dispatch BEFORE any transport wait: a
+            // local commit must not depend on the broker connection and is
+            // processed even with no Bus handler or native sources (broker
+            // loss, isolated bootstrap). Exactly one is queued per
+            // committed reload; a shutdown before dispatch drops it with
+            // the evaluator — durable intent re-derives it on the next boot.
+            let local = self.globals.borrow_mut().pending_local.pop_front();
+            if let Some(ev) = local {
+                self.dispatch_event(ev).await?;
+                if self.globals.borrow().handlers.is_empty() {
+                    break "handlers_drained";
+                }
+                continue;
             }
 
             // Await next incoming message. Cancellation safety: the
@@ -12653,6 +12746,18 @@ impl Evaluator {
                         return Ok(runtime
                             .and_then(|rt| rt.service_name().map(|s| Value::String(s.to_string())))
                             .unwrap_or(Value::Nil));
+                    }
+
+                    // is_reload_candidate() — true only while THIS evaluator
+                    // is a hot-reload candidate executing its init body (set
+                    // by the serve driver around the replacement's execute;
+                    // cleared before the swap commits). False in a plain
+                    // script, the initial boot and committed generations, so
+                    // a loader branches its top-level on it: candidate =
+                    // passive preparation, anything else = full boot.
+                    if name == "is_reload_candidate" {
+                        self.check_capability(name)?; // Knob A
+                        return Ok(Value::Bool(self.globals.borrow().reload_candidate));
                     }
 
                     // script_version() — the entry script's provenance map,
