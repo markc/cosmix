@@ -61,7 +61,8 @@ fn multipart_body_reaches_the_server_well_formed() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "200");
 
-    let req = String::from_utf8_lossy(&captured.lock().unwrap());
+    let captured_bytes = captured.lock().unwrap();
+    let req = String::from_utf8_lossy(&captured_bytes);
     assert!(
         req.starts_with("POST /up HTTP/1.1"),
         "request line: {req}"
