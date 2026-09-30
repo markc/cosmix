@@ -131,6 +131,8 @@ Options (unknown keys are a hard `OPTION_INVALID` error):
   REMOVES the variable from the child, the `env -u` form), and `clear_env`
   (bool — start from an empty environment) retain their existing meanings.
   Removals apply AFTER sets, so a key both set and unset ends unset.
+  This also applies to `run_argv_must`, `run_parallel` jobs and each
+  `run_pipeline` stage, including captured and routed output.
 - `max_output`: bytes **per captured stream**, default 8 MiB, `0` disables.
   Excess is drained and discarded — the child is never blocked or killed by the
   cap, and the captured stream's truncation flag is set. The same flag is true
