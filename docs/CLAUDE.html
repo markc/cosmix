@@ -455,6 +455,16 @@ domains, <code>alpha/beta/gamma</code> node names, <code>/home/user</code>.</li>
 (<code>src/</code>), one docs tree. Never hardcode where a checkout or an install
 lives; go through <code>cosmix-lib-config::paths</code> / <code>cosmix_paths</code>.</li>
 </ul>
+<h2 id="core-is-free-and-unencumbered">Core is free and unencumbered</h2>
+<p>CosMix Core — the Bus protocol, the Mix language, the daemon family and the
+desktop — is 100% free to use, unencumbered by copyright or paywalls. Never
+bind core to a specific upstream LLM/media provider unless that binding is
+essential. Reach upstream services through generic builtins (HTTP verbs,
+multipart/file upload, auth seams) so a vendor integration is an optional
+Mix script — a script a user can drop or swap without touching core — and
+the core never inherits a paywalled dependency's terms. Reserve native code
+for what Mix cannot express, and even then build the generic primitive, not
+the vendor call.</p>
 <p>Per-area guidance from the former repositories is in <code>docs/dev/{bus,mix,cos}/</code>.
 Public-safe architecture specifications belong in <code>docs/spec/</code>; their explicit
 draft/acceptance status and source evidence govern how they may be used.

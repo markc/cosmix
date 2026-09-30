@@ -14,6 +14,18 @@ Two rules that outrank anything below:
   (`src/`), one docs tree. Never hardcode where a checkout or an install
   lives; go through `cosmix-lib-config::paths` / `cosmix_paths`.
 
+## Core is free and unencumbered
+
+CosMix Core — the Bus protocol, the Mix language, the daemon family and the
+desktop — is 100% free to use, unencumbered by copyright or paywalls. Never
+bind core to a specific upstream LLM/media provider unless that binding is
+essential. Reach upstream services through generic builtins (HTTP verbs,
+multipart/file upload, auth seams) so a vendor integration is an optional
+Mix script — a script a user can drop or swap without touching core — and
+the core never inherits a paywalled dependency's terms. Reserve native code
+for what Mix cannot express, and even then build the generic primitive, not
+the vendor call.
+
 Per-area guidance from the former repositories is in `docs/dev/{bus,mix,cos}/`.
 Public-safe architecture specifications belong in `docs/spec/`; their explicit
 draft/acceptance status and source evidence govern how they may be used.
