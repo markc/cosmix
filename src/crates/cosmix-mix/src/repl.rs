@@ -1294,12 +1294,25 @@ pub(crate) async fn load_mixrc_async(eval: &mut Evaluator) -> Option<i32> {
         0,
     )];
     match eval.execute(&stmts).await {
-        Ok(_) => None,
+        Ok(_) => {
+            apply_mixrc_arity(eval);
+            None
+        }
         Err(MixError::ExitRequest { code }) => Some(code),
         Err(e) => {
             eprintln!("{}: {}", rc_path.display(), e);
             None
         }
+    }
+}
+
+/// A1 step 1 (TODO-mix strict-arity sweep): `$strict_arity = true` in
+/// ~/.mixrc opts this evaluator into strict arity — the same knob as
+/// `--strict-arity` / `MIX_STRICT_ARITY=1`, settable per-operator without
+/// a wrapper script.
+fn apply_mixrc_arity(eval: &mut Evaluator) {
+    if let Some(cosmix_mix::Value::Bool(true)) = eval.get_global("strict_arity") {
+        eval.set_arity_mode(cosmix_mix::ArityMode::Strict);
     }
 }
 

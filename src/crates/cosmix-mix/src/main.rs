@@ -177,6 +177,36 @@ fn print_uncaught(e: &cosmix_mix::error::MixError) {
 /// missing->nil / extra-ignored binding.
 static STRICT_ARITY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Flags that mean something to `mix` itself. A1 step 1 (TODO-mix):
+/// `mix -c '…' --strict-arity` passes the flag to the SCRIPT as an
+/// argument — it is not read as a flag — so an operator flipping a knob
+/// after the source gets nothing. Warn when a trailing script argument
+/// exactly matches one of these, instead of leaving the knob silently
+/// unset.
+const KNOWN_MIX_FLAGS: &[&str] = &[
+    "--strict-arity",
+    "--no-prelude",
+    "--no-traceback",
+    "--result-fd",
+    "--serve",
+    "--gui",
+    "--help",
+    "-h",
+    "--version",
+    "-V",
+];
+
+fn warn_trailing_flag_args(script_args: &[String]) {
+    for a in script_args {
+        if KNOWN_MIX_FLAGS.contains(&a.as_str()) {
+            eprintln!(
+                "mix: warning: '{a}' after the source is a script argument, not a flag — \
+                 mix flags go BEFORE the script/-c source"
+            );
+        }
+    }
+}
+
 /// Apply the global CLI arity flag to a freshly built evaluator.
 fn apply_arity_mode(eval: &mut Evaluator) {
     if STRICT_ARITY.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1973,6 +2003,17 @@ fn real_main() -> i32 {
     let _ = stats_io::stats_enabled();
     let args: Vec<String> = env::args().collect();
 
+    // A1 step 1 (TODO-mix strict-arity sweep): `MIX_STRICT_ARITY=1` is the
+    // env-level equivalent of `--strict-arity` — the knob scripts and
+    // supervisors set ahead of the step-3 default flip. Read it BEFORE the
+    // arg loop so a trailing flag warning can't race the mode decision.
+    if matches!(
+        env::var("MIX_STRICT_ARITY").as_deref(),
+        Ok("1" | "true" | "yes" | "on")
+    ) {
+        STRICT_ARITY.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     // No arguments → REPL
     if args.len() < 2 {
         return repl::run_repl();
@@ -2043,6 +2084,7 @@ fn real_main() -> i32 {
                 }
                 let code = &args[i];
                 let script_args: Vec<String> = args[i + 1..].to_vec();
+                warn_trailing_flag_args(&script_args);
                 return run_command_line(code, interactive_rc, &script_args, no_prelude, result_fd);
             }
             "--result-fd" => {
@@ -2179,6 +2221,7 @@ fn real_main() -> i32 {
                     return 1;
                 };
                 let script_args: Vec<String> = args[i + 1..].to_vec();
+                warn_trailing_flag_args(&script_args);
                 return run_source(&source, Some("-"), &script_args, no_prelude, Some(provenance));
             }
             arg if arg.starts_with('-') => {
@@ -2231,6 +2274,7 @@ fn real_main() -> i32 {
                     }
                 };
                 let script_args: Vec<String> = args[i + 1..].to_vec();
+                warn_trailing_flag_args(&script_args);
                 return run_source(&source, Some(filename), &script_args, no_prelude, Some(provenance));
             }
         }

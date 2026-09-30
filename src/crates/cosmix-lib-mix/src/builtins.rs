@@ -11077,6 +11077,25 @@ fn plan_ssh_mix(args: Vec<Value>) -> MixResult<(SshCall, Option<String>)> {
             }
         },
     };
+    // A1 step 1 (TODO-mix strict-arity sweep): strict_arity rides the
+    // remote argv as the `--strict-arity` flag. It must come BEFORE the
+    // `-` stdin marker — everything after `-` is a script argument, which
+    // is exactly the trailing-flag trap the main-binary warning now names.
+    let strict_arity = match opts_map.shift_remove("strict_arity") {
+        None | Some(Value::Nil) => false,
+        Some(Value::Bool(b)) => b,
+        Some(other) => {
+            return Err(MixError::RuntimeError {
+                span: None,
+                msg: format!("ssh_mix: strict_arity must be a bool, got {}", other.type_name()),
+            });
+        }
+    };
+    let remote_cmd = if strict_arity {
+        "/opt/cosmix/bin/mix --strict-arity -".to_string()
+    } else {
+        REMOTE_MIX_STDIN_CMD.to_string()
+    };
     opts_map.insert(
         "stdin".into(),
         Value::String(format!("{env_prefix}{bindings_prefix}{source}")),
@@ -11084,7 +11103,7 @@ fn plan_ssh_mix(args: Vec<Value>) -> MixResult<(SshCall, Option<String>)> {
 
     let call = plan_ssh_run(vec![
         host,
-        Value::String(REMOTE_MIX_STDIN_CMD.into()),
+        Value::String(remote_cmd),
         Value::map(opts_map),
     ])?;
     Ok((call, decode_mode))
@@ -22860,6 +22879,30 @@ mod ssh_helpers_tests {
         // `$` is escaped so `${...}` in the payload never interpolates.
         assert_eq!(quote_mix_string("x${y}"), "\"x\\${y}\"");
         assert_eq!(quote_mix_string("a\\b"), "\"a\\\\b\"");
+    }
+
+    #[test]
+    fn ssh_mix_strict_arity_places_the_flag_before_the_stdin_dash() {
+        // A1 step 1: the remote command word must be
+        // `… mix --strict-arity -` — the flag BEFORE the stdin marker, since
+        // everything after `-` is a script argument on the remote side.
+        let (call, _) = super::plan_ssh_mix(vec![
+            Value::String("h".into()),
+            Value::String("print(1)".into()),
+            m(&[("strict_arity", Value::Bool(true))]),
+        ])
+        .expect("plan");
+        let remote = call.argv.last().expect("argv ends with the command");
+        assert_eq!(remote, "/opt/cosmix/bin/mix --strict-arity -");
+        // Without the opt the command is unchanged.
+        let (call2, _) = super::plan_ssh_mix(vec![
+            Value::String("h".into()),
+            Value::String("print(1)".into()),
+            m(&[]),
+        ])
+        .expect("plan");
+        let remote2 = call2.argv.last().expect("argv ends with the command");
+        assert_eq!(remote2, super::REMOTE_MIX_STDIN_CMD);
     }
 
     #[test]
