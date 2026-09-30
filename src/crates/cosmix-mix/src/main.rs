@@ -175,7 +175,12 @@ fn print_uncaught(e: &cosmix_mix::error::MixError) {
 /// outside min..=max and builtin calls outside their contract arity
 /// raise catchable ARITY_MISMATCH errors instead of the compatible
 /// missing->nil / extra-ignored binding.
-static STRICT_ARITY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+///
+/// A1 step 3 (0.103.0): strict is now the DEFAULT for script/`-c`/serve
+/// modes — the compatible binding is opt-in via `--compat-arity`. The
+/// REPL never read this flag and still does not: interactive tolerance
+/// stays the compatible binding unless `~/.mixrc` sets `$strict_arity`.
+static STRICT_ARITY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Flags that mean something to `mix` itself. A1 step 1 (TODO-mix):
 /// `mix -c '…' --strict-arity` passes the flag to the SCRIPT as an
@@ -185,6 +190,7 @@ static STRICT_ARITY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// unset.
 const KNOWN_MIX_FLAGS: &[&str] = &[
     "--strict-arity",
+    "--compat-arity",
     "--no-prelude",
     "--no-traceback",
     "--result-fd",
@@ -2144,6 +2150,14 @@ fn real_main() -> i32 {
             }
             "--strict-arity" => {
                 STRICT_ARITY.store(true, std::sync::atomic::Ordering::Relaxed);
+                i += 1;
+                continue;
+            }
+            "--compat-arity" => {
+                // A1 step 3 (0.103.0): the escape hatch — strict arity is
+                // the default for script/-c/serve modes; this restores the
+                // compatible missing->nil / extra-ignored binding.
+                STRICT_ARITY.store(false, std::sync::atomic::Ordering::Relaxed);
                 i += 1;
                 continue;
             }

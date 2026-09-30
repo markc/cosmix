@@ -106,7 +106,7 @@ $TOKEN = uuid()
 -- create. This would still refuse if the seed operation did nothing.
 $reach = ssh_mix($REMOTE, '
 if which("curl") == nil then
-  raise("curl is unavailable")
+  raise("ECURL", "curl is unavailable")
 end
 print("PIM_SEED_REACH " .. $token)
 ', {bindings: {token: $TOKEN}, connect_timeout: 8, timeout: 15})
