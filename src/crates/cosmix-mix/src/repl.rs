@@ -1311,7 +1311,7 @@ pub(crate) async fn load_mixrc_async(eval: &mut Evaluator) -> Option<i32> {
 /// `--strict-arity` / `MIX_STRICT_ARITY=1`, settable per-operator without
 /// a wrapper script.
 fn apply_mixrc_arity(eval: &mut Evaluator) {
-    if let Some(cosmix_mix::Value::Bool(true)) = eval.get_global("strict_arity") {
+    if let Some(cosmix_mix::value::Value::Bool(true)) = eval.get_global("strict_arity") {
         eval.set_arity_mode(cosmix_mix::ArityMode::Strict);
     }
 }
