@@ -115,4 +115,5 @@ end
 -- hash_sha1() expects at most 2 argument(s), got 3
 -- OPTION_INVALID
 -- string bytes
--- TYPE_MISMATCH hash_file(): argument 2 (algo) must be string, got map (see: mix man io)-- hash_file: unknown algorithm 'sha512' (expected "md5", "sha1", "sha256" or "blake3")
+-- TYPE_MISMATCH hash_file(): argument 2 (algo) must be string, got map (see: mix man io)
+-- hash_file: unknown algorithm 'sha512' (expected "md5", "sha1", "sha256" or "blake3")
