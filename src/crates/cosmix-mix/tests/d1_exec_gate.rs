@@ -31,13 +31,20 @@ fn hard_safe_diagnostic_refuses_with_exit_2_before_running() {
 
 #[test]
 fn no_lint_overrides_the_gate() {
+    // With --no-lint the source RUNS — and under the strict default the
+    // 2-arg remove then fails at runtime with ARITY_MISMATCH (not the
+    // gate's exit-2 refusal).
     let out = mix_bin()
         .args(["--no-lint", "-c", "print(\"ran\")\n$m = {}\nremove($m, \"k\")\n"])
         .output()
         .expect("run mix");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "--no-lint runs regardless: {stderr}");
+    assert!(
+        !out.status.success() && out.status.code() != Some(2),
+        "--no-lint runs the source: {stderr}"
+    );
     assert!(!stderr.contains("refusing to run"), "got: {stderr}");
+    assert!(stderr.contains("ARITY_MISMATCH"), "the runtime caught it: {stderr}");
 }
 
 #[test]
