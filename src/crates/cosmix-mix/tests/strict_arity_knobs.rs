@@ -15,21 +15,27 @@ fn mix_bin() -> Command {
 
 #[test]
 fn env_knob_turns_on_strict_arity() {
+    // A user-function surplus argument is the A1 probe: `f(1, 2)` is the
+    // compatible extra-ignored binding by default and ARITY_MISMATCH under
+    // strict mode. (A builtin surplus would no longer serve — the A2
+    // contract-type check makes e.g. remove(map, key) a TYPE_MISMATCH in
+    // every mode.)
     let out = mix_bin()
         .env("MIX_STRICT_ARITY", "1")
-        .args(["-c", "print(remove({a: 1}, \"x\"))"])
+        .args(["-c", "fn f($x) return 1 end\nprint(f(1, 2))"])
         .output()
         .expect("run mix");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(!out.status.success(), "surplus-arity remove must fail under the env knob");
+    assert!(!out.status.success(), "surplus-arity call must fail under the env knob");
     assert!(stderr.contains("ARITY_MISMATCH"), "got: {stderr}");
-    // And without the knob the same call is the compatible no-op. The
-    // knob is inherited through the environment, so the default arm must
-    // REMOVE it explicitly — a harness or fleet host that already sets
-    // MIX_STRICT_ARITY would otherwise leak into this assertion.
+    // And without the knob the same call is the compatible extra-ignored
+    // binding. The knob is inherited through the environment, so the
+    // default arm must REMOVE it explicitly — a harness or fleet host
+    // that already sets MIX_STRICT_ARITY would otherwise leak into this
+    // assertion.
     let ok = mix_bin()
         .env_remove("MIX_STRICT_ARITY")
-        .args(["-c", "print(remove({a: 1}, \"x\"))"])
+        .args(["-c", "fn f($x) return 1 end\nprint(f(1, 2))"])
         .output()
         .expect("run mix");
     assert!(
@@ -47,7 +53,8 @@ fn mixrc_strict_arity_variable_turns_on_strict_mode() {
     std::fs::write(dir.join(".mixrc"), "$strict_arity = true\n").expect("write .mixrc");
     let out = mix_bin()
         .env("HOME", &dir)
-        .args(["-ci", "print(remove({a: 1}, \"x\"))"])
+        .env_remove("MIX_STRICT_ARITY")
+        .args(["-ci", "fn f($x) return 1 end\nprint(f(1, 2))"])
         .output()
         .expect("run mix -ci");
     let stderr = String::from_utf8_lossy(&out.stderr);
