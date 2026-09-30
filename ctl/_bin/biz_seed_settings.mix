@@ -111,15 +111,15 @@ $SETTINGS = $CONF["settings"]
 -- worker can be launched as the webd account before any write is attempted.
 $preflight = ssh_mix($ADDRESS, '
 if not is_file($db_path) then
-  raise($db_path .. " does not exist yet — warm the site once to create the schema, then re-run")
+  raise("ESCHEMA", $db_path .. " does not exist yet — warm the site once to create the schema, then re-run")
 end
 $uid = trim(run("id -u cosmix-webd"))
 if $rc != 0 or not re_match($uid, "^[0-9]+$") then
-  raise("cosmix-webd account is unavailable")
+  raise("EACCOUNT", "cosmix-webd account is unavailable")
 end
 $_sudo = run("sudo -n -u cosmix-webd true")
 if $rc != 0 then
-  raise("cannot run the seed worker as cosmix-webd with non-interactive sudo")
+  raise("ESUDO", "cannot run the seed worker as cosmix-webd with non-interactive sudo")
 end
 print("BIZ_SEED_PREFLIGHT_OK")
 ', {bindings: {db_path: $DB_PATH}, timeout: 30})
@@ -167,7 +167,7 @@ print("BIZ_SEED_SETTINGS_OK " .. $token)
 $TOKEN = uuid()
 $apply = ssh_mix($ADDRESS, '
 if not re_match($token, "^[0-9a-f-]+$") then
-  raise("invalid invocation token")
+  raise("ETOKEN", "invalid invocation token")
 end
 $worker_path = "/tmp/biz-seed-settings-" .. $token .. ".mix"
 $payload_path = "/tmp/biz-seed-settings-" .. $token .. ".conf.mix"
@@ -184,7 +184,7 @@ try
 catch $stage_error
   remove($worker_path)
   remove($payload_path)
-  raise("could not stage seed worker: " .. $stage_error)
+  raise("ESTAGE", "could not stage seed worker: " .. $stage_error)
 end
 
 $output = run("sudo -n -u cosmix-webd /opt/cosmix/bin/mix " ..
@@ -193,10 +193,10 @@ $status = $rc
 remove($worker_path)
 remove($payload_path)
 if $status != 0 then
-  raise("seed worker failed: " .. $output)
+  raise("EWORKER", "seed worker failed: " .. $output)
 end
 if not contains($output, "BIZ_SEED_SETTINGS_OK " .. $token) then
-  raise("seed worker returned no invocation proof: " .. $output)
+  raise("EPROOF", "seed worker returned no invocation proof: " .. $output)
 end
 print($output)
 ', {bindings: {

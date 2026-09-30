@@ -163,17 +163,17 @@ fn deploy_node($node)
   -- ssh_mix itself proves that the node's system Mix exists and runs. This
   -- read-only preflight also binds the existing docroot owner and webd group.
   $pre = ssh_mix($addr, 'if not is_dir($docroot) then
-  raise("docroot missing: " .. $docroot)
+  raise("DCS_PREFLIGHT", "docroot missing: " .. $docroot)
 end
 $root = stat($docroot)
 $group_line = trim(run("getent group cosmix-webd"))
 $group_parts = split($group_line, ":")
 if length($group_parts) != 4 or $group_parts[0] != "cosmix-webd" then
-  raise("group cosmix-webd is unavailable")
+  raise("DCS_PREFLIGHT", "group cosmix-webd is unavailable")
 end
 $gid_text = $group_parts[2]
 if not re_match($gid_text, "^[0-9]+$") then
-  raise("group cosmix-webd returned a non-numeric gid")
+  raise("DCS_PREFLIGHT", "group cosmix-webd returned a non-numeric gid")
 end
 print(data_encode({reach: "reach-ok", uid: $root["uid"], gid: to_number($gid_text)}))', {
     bindings: {docroot: $docroot}, decode: "data", timeout: 60
@@ -199,11 +199,11 @@ print(data_encode({reach: "reach-ok", uid: $root["uid"], gid: to_number($gid_tex
   -- are then checked from the resulting docroot.
   $token = uuid()
   $apply = ssh_mix($addr, 'if not is_file($archive) then
-  raise("uploaded archive is missing")
+  raise("DCS_APPLY", "uploaded archive is missing")
 end
 if hash_file($archive, "sha256") != $archive_hash then
   remove($archive)
-  raise("uploaded archive hash mismatch")
+  raise("DCS_APPLY", "uploaded archive hash mismatch")
 end
 remove($docroot .. "/index.html")
 remove($docroot .. "/.htaccess")
@@ -212,7 +212,7 @@ remove($docroot .. "/.nojekyll")
 $unpack = run("tar -C $docroot -xzf $archive && printf unpack-ok")
 remove($archive)
 if $unpack != "unpack-ok" then
-  raise("tar extraction failed")
+  raise("DCS_APPLY", "tar extraction failed")
 end
 chown($docroot, $uid, $gid)
 chmod($docroot, 0o750)
@@ -229,15 +229,15 @@ for each $path in walk($docroot, {include_dirs: true, follow_symlinks: false})
 end
 $root = stat($docroot)
 if $root["uid"] != $uid or $root["gid"] != $gid or $root["perm"] != 0o750 then
-  raise("docroot ownership or mode mismatch")
+  raise("DCS_APPLY", "docroot ownership or mode mismatch")
 end
 $index = $docroot .. "/index.html"
 if not is_file($index) or hash_file($index, "sha256") != $index_hash then
-  raise("installed index.html hash mismatch")
+  raise("DCS_APPLY", "installed index.html hash mismatch")
 end
 $index_stat = stat($index)
 if $index_stat["uid"] != $uid or $index_stat["gid"] != $gid or $index_stat["perm"] != 0o640 then
-  raise("installed index.html ownership or mode mismatch")
+  raise("DCS_APPLY", "installed index.html ownership or mode mismatch")
 end
 print(data_encode({token: $token, archive_hash: $archive_hash, index_hash: $index_hash}))', {
     bindings: {

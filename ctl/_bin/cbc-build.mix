@@ -154,11 +154,11 @@ fn worker_probe($worker_conf)
   $r = ssh_mix($worker_conf["ssh_host"], '
 $parts = split(trim(read_file("/proc/loadavg")), " ")
 if len($parts) == 0 then
-  raise("empty /proc/loadavg")
+  raise("LOADAVG", "empty /proc/loadavg")
 end
 $load1 = to_number($parts[0])
 if $load1 == nil then
-  raise("invalid one-minute load: " .. $parts[0])
+  raise("LOADAVG", "invalid one-minute load: " .. $parts[0])
 end
 print(data_encode({token: $token, load1: $load1}))
 ', {bindings: {token: $token}, decode: "data", timeout: 20})
@@ -230,7 +230,7 @@ $remote_repo = $WORKER_ROOT .. "/" .. $repository["worker_dir"]
 $checkout_token = uuid()
 $checkout_result = ssh_mix($worker["ssh_host"], '
 if not is_dir($repo_root) then
-  raise("worker checkout missing: " .. $repo_root)
+  raise("ECHECKOUT", "worker checkout missing: " .. $repo_root)
 end
 $fetch = run_argv(["git", "-C", $repo_root, "fetch", "-q", "origin"], {timeout: 600})
 if $fetch["exit_code"] != 0 then
