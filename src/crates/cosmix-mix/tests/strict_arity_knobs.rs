@@ -23,12 +23,21 @@ fn env_knob_turns_on_strict_arity() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success(), "surplus-arity remove must fail under the env knob");
     assert!(stderr.contains("ARITY_MISMATCH"), "got: {stderr}");
-    // And without the knob the same call is the compatible no-op.
+    // And without the knob the same call is the compatible no-op. The
+    // knob is inherited through the environment, so the default arm must
+    // REMOVE it explicitly — a harness or fleet host that already sets
+    // MIX_STRICT_ARITY would otherwise leak into this assertion.
     let ok = mix_bin()
+        .env_remove("MIX_STRICT_ARITY")
         .args(["-c", "print(remove({a: 1}, \"x\"))"])
         .output()
         .expect("run mix");
-    assert!(ok.status.success(), "default mode keeps the compatible binding");
+    assert!(
+        ok.status.success(),
+        "default mode keeps the compatible binding: {:?} / stderr: {}",
+        ok.status.code(),
+        String::from_utf8_lossy(&ok.stderr)
+    );
 }
 
 #[test]
