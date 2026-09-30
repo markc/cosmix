@@ -191,7 +191,6 @@ async fn head_tail_reject_bad_n() {
         err.contains("argument 2 (n) must be number"),
         "non-number n must be rejected loudly: {err}"
     );
-    }
 }
 
 #[tokio::test]
