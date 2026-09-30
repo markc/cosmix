@@ -13949,9 +13949,10 @@ impl Evaluator {
         static SEEN: OnceLock<Mutex<HashSet<(String, usize)>>> = OnceLock::new();
         let set = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
         let mut seen = set.lock().unwrap_or_else(|p| p.into_inner());
-        // Borrow-key containment first: the hot repeat path takes the lock
-        // but allocates nothing — only a FIRST (builtin, count) inserts.
-        if seen.contains(&(name, n)) {
+        // Allocation-free repeat check: the set stays tiny (one entry per
+        // (builtin, count) ever warned), so a linear scan beats hashing a
+        // freshly-allocated key on the hot loop path.
+        if seen.iter().any(|(s, c)| s == name && *c == n) {
             return;
         }
         seen.insert((name.to_string(), n));
