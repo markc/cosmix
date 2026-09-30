@@ -38,7 +38,6 @@ use std::fs::File;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use cosmix_lib_client::{NodedClient, UnixConnectOutcome, VerifiedConnection};
@@ -51,10 +50,10 @@ const RECONCILE: Duration = Duration::from_secs(90);
 
 /// One whole fixture at a time: the fixed TCP port reservation and the
 /// embedded broker must not race sibling tests in this binary.
-static LOCK: Mutex<()> = Mutex::new(());
+static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-fn lock() -> std::sync::MutexGuard<'static, ()> {
-    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+async fn lock() -> tokio::sync::MutexGuard<'static, ()> {
+    LOCK.lock().await
 }
 
 // ── fixture scaffolding ──────────────────────────────────────────────────
@@ -416,7 +415,7 @@ fn boot(citizen_script: &Variant, dir: &Dir, broker: &Broker) -> (PathBuf, Citiz
 
 #[tokio::test]
 async fn invalid_parse_and_raising_candidate_leave_the_boot_generation_running() {
-    let _g = lock();
+    let _g = lock().await;
     let dir = Dir::new("refuse");
     let mut broker = Broker::start();
     let variant = Variant {
@@ -484,7 +483,7 @@ async fn invalid_parse_and_raising_candidate_leave_the_boot_generation_running()
 
 #[tokio::test]
 async fn committed_reload_retires_old_children_then_launches_one_successor() {
-    let _g = lock();
+    let _g = lock().await;
     let dir = Dir::new("commit");
     let mut broker = Broker::start();
     let variant = Variant {
@@ -556,7 +555,7 @@ async fn committed_reload_retires_old_children_then_launches_one_successor() {
 
 #[tokio::test]
 async fn wire_spoofed_lifecycle_commit_is_refused_without_side_effects() {
-    let _g = lock();
+    let _g = lock().await;
     let dir = Dir::new("spoof");
     let mut broker = Broker::start();
     let variant = Variant {
@@ -597,7 +596,7 @@ async fn wire_spoofed_lifecycle_commit_is_refused_without_side_effects() {
 
 #[tokio::test]
 async fn broker_cut_during_candidate_prep_commit_dispatches_and_reconciles() {
-    let _g = lock();
+    let _g = lock().await;
     let dir = Dir::new("cut");
     let port = reserve_port();
     let mut broker = Broker::with_tcp_port(port);
@@ -663,7 +662,7 @@ async fn broker_cut_during_candidate_prep_commit_dispatches_and_reconciles() {
 
 #[tokio::test]
 async fn sigterm_shuts_down_the_child_group_from_prep_and_from_the_dispatching_hook() {
-    let _g = lock();
+    let _g = lock().await;
     let dir = Dir::new("sigterm");
     let mut broker = Broker::start();
 
@@ -732,7 +731,7 @@ async fn sigterm_shuts_down_the_child_group_from_prep_and_from_the_dispatching_h
 
 #[tokio::test]
 async fn offloaded_grace_keeps_reactor_responsive_while_sweeping_a_term_ignoring_child() {
-    let _g = lock();
+    let _g = lock().await;
     let dir = Dir::new("grace");
     let mut broker = Broker::start();
     let variant = Variant {
