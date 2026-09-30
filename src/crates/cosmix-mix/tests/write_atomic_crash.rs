@@ -8,9 +8,10 @@
 //! * per-round progress — each round first waits for a NEW write to land
 //!   (the target's inode changes), so no round merely inherits the last
 //!   round's file;
-//! * a synchronised kill — the test watches the directory and SIGKILLs the
-//!   writer the moment a partially written temp (0 < size < SIZE) is on
-//!   disk, i.e. provably mid-write. At least one round must land that way.
+//! * a synchronised kill — stop the writer and confirm its unpublished
+//!   temporary still exists before SIGKILL. Some filesystems expose a write's
+//!   final size only when the syscall completes, so observing a partial size
+//!   is not a portable proof. At least one round must stop before publication.
 
 #![cfg(target_os = "linux")]
 
@@ -23,12 +24,32 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const SIZE: usize = 16 * 1024 * 1024;
 const ROUNDS: u64 = 5;
 
+// Even a failed assertion must retire the infinite producer.
+struct Writer(std::process::Child);
+impl std::ops::Deref for Writer {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for Writer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+impl Drop for Writer {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 fn inode(path: &Path) -> Option<u64> {
     std::fs::metadata(path).ok().map(|m| m.ino())
 }
 
-/// A temp beside the target that is partially written right now.
-fn partial_temp_present(dir: &Path) -> bool {
+/// A temporary belonging to the current atomic replacement, before rename.
+fn unpublished_temp_present(dir: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
     };
@@ -36,7 +57,7 @@ fn partial_temp_present(dir: &Path) -> bool {
         entry.file_name().to_string_lossy().starts_with(".state.mixtmp-")
             && entry
                 .metadata()
-                .map(|m| m.len() > 0 && (m.len() as usize) < SIZE)
+                .map(|m| m.is_file() && m.len() <= SIZE as u64)
                 .unwrap_or(false)
     })
 }
@@ -70,25 +91,25 @@ fn sigkill_mid_rewrite_leaves_a_complete_old_or_new_file() {
         .expect("script");
     }
 
-    let mut mid_write_kills = 0;
+    let mut pre_publish_kills = 0;
     for round in 0..ROUNDS {
         // A killed round leaves its partial temp behind (documented: a
         // SIGKILLed writer cannot clean up). Clear them, or the next round's
-        // "partial temp present" would be satisfied by a stale one.
+        // "unpublished temp present" would be satisfied by a stale one.
         for entry in std::fs::read_dir(&dir).expect("scratch dir").flatten() {
             if entry.file_name().to_string_lossy().starts_with(".state.mixtmp-") {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
         let before = inode(&target);
-        let mut child = Command::new(env!("CARGO_BIN_EXE_mix"))
+        let mut child = Writer(Command::new(env!("CARGO_BIN_EXE_mix"))
             .arg(&script)
             .env("MIX_STATS", "off")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()
-            .expect("mix binary must run");
+            .expect("mix binary must run"));
 
         // Progress: a new write must land this round.
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -104,19 +125,44 @@ fn sigkill_mid_rewrite_leaves_a_complete_old_or_new_file() {
             std::thread::sleep(Duration::from_millis(2));
         }
 
-        // Synchronised kill: the moment a partial temp is on disk.
+        // Freeze the producer, then prove it still owns an unpublished temp.
+        // A rename between observation and SIGSTOP does not count: resume and
+        // retry. SIGKILL is delivered only after the stopped-state proof.
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut caught = false;
         while Instant::now() < deadline {
-            if partial_temp_present(&dir) {
-                caught = true;
-                break;
+            if unpublished_temp_present(&dir) {
+                let pid = child.id() as libc::pid_t;
+                assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0, "stop writer");
+                let stop_deadline = Instant::now() + Duration::from_secs(5);
+                let mut stopped = false;
+                while Instant::now() < stop_deadline {
+                    let mut status = 0;
+                    let got = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED | libc::WNOHANG) };
+                    if got == pid {
+                        assert!(libc::WIFSTOPPED(status), "writer exited while stopping");
+                        stopped = true;
+                        break;
+                    }
+                    assert!(got >= 0, "wait for stopped writer");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                if !stopped {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("writer did not stop within deadline");
+                }
+                if unpublished_temp_present(&dir) {
+                    caught = true;
+                    break;
+                }
+                assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0, "resume writer");
             }
         }
         child.kill().expect("SIGKILL mix");
         let _ = child.wait();
         if caught {
-            mid_write_kills += 1;
+            pre_publish_kills += 1;
         }
 
         let bytes = std::fs::read(&target).expect("target must still exist");
@@ -124,7 +170,7 @@ fn sigkill_mid_rewrite_leaves_a_complete_old_or_new_file() {
         let complete_b = bytes.len() == SIZE && bytes.iter().all(|b| *b == b'B');
         assert!(
             complete_a || complete_b,
-            "round {round} (killed mid-write: {caught}): target is partial or mixed \
+            "round {round} (killed before publication: {caught}): target is partial or mixed \
              ({} bytes, first {:?}, last {:?})",
             bytes.len(),
             bytes.first().map(|b| *b as char),
@@ -133,7 +179,7 @@ fn sigkill_mid_rewrite_leaves_a_complete_old_or_new_file() {
     }
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
-        mid_write_kills >= 1,
-        "no round caught the writer mid-write — the test proved nothing"
+        pre_publish_kills >= 1,
+        "no round stopped the writer before publication — the test proved nothing"
     );
 }

@@ -280,13 +280,19 @@ above. This section supplies the remaining option and decoding contract.
 > lint parses it when it is a **literal** — a string, an inline heredoc, or a
 > variable bound exactly once to either — and reports its diagnostics
 > against your file, prefixed `[inside ssh_mix body]`, at mapped line numbers.
-> Names in the body resolve against the body itself, the builtins, and the
-> call's `bindings`/`env` keys, so an unbound `$name` or a helper that exists
-> only in the calling file is reported. A body it cannot read — any other
-> variable, a concatenation, an interpolated string, a `read_file`, or a
-> literal that does not parse — is reported as **`MIX-D3012`** rather than
-> passing silently. Prefer a literal and the [`bindings`](#options-map)
-> option over interpolation: it is both safer (no injection through string
+> A double-quoted body whose lines are `\n` escapes reports everything on
+> the one physical line the literal occupies; a physically multi-line
+> literal and a heredoc map line-for-line. Names in the body resolve
+> against the body itself, the builtins, and the call's `bindings`/`env`
+> keys — the opts argument is read statically when it is a map literal or
+> a variable bound exactly once to one. When the opts cannot be read, only
+> undefined-**variable** checks stand down (`MIX-D3018`): a function name
+> cannot ride in through strict-data bindings, so undefined-function
+> checks still run. A body lint cannot read — any other variable, a
+> concatenation, an interpolated string, a `read_file`, or a literal that
+> does not parse — is reported as **`MIX-D3012`** rather than passing
+> silently. Prefer a literal and the [`bindings`](#options-map) option
+> over interpolation: it is both safer (no injection through string
 > building) and the only form lint can check. See
 > [lint](lint.md#remote-bodies--lint-sees-inside-ssh_mix-0690).
 

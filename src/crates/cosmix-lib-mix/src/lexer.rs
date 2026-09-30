@@ -24,6 +24,37 @@ pub enum StringNote {
     UnknownEscape { line: usize, text: String },
 }
 
+/// The physical source lines of one quoted-string or heredoc literal.
+///
+/// Built while the literal DECODES, so a consumer can map a decoded line
+/// back to the physical line it was written on: `lines[i]` is the
+/// physical source line that decoded line `i+1` begins on, with one
+/// entry per decoded line (never empty). A `\n` escape and a physical
+/// newline both add a decoded line, but only the physical one advances
+/// the line counter — this map is the only place that difference
+/// survives, which is what the analyzer's `ssh_mix` body pass needs to
+/// report a remote diagnostic on the ONE line a double-quoted escaped
+/// body physically occupies.
+#[derive(Debug, Clone)]
+pub struct LiteralLineMap {
+    /// Physical line of the opening quote / `<<TAG`.
+    pub opener_line: usize,
+    /// True when the literal is a heredoc (`<<TAG`).
+    pub heredoc: bool,
+    /// `lines[i]` is the physical source line decoded line `i+1` starts on.
+    pub lines: Vec<usize>,
+}
+
+/// One all-literal string or heredoc in a source, with its decoded text
+/// and its decoded-line → physical-line map, in token order.
+#[derive(Debug, Clone)]
+pub struct LiteralSource {
+    /// The decoded literal text.
+    pub text: String,
+    /// Decoded-line → physical-line map (opener line + heredoc flag included).
+    pub map: LiteralLineMap,
+}
+
 pub struct Lexer {
     source: Vec<char>,
     pos: usize,
@@ -36,6 +67,17 @@ pub struct Lexer {
     continuation_sites: Vec<ContinuationSite>,
     continuation_error: Option<MixError>,
     string_notes: Vec<StringNote>,
+    /// One decoded-line → physical-line map per quoted-string/heredoc
+    /// token, in token emission order. Populated by `tokenize` only when
+    /// `record_literal_maps` is set — [`string_literal_sources`] and
+    /// [`lex_with_literal_maps`] are the only callers that need them —
+    /// and read by that same pair of helpers.
+    literal_maps: Vec<LiteralLineMap>,
+    /// Opt-in map recording: off by default, so the ordinary tokenize
+    /// paths (runtime, parser, highlighter, notes) allocate no per-string
+    /// line vectors at all. Set by [`string_literal_sources`] /
+    /// [`lex_with_literal_maps`] before they lex.
+    record_literal_maps: bool,
     /// Strict-data source (`parse_data`): double-quoted strings also
     /// decode the JSON-style `\uXXXX` escape, so JSON-encoded text reads
     /// back unchanged. Program source keeps a bare `\u` literal.
@@ -142,6 +184,8 @@ impl Lexer {
             continuation_sites,
             continuation_error,
             string_notes: Vec::new(),
+            literal_maps: Vec::new(),
+            record_literal_maps: false,
             data_mode: false,
         }
     }
@@ -170,6 +214,103 @@ impl Lexer {
             Ok(_) => lexer.string_notes,
             Err(_) => Vec::new(),
         }
+    }
+
+    /// Zip the tokens of one source with its recorded literal line maps:
+    /// one `(byte offset, decoded text, map)` per string/heredoc/
+    /// interpolated token, in token order. `text` is `None` when the
+    /// token's decoded form is not one literal text (an interpolated
+    /// string, a heredoc with substitutions).
+    fn token_literal_sources(
+        tokens: &[SpannedToken],
+        maps: Vec<LiteralLineMap>,
+        source: &str,
+    ) -> Vec<(usize, Option<String>, LiteralLineMap)> {
+        let byte_at: Vec<usize> = source.char_indices().map(|(b, _)| b).collect();
+        let mut maps = maps.into_iter();
+        let mut out = Vec::new();
+        for t in tokens {
+            // `is_literal` advances the map cursor: every token emitted by
+            // a string/heredoc lexer fn owns exactly one map entry.
+            let (text, is_literal) = match &t.token {
+                Token::HeredocString(parts) => {
+                    let mut text = String::new();
+                    let all_literal = parts.iter().all(|p| match p {
+                        StringPart::Literal(s) => {
+                            text.push_str(s);
+                            true
+                        }
+                        _ => false,
+                    });
+                    (all_literal.then_some(text), true)
+                }
+                Token::InterpString(_) => (None, true),
+                Token::String(s) => {
+                    let first = byte_at
+                        .get(t.offset)
+                        .copied()
+                        .and_then(|b| source.get(b..))
+                        .and_then(|r| r.chars().next());
+                    let quoted = matches!(first, Some('"' | '\''));
+                    (quoted.then_some(s.clone()), quoted)
+                }
+                _ => (None, false),
+            };
+            if !is_literal {
+                continue;
+            }
+            let Some(map) = maps.next() else {
+                // Unreachable with the one-map-per-token invariant; skip
+                // rather than misalign the zipper.
+                continue;
+            };
+            out.push((t.offset, text, map));
+        }
+        out
+    }
+
+    /// Every all-literal quoted-string and heredoc in `source`, in token
+    /// order, with its decoded text and decoded-line → physical-line map.
+    ///
+    /// Bare identifiers also lex to `Token::String`; they are excluded by
+    /// their first source character (a quote), which is exactly the test
+    /// `highlight` uses to tell a literal from a word. Empty when the
+    /// source does not lex — callers fall back to their own estimate.
+    pub fn string_literal_sources(source: &str) -> Vec<LiteralSource> {
+        let mut lexer = Lexer::new(source);
+        // The one lex that pays for the maps; every ordinary path keeps
+        // the default (recording off).
+        lexer.record_literal_maps = true;
+        let Ok(tokens) = lexer.tokenize() else {
+            return Vec::new();
+        };
+        Self::token_literal_sources(&tokens, std::mem::take(&mut lexer.literal_maps), source)
+            .into_iter()
+            .filter_map(|(_, text, map)| text.map(|text| LiteralSource { text, map }))
+            .collect()
+    }
+
+    /// (Analyzer-only.) Lex `source` with line-map recording on and
+    /// return the token stream plus, for every string/heredoc/
+    /// interpolated token, its byte offset joined to its decoded-line →
+    /// physical-line map. `None` when the source does not lex.
+    ///
+    /// The offsets are the join key for the parser's literal-origin
+    /// recording ([`crate::parser::LiteralOrigin`]): parser tokens carry
+    /// the same offsets, so a recorded origin attaches its line map
+    /// without any text guessing.
+    pub(crate) fn lex_with_literal_maps(
+        source: &str,
+    ) -> Option<(Vec<SpannedToken>, std::collections::HashMap<usize, LiteralLineMap>)> {
+        let mut lexer = Lexer::new(source);
+        lexer.record_literal_maps = true;
+        let tokens = lexer.tokenize().ok()?;
+        let by_offset =
+            Self::token_literal_sources(&tokens, std::mem::take(&mut lexer.literal_maps), source)
+                .into_iter()
+                .map(|(offset, _, map)| (offset, map))
+                .collect();
+        Some((tokens, by_offset))
     }
 
     pub fn tokenize(&mut self) -> MixResult<Vec<SpannedToken>> {
@@ -728,6 +869,9 @@ impl Lexer {
     fn lex_single_string(&mut self, line: usize, col: usize) -> MixResult<SpannedToken> {
         self.advance(); // skip opening '
         let mut s = String::new();
+        // Single-quoted strings decode NO `\n` escape — every decoded
+        // newline is a physical one, so the map is strictly increasing.
+        let mut lines: Vec<usize> = if self.record_literal_maps { vec![line] } else { Vec::new() };
         loop {
             match self.advance() {
                 None => {
@@ -747,6 +891,9 @@ impl Lexer {
                     Some(c) => {
                         s.push('\\');
                         s.push(c);
+                        if self.record_literal_maps && c == '\n' {
+                            lines.push(self.line);
+                        }
                     }
                     None => {
                         return Err(MixError::LexerError {
@@ -759,8 +906,20 @@ impl Lexer {
                         });
                     }
                 },
-                Some(c) => s.push(c),
+                Some(c) => {
+                    s.push(c);
+                    if self.record_literal_maps && c == '\n' {
+                        lines.push(self.line);
+                    }
+                }
             }
+        }
+        if self.record_literal_maps {
+            self.literal_maps.push(LiteralLineMap {
+                opener_line: line,
+                heredoc: false,
+                lines,
+            });
         }
         Ok(self.spanned(Token::String(s), line, col))
     }
@@ -769,6 +928,11 @@ impl Lexer {
         self.advance(); // skip opening "
         let mut parts: Vec<StringPart> = Vec::new();
         let mut current = String::new();
+        // Physical line each decoded line starts on. Seeded with the
+        // opener's line; a DECODED '\n' extends it with the physical line
+        // the NEXT decoded line begins on (unchanged for an escape, the
+        // next line for a physical newline).
+        let mut lines: Vec<usize> = if self.record_literal_maps { vec![line] } else { Vec::new() };
         // MIX-W2404 candidates for THIS string, and whether the string
         // spans lines. A multi-line double-quoted string is, overwhelmingly,
         // NESTED PROGRAM TEXT — an `ssh_mix` body or a `mix -c` program —
@@ -824,6 +988,9 @@ impl Lexer {
                         Some('n') => {
                             multiline = true;
                             current.push('\n');
+                            if self.record_literal_maps {
+                                lines.push(self.line);
+                            }
                         }
                         Some('t') => current.push('\t'),
                         Some('r') => current.push('\r'),
@@ -845,14 +1012,22 @@ impl Lexer {
                         // embedded JSON `\uXXXX` are unchanged — a pure
                         // addition, not a break.
                         Some('u') if self.peek() == Some('{') => {
-                            self.lex_unicode_escape(line, col, &mut current)?
+                            let ch = self.lex_unicode_escape(line, col)?;
+                            current.push(ch);
+                            if self.record_literal_maps && ch == '\n' {
+                                lines.push(self.line);
+                            }
                         }
                         // Strict data only: the JSON `\uXXXX` form (exactly
                         // four hex digits, surrogate pairs joined), so text
                         // produced by json_encode — which escapes control
                         // characters that way — reads back unchanged.
                         Some('u') if self.data_mode && self.hex4_at(0).is_some() => {
-                            self.lex_json_unicode_escape(line, col, &mut current)?
+                            let ch = self.lex_json_unicode_escape(line, col)?;
+                            current.push(ch);
+                            if self.record_literal_maps && ch == '\n' {
+                                lines.push(self.line);
+                            }
                         }
                         // The C/Rust/JS control escapes (0.90.0). Every
                         // other language has these, so the "unrecognised
@@ -889,6 +1064,9 @@ impl Lexer {
                                 let cp = (h1.to_digit(16).unwrap() * 16) + h2.to_digit(16).unwrap();
                                 // 0x00..=0xFF is always a valid char.
                                 current.push(char::from_u32(cp).expect("0x00..=0xFF is a char"));
+                                if self.record_literal_maps && cp == 0x0A {
+                                    lines.push(self.line);
+                                }
                             } else {
                                 self.note_unknown_escape(esc_line, 'x');
                                 current.push('\\');
@@ -910,6 +1088,9 @@ impl Lexer {
                             self.note_unknown_escape(esc_line, c);
                             current.push('\\');
                             current.push(c);
+                            if self.record_literal_maps && c == '\n' {
+                                lines.push(self.line);
+                            }
                         }
                         None => {
                             return Err(MixError::LexerError {
@@ -970,6 +1151,9 @@ impl Lexer {
                     }
                     current.push(c);
                     self.advance();
+                    if self.record_literal_maps && c == '\n' {
+                        lines.push(self.line);
+                    }
                 }
             }
         }
@@ -980,6 +1164,14 @@ impl Lexer {
 
         if !current.is_empty() {
             parts.push(StringPart::Literal(current));
+        }
+
+        if self.record_literal_maps {
+            self.literal_maps.push(LiteralLineMap {
+                opener_line: line,
+                heredoc: false,
+                lines,
+            });
         }
 
         // Optimize: if no interpolation, return plain string
@@ -1047,12 +1239,14 @@ impl Lexer {
         });
     }
 
-    /// Parse a `\u{XXXX}` unicode escape (the `\u` is already consumed) and
-    /// push the decoded codepoint onto `out`. 1–6 hex digits in braces,
-    /// matching Rust/JS. Errors loudly on a missing brace, empty/over-long
-    /// hex, a non-hex digit, or a codepoint that isn't a valid `char`
-    /// (e.g. a surrogate) — never silently passes through.
-    fn lex_unicode_escape(&mut self, line: usize, col: usize, out: &mut String) -> MixResult<()> {
+    /// Parse a `\u{XXXX}` unicode escape (the `\u` is already consumed)
+    /// and return the decoded codepoint (the caller pushes it, so it can
+    /// extend the literal's line map when the codepoint is a newline).
+    /// 1–6 hex digits in braces, matching Rust/JS. Errors loudly on a
+    /// missing brace, empty/over-long hex, a non-hex digit, or a
+    /// codepoint that isn't a valid `char` (e.g. a surrogate) — never
+    /// silently passes through.
+    fn lex_unicode_escape(&mut self, line: usize, col: usize) -> MixResult<char> {
         let err = |msg: String| MixError::LexerError {
             msg,
             span: Span {
@@ -1087,10 +1281,8 @@ impl Lexer {
         }
         let cp =
             u32::from_str_radix(&hex, 16).map_err(|_| err(format!("invalid \\u{{{hex}}} hex")))?;
-        let ch = char::from_u32(cp)
-            .ok_or_else(|| err(format!("\\u{{{hex}}} is not a valid unicode codepoint")))?;
-        out.push(ch);
-        Ok(())
+        char::from_u32(cp)
+            .ok_or_else(|| err(format!("\\u{{{hex}}} is not a valid unicode codepoint")))
     }
 
     /// The value of the four hex digits starting `offset` chars ahead, if
@@ -1104,10 +1296,11 @@ impl Lexer {
     }
 
     /// Decode a JSON-style `\uXXXX` (strict data only; the `\u` is already
-    /// consumed and four hex digits are known to follow). A high surrogate
-    /// must be followed by `\u` + a low one and the pair is joined, exactly
-    /// as JSON defines; a lone surrogate is an error, never a silent U+FFFD.
-    fn lex_json_unicode_escape(&mut self, line: usize, col: usize, out: &mut String) -> MixResult<()> {
+    /// consumed and four hex digits are known to follow) and return the
+    /// decoded codepoint. A high surrogate must be followed by `\u` + a
+    /// low one and the pair is joined, exactly as JSON defines; a lone
+    /// surrogate is an error, never a silent U+FFFD.
+    fn lex_json_unicode_escape(&mut self, line: usize, col: usize) -> MixResult<char> {
         let err = |msg: String| MixError::LexerError {
             msg,
             span: Span {
@@ -1146,8 +1339,7 @@ impl Lexer {
             }
             cp => cp,
         };
-        out.push(char::from_u32(cp).expect("non-surrogate BMP or joined pair is a char"));
-        Ok(())
+        Ok(char::from_u32(cp).expect("non-surrogate BMP or joined pair is a char"))
     }
 
     fn lex_heredoc(&mut self, line: usize, col: usize) -> MixResult<SpannedToken> {
@@ -1201,6 +1393,13 @@ impl Lexer {
 
         // Accumulate lines until we find the closing tag on its own line
         let mut body = String::new();
+        // The heredoc body starts on the line AFTER the `<<TAG` opener,
+        // and its physical newlines survive 1:1 into the decoded text —
+        // the escape pass below can only ADD decoded lines (`\n`), never
+        // remove physical ones, so `phys` tracks the physical line each
+        // decoded line begins on.
+        let mut phys = line + 1;
+        let mut lines: Vec<usize> = if self.record_literal_maps { vec![phys] } else { Vec::new() };
         loop {
             // Read a line
             let mut line_content = String::new();
@@ -1290,7 +1489,15 @@ impl Lexer {
                             }
                             cmd.push(')');
                         }
-                        c => cmd.push(c),
+                        c => {
+                            cmd.push(c);
+                            // Newlines inside the substitution move the
+                            // physical cursor without adding a decoded
+                            // line to the literal parts.
+                            if c == '\n' {
+                                phys += 1;
+                            }
+                        }
                     }
                     i += 1;
                 }
@@ -1302,7 +1509,12 @@ impl Lexer {
                 // Escape sequences
                 i += 1;
                 match chars[i] {
-                    'n' => current.push('\n'),
+                    'n' => {
+                        current.push('\n');
+                        if self.record_literal_maps {
+                            lines.push(phys);
+                        }
+                    }
                     't' => current.push('\t'),
                     'r' => current.push('\r'),
                     'e' => current.push('\x1b'),
@@ -1320,17 +1532,42 @@ impl Lexer {
                     c => {
                         current.push('\\');
                         current.push(c);
+                        // A backslash before a PHYSICAL newline keeps both
+                        // characters: the newline is a decoded line break,
+                        // and the next decoded line starts on the NEXT
+                        // physical line.
+                        if c == '\n' {
+                            phys += 1;
+                            if self.record_literal_maps {
+                                lines.push(phys);
+                            }
+                        }
                     }
                 }
                 i += 1;
             } else {
-                current.push(chars[i]);
+                let c = chars[i];
+                current.push(c);
                 i += 1;
+                if c == '\n' {
+                    phys += 1;
+                    if self.record_literal_maps {
+                        lines.push(phys);
+                    }
+                }
             }
         }
 
         if !current.is_empty() {
             parts.push(StringPart::Literal(current));
+        }
+
+        if self.record_literal_maps {
+            self.literal_maps.push(LiteralLineMap {
+                opener_line: line,
+                heredoc: true,
+                lines,
+            });
         }
 
         // Keep heredocs distinct even when entirely literal so the AST
@@ -1650,6 +1887,143 @@ fn classify(token: &Token, first: char) -> TokenClass {
         | Token::Semicolon
         | Token::Newline
         | Token::Eof => TokenClass::Punctuation,
+    }
+}
+
+#[cfg(test)]
+mod literal_line_map_tests {
+    use super::Lexer;
+
+    fn sources(src: &str) -> Vec<(String, bool, usize, Vec<usize>)> {
+        Lexer::string_literal_sources(src)
+            .into_iter()
+            .map(|s| {
+                (
+                    s.text,
+                    s.map.heredoc,
+                    s.map.opener_line,
+                    s.map.lines,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_escaped_newline_stays_on_the_openers_line() {
+        // The whole reason the map exists: `\n` decodes to a newline but
+        // the literal occupies ONE physical line.
+        let got = sources("$r = ssh_mix($h, \"print(1)\\nprint(2)\")\n");
+        assert_eq!(
+            got.iter().find(|(t, _, _, _)| t.contains("print")).unwrap(),
+            &("print(1)\nprint(2)".to_string(), false, 1, vec![1, 1]),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn a_physical_multiline_string_maps_lines_one_to_one() {
+        let src = "$r = ssh_mix($h, \"print(1)\nprint(2)\")\n";
+        let got = sources(src);
+        let (text, heredoc, opener, lines) =
+            got.iter().find(|(t, ..)| t.contains("print")).expect("found");
+        assert_eq!((text.as_str(), *heredoc, *opener), ("print(1)\nprint(2)", false, 1));
+        assert_eq!(lines, &vec![1, 2], "{got:?}");
+    }
+
+    #[test]
+    fn a_single_quoted_multiline_string_maps_one_to_one() {
+        let src = "$r = ssh_mix($h, 'print(1)\nprint(2)')\n";
+        let got = sources(src);
+        let (_, heredoc, opener, lines) =
+            got.iter().find(|(t, ..)| t.contains("print")).expect("found");
+        assert!(!heredoc);
+        assert_eq!(*opener, 1);
+        assert_eq!(lines, &vec![1, 2], "{got:?}");
+    }
+
+    #[test]
+    fn a_heredoc_starts_one_line_below_its_opener() {
+        let src = "$p = <<END\nl1\nl2\nEND\n";
+        let got = sources(src);
+        assert_eq!(
+            got,
+            vec![("l1\nl2".to_string(), true, 1, vec![2, 3])],
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn a_heredoc_escape_adds_a_decoded_line_on_the_escapes_line() {
+        let src = "$p = <<END\nl1\\nl2\nEND\n";
+        let got = sources(src);
+        assert_eq!(
+            got,
+            vec![("l1\nl2".to_string(), true, 1, vec![2, 2])],
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn unicode_and_hex_escapes_that_decode_to_a_newline_stay_on_their_line() {
+        for (esc, text) in [("\\u{000A}", "\n"), ("\\x0A", "\n")] {
+            let src = format!("$r = ssh_mix($h, \"print(1){esc}print(2)\")\n");
+            let got = sources(&src);
+            let (decoded, _, opener, lines) =
+                got.iter().find(|(t, ..)| t.contains("print")).expect("found");
+            assert_eq!(decoded, &format!("print(1){text}print(2)"));
+            assert_eq!(*opener, 1);
+            assert_eq!(lines, &vec![1, 1], "{esc}: {got:?}");
+        }
+    }
+
+    #[test]
+    fn bareword_identifiers_are_not_literals() {
+        // Identifiers lex to Token::String too; only quote-openers count.
+        let src = "$a = ssh_mix\nprint(ssh_mix($h, 'x'))\n";
+        let got = sources(src);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].0, "x");
+    }
+
+    #[test]
+    fn multiple_identical_literals_on_one_line_keep_their_own_maps() {
+        let src = "$r = [ssh_mix(\"a\", \"x\\ny\"), ssh_mix(\"b\", \"x\\ny\")]\n";
+        let got = sources(src);
+        assert_eq!(got.len(), 4, "{got:?}");
+        assert_eq!(got[1].0, "x\ny");
+        assert_eq!(got[3].0, "x\ny");
+        assert_eq!(got[1].3, vec![1, 1]);
+        assert_eq!(got[3].3, vec![1, 1]);
+    }
+
+    #[test]
+    fn ordinary_tokenize_records_no_maps_but_the_helper_maps_every_string() {
+        // Map recording is OPT-IN: the ordinary tokenize paths (runtime,
+        // parser, highlighter) must pay nothing per string, while the one
+        // helper that asked for maps gets every literal mapped exactly.
+        use super::Token;
+        let src = "\"hello world\"\n".repeat(3000);
+        let mut lexer = Lexer::new(&src);
+        let tokens = lexer.tokenize().expect("lex");
+        let strings = tokens
+            .iter()
+            .filter(|t| matches!(&t.token, Token::String(_)))
+            .count();
+        assert_eq!(strings, 3000, "3000 string literals tokenized");
+        assert!(
+            lexer.literal_maps.is_empty(),
+            "ordinary tokenize must not record literal maps"
+        );
+        let maps = Lexer::string_literal_sources(&src);
+        assert_eq!(maps.len(), 3000, "the helper maps every literal");
+        assert_eq!(maps[0].map.opener_line, 1);
+        assert_eq!(maps[2999].map.opener_line, 3000);
+        assert_eq!(maps[2999].text, "hello world");
+    }
+
+    #[test]
+    fn a_non_lexing_source_yields_no_sources() {
+        assert!(sources("\"unterminated\n").is_empty());
     }
 }
 

@@ -69,7 +69,7 @@ data: elements <div id="clock">12:34</div>
 |---|---|---|
 | `selector` | a CSS selector string | none (Datastar uses the element's `id`) |
 | `mode` | `outer` `inner` `remove` `replace` `prepend` `append` `before` `after` | `outer` |
-| `view_transition` | truthy → emit `useViewTransition true`; falsy → same as absent | off |
+| `view_transition` | a bool: `true` → emit `useViewTransition true`; `false`/absent → off | off |
 
 Two option-map behaviours to know: a `nil`-valued `selector`/`mode` is treated as
 absent, and **unknown keys are silently ignored** — there is no strict allowlist
@@ -202,7 +202,9 @@ data: signals {"open":true}
 ```
 
 `only_if_missing` makes the patch a default — it only sets signals the client
-does not already have (good for initial values that must not clobber user edits):
+does not already have (good for initial values that must not clobber user edits).
+Like `view_transition`, it is a strict bool: `"false"`/`0`/`nil` raise
+`TYPE_MISMATCH` rather than being read as a truthiness.
 
 ```mix
 $ev = ds_patch_signals({theme: "dark"}, {only_if_missing: true})

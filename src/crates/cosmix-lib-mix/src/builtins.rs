@@ -92,7 +92,7 @@ builtin_table! {
     ("strip", CapabilityClass::Pure,           "string",  "Remove leading/trailing whitespace, or codepoints in charset: strip(s[, charset]) (0.63.0 — the 2nd arg was silently IGNORED before)", contract!((s: string, charset?: string) -> string)),
     ("trim", CapabilityClass::Pure,            "string",  "Alias for strip(): trim(s[, charset]) — charset is a SET of codepoints to strip from both ends (0.63.0; was silently ignored). One-sided: ltrim/rtrim", contract!((s: string, charset?: string) -> string)),
     ("replace", CapabilityClass::Pure,         "string",  "Replace all occurrences of old with new in string", contract!((s: string, old: string, new: string) -> string)),
-    ("replace_must", CapabilityClass::Pure,    "string",  "replace() that REFUSES a no-op: raises NEEDLE_ABSENT when old does not occur, and NEEDLE_COUNT when {count: n} is given and the occurrence count differs. Optional {path} names the file in the message. The form to use in a read_file -> edit -> write_file chain (0.90.0)", contract!((s: string, old: string, new: string, opts?: map) -> string; failure[raises])),
+    ("replace_must", CapabilityClass::Pure,    "string",  "replace() that REFUSES a no-op: raises NEEDLE_ABSENT when old does not occur, and NEEDLE_COUNT when {count: n} is given and the occurrence count differs. Optional {path} names the file in the message. The form to use in a read_file -> edit -> write_file chain (0.90.0)", contract!((s: string, old: string, new: string, opts?: any_of(map, nil)) -> string; failure[raises])),
     ("split", CapabilityClass::Pure,           "string",  "Split string into list by delimiter (default: space)", contract!((s: string, delim?: string) -> list(string))),
     ("join", CapabilityClass::Pure,            "string",  "Join list into string with delimiter (default: space)", contract!((list: list, delim?: string) -> string)),
     ("starts_with", CapabilityClass::Pure,     "string",  "Test if string starts with prefix", contract!((s: string, prefix: string) -> bool)),
@@ -112,7 +112,7 @@ builtin_table! {
     // UTF-8 bytes, not codepoints.
     ("ord", CapabilityClass::Pure,             "string",  "Unicode codepoint of the FIRST character: ord(\"A\") -> 65, ord(\"é\") -> 233. Empty string raises. Inverse: chr()", contract!((s: string) -> number; failure[raises])),
     ("chr", CapabilityClass::Pure,             "string",  "The 1-character string for a Unicode codepoint: chr(65) -> \"A\", chr(10084) -> \"❤\". Surrogates (D800-DFFF) and >0x10FFFF raise, same rule as \\u{...}. Inverse: ord()", contract!((n: number) -> string; failure[raises])),
-    ("normalize", CapabilityClass::Pure,       "string",  "Unicode normalisation (UAX #15): normalize(s[, form]) with form \"NFC\" (default), \"NFD\", \"NFKC\" or \"NFKD\" (case-insensitive; anything else raises VALUE_ERROR). Makes canonically-equivalent text compare equal: a decomposed e + combining acute (macOS filenames, NFD) equals the precomposed é after normalize(); NFKC also folds compatibility forms (fullwidth letters, ligatures: normalize(\"ﬁ\", \"NFKC\") -> \"fi\"). Emoji and ZWJ sequences pass through unchanged (v0.92.0)", contract!((s: string, form?: string) -> string; failure[raises])),
+    ("normalize", CapabilityClass::Pure,       "string",  "Unicode normalisation (UAX #15): normalize(s[, form]) with form \"NFC\" (default), \"NFD\", \"NFKC\" or \"NFKD\" (case-insensitive; nil selects NFC; anything else raises VALUE_ERROR). Makes canonically-equivalent text compare equal: a decomposed e + combining acute (macOS filenames, NFD) equals the precomposed é after normalize(); NFKC also folds compatibility forms (fullwidth letters, ligatures: normalize(\"ﬁ\", \"NFKC\") -> \"fi\"). Emoji and ZWJ sequences pass through unchanged (v0.92.0)", contract!((s: string, form?: any_of(string, nil)) -> string; failure[raises])),
     // --- Subject-first string helpers (0.63.0). Tier 1 (delimiter family):
     // absent delimiter/marker -> nil, "" is a REAL result (delimiter at the
     // edge), empty delimiter raises — nil and "" never blur. Tier 2
@@ -149,17 +149,17 @@ builtin_table! {
     ("re_match", CapabilityClass::Pure,        "string",  "Subject-first regex test: re_match(s, pattern) -> bool, true if pattern matches anywhere in s", contract!((s: string, pattern: string) -> bool; failure[raises])),
     ("re_find", CapabilityClass::Pure,         "string",  "All matches as {match, start, end[, groups]} maps with CODEPOINT offsets (compose with substr/slice/index_of; the deleted legacy regex_find answered in UTF-8 BYTE offsets). [] when none", contract!((s: string, pattern: string) -> list(map); failure[raises])),
     ("re_replace", CapabilityClass::Pure,      "string",  "Replace ALL matches: re_replace(s, pattern, replacement) — subject FIRST; $1/${name} backrefs in replacement", contract!((s: string, pattern: string, replacement: string) -> string; failure[raises])),
-    ("re_replace_must", CapabilityClass::Pure, "string",  "re_replace() that REFUSES a no-op: raises NEEDLE_ABSENT when the pattern does not match, and NEEDLE_COUNT when {count: n} is given and the match count differs. Optional {path} names the file in the message (0.90.0)", contract!((s: string, pattern: string, replacement: string, opts?: map) -> string; failure[raises])),
+    ("re_replace_must", CapabilityClass::Pure, "string",  "re_replace() that REFUSES a no-op: raises NEEDLE_ABSENT when the pattern does not match, and NEEDLE_COUNT when {count: n} is given and the match count differs. Optional {path} names the file in the message (0.90.0)", contract!((s: string, pattern: string, replacement: string, opts?: any_of(map, nil)) -> string; failure[raises])),
     ("re_split", CapabilityClass::Pure,        "string",  "Split s on each match of pattern (subject first)", contract!((s: string, pattern: string) -> list(string); failure[raises])),
     ("grep_lines", CapabilityClass::Pure,      "string",  "Lines of text matching pattern (subject first; regex when enabled, else substring) — the line filter (its pattern-first predecessor grep() was deleted in release B)", contract!((text: string, pattern: string) -> list(string); failure[raises])),
-    ("csv_parse", CapabilityClass::Pure,       "string",  "Parse CSV string into a list of header-keyed row maps", contract!((s: string, delim?: string) -> list(map))),
+    ("csv_parse", CapabilityClass::Pure,       "string",  "Parse CSV string into a list of header-keyed row maps. delim is exactly ONE ASCII byte (default \",\"; empty/multi-byte/non-string/nil and NUL/CR/LF/quote raise TYPE_MISMATCH — never a silent default or truncation)", contract!((s: string, delim?: string) -> list(map); hints[delim: "one ASCII byte — the delimiter character, e.g. \",\" or \";\"; omit it for a comma"])),
     ("ini_parse", CapabilityClass::Pure,       "string",  "Parse INI string into nested map of sections", contract!((s: string) -> map)),
-    ("xml_parse", CapabilityClass::Pure,       "string",  "Parse a strict-XML string (or bytes, e.g. an HTTP body) into a Value tree (requires xml feature). Default simple mode is the SOAP/RSS consumer shape: {RootName: …} with namespace prefixes stripped, attributes as @name keys, repeated sibling elements collapsed to a list, a leaf element's text as its value, mixed text under #text, xmlns declarations dropped. Pass {mode:\"tree\"} for full fidelity: nodes are {name, attrs, children} with prefixes + xmlns preserved and text children as plain strings. Strict XML only — real-world HTML is tag soup and will NOT parse.", contract!((s: any_of(string, bytes), opts?: map) -> map)),
+    ("xml_parse", CapabilityClass::Pure,       "string",  "Parse a strict-XML string (or bytes, e.g. an HTTP body) into a Value tree (requires xml feature). Default simple mode is the SOAP/RSS consumer shape: {RootName: …} with namespace prefixes stripped, attributes as @name keys, repeated sibling elements collapsed to a list, a leaf element's text as its value, mixed text under #text, xmlns declarations dropped. Pass {mode:\"tree\"} for full fidelity: nodes are {name, attrs, children} with prefixes + xmlns preserved and text children as plain strings. Strict XML only — real-world HTML is tag soup and will NOT parse.", contract!((s: any_of(string, bytes), opts?: any_of(map, nil)) -> map)),
     ("url_parse", CapabilityClass::Pure,       "string",  "Parse URL into {scheme, host, port, path, query, fragment}", contract!((url: string) -> map("url_parts", {scheme: string, host: string, port: any, path: string, query: string, fragment: string}))),
     ("url_decode", CapabilityClass::Pure,      "string",  "Percent-decode a URL/form-encoded string ('+' → space)", contract!((s: string) -> string)),
     ("url_encode", CapabilityClass::Pure,      "string",  "Percent-encode a string for use in a URL/form body", contract!((s: string) -> string)),
     ("rfc2047_decode", CapabilityClass::Pure,  "string",  "Decode RFC 2047 encoded-words in a mail header value (=?charset?B/Q?data?=) to a plain string. Honours the charset token (utf-8/us-ascii/iso-8859-1; anything else falls back to UTF-8-lossy), joins adjacent encoded-words at the BYTE level per §6.2 so a character split across two words survives, and passes malformed words through literally rather than losing the header. Accepts string/bytes/buffer (v0.67.0)", contract!((header: any_of(string, bytes, buffer)) -> string; failure[raises])),
-    ("rfc2047_encode", CapabilityClass::Pure,  "string",  "Encode a header value as RFC 2047 encoded-words in UTF-8, or return it UNCHANGED when it is already plain ASCII with no \"=?\" (§5: encode only when needed). Optional {encoding: \"B\"|\"Q\"}, default B. Words are kept within the §2 75-character limit and split on CHARACTER boundaries so each stays independently decodable (v0.67.0)", contract!((text: string, opts?: map) -> string; failure[raises])),
+    ("rfc2047_encode", CapabilityClass::Pure,  "string",  "Encode a header value as RFC 2047 encoded-words in UTF-8, or return it UNCHANGED when it is already plain ASCII with no \"=?\" (§5: encode only when needed). Optional {encoding: \"B\"|\"Q\"}, default B. Words are kept within the §2 75-character limit and split on CHARACTER boundaries so each stays independently decodable (v0.67.0)", contract!((text: string, opts?: any_of(map, nil)) -> string; failure[raises])),
     ("parse_query", CapabilityClass::Pure,     "string",  "Parse a k=v&k2=v2 query/form string into a map (url-decoded, last-wins)", contract!((s: string) -> map)),
     ("parse_form", CapabilityClass::Pure,      "string",  "Parse an x-www-form-urlencoded body into a map (alias of parse_query)", contract!((s: string) -> map)),
 
@@ -250,21 +250,21 @@ builtin_table! {
     ("read_file_bytes", CapabilityClass::FsRead, "io",      "Read file contents as raw bytes. Optional 2nd arg caps the read: read_file_bytes(path, 8192) reads at most 8192 bytes (header-sniffing without slurping a huge file) (v0.3.1; cap v0.17.1)", contract!((path: string, max?: number) -> bytes; failure[raises])),
     ("read_lines", CapabilityClass::FsRead,      "io",      "Read file as a list of lines (trailing newline stripped, empty last line dropped) (v0.2.3)", contract!((path: string) -> list(string); failure[raises])),
     ("load_data", CapabilityClass::FsRead,       "io",      "Read + parse a strict-data .mix file (bare-key `k: v`, the zones.mix/conf.mix form) into a Value — the non-executing twin of source/include, for substrate-internal data that must NOT run as code (v0.9.0)", contract!((path: string) -> any; failure[raises])),
-    ("write_file", CapabilityClass::FsWrite,      "io",      "Write string or bytes to file (creates/overwrites). Bytes are written verbatim (v0.3.1).", contract!((path: string, data: any) -> nil; failure[raises])),
-    ("write_new", CapabilityClass::FsWrite,       "io",      "Atomically create a new file with mode. write_new(path, content, 0o600) — mode as a value (octal literal) or octal string \"0600\"; fails if path exists; mode applied at creation (no umask race)", contract!((path: string, content: any, mode: any_of(number, string)) -> nil; failure[raises])),
-    ("write_atomic", CapabilityClass::FsWrite,    "io",      "Replace or create a file so every reader and every crash sees the old complete file or the new complete file, never a partial one: write_atomic(path, data[, {durability, mode, max_bytes}]). data is a string, bytes or buffer (nothing else is coerced). A temp is claimed O_EXCL beside the target (same filesystem), written, optionally synced, and renamed over the target; any failure before the rename removes the temp and leaves the target untouched. durability \"none\" (default: atomic, NOT durable across power loss) | \"file\" (fsync the file before the rename) | \"full\" (also fsync the directory after it). An existing target keeps its mode and owner (raises rather than silently change the owner); a new file gets 0o666 & ~umask; mode sets it exactly. A symlink path replaces the file it names and keeps the link. max_bytes raises WRITE_TOO_LARGE before touching disk. A killed process can leave a hidden .NAME.mixtmp-* temp beside the target, never a partial target", contract!((path: string, data: any_of(string, bytes, buffer), opts?: map("write_atomic_options", {durability: string, mode: any_of(number, string), max_bytes: number})) -> nil; failure[raises])),
-    ("append_file", CapabilityClass::FsWrite,     "io",      "Append string to file", contract!((path: string, s: any) -> nil; failure[raises])),
-    ("exists", CapabilityClass::FsRead,          "io",      "Test if path exists. FOLLOWS symlinks by default, so a dangling link reads as absent — that is the right answer for \"can I open something here\" and the wrong one for \"is this name taken\". exists(path, {follow_symlinks: false}) is the lstat form and sees the link itself (v0.39.0).", contract!((path: string, opts?: map) -> bool)),
+    ("write_file", CapabilityClass::FsWrite,      "io",      "Write a string, bytes or buffer to file (creates/overwrites); bytes/buffer are written verbatim, a string as UTF-8. Nothing else is coerced — nil/map/list/function/number/bool raise TYPE_MISMATCH before the file is opened (encode with json_encode/data_encode/to_string first)", contract!((path: string, data: any_of(string, bytes, buffer)) -> nil; failure[raises]; hints[data: "encode it first (json_encode, data_encode or to_string)"])),
+    ("write_new", CapabilityClass::FsWrite,       "io",      "Atomically create a new file with mode. write_new(path, content, 0o600) — mode as a value (octal literal) or octal string \"0600\"; fails if path exists; mode applied at creation (no umask race). content is a string, bytes or buffer (nothing else is coerced — wrong types raise TYPE_MISMATCH before the O_EXCL open)", contract!((path: string, content: any_of(string, bytes, buffer), mode: any_of(number, string)) -> nil; failure[raises]; hints[content: "encode it first (json_encode, data_encode or to_string)"])),
+    ("write_atomic", CapabilityClass::FsWrite,    "io",      "Replace or create a file so every reader and every crash sees the old complete file or the new complete file, never a partial one: write_atomic(path, data[, {durability, mode, max_bytes}]). data is a string, bytes or buffer (nothing else is coerced). A temp is claimed O_EXCL beside the target (same filesystem), written, optionally synced, and renamed over the target; any failure before the rename removes the temp and leaves the target untouched. durability \"none\" (default: atomic, NOT durable across power loss) | \"file\" (fsync the file before the rename) | \"full\" (also fsync the directory after it). An existing target keeps its mode and owner (raises rather than silently change the owner); a new file gets 0o666 & ~umask; mode sets it exactly. A symlink path replaces the file it names and keeps the link. max_bytes raises WRITE_TOO_LARGE before touching disk. A killed process can leave a hidden .NAME.mixtmp-* temp beside the target, never a partial target", contract!((path: string, data: any_of(string, bytes, buffer), opts?: any_of(map("write_atomic_options", {durability: string, mode: any_of(number, string), max_bytes: number}), nil)) -> nil; failure[raises])),
+    ("append_file", CapabilityClass::FsWrite,     "io",      "Append a string, bytes or buffer to file (created if missing); bytes/buffer append verbatim, a string as UTF-8. Nothing else is coerced — nil/map/list/function/number/bool raise TYPE_MISMATCH before the file is opened", contract!((path: string, s: any_of(string, bytes, buffer)) -> nil; failure[raises]; hints[s: "encode it first (json_encode, data_encode or to_string)"])),
+    ("exists", CapabilityClass::FsRead,          "io",      "Test if path exists. FOLLOWS symlinks by default, so a dangling link reads as absent — that is the right answer for \"can I open something here\" and the wrong one for \"is this name taken\". exists(path, {follow_symlinks: false}) is the lstat form and sees the link itself (v0.39.0). opts may be nil, like being omitted.", contract!((path: string, opts?: any_of(map("exists_options", {follow_symlinks: bool}), nil)) -> bool)),
     ("access", CapabilityClass::FsRead,          "io",      "Ask the kernel whether this process can access path using its effective uid/gid: mode is a non-empty, duplicate-free string of r/w/x/f letters (f = existence and is redundant when combined). Follows symlinks. Unlike inspecting stat().perm, this honours POSIX ACLs. Ordinary absence/denial returns false; malformed input or an unexpected syscall failure raises (v0.45.0).", contract!((path: string, mode: string) -> bool; failure[raises])),
     ("is_dir", CapabilityClass::FsRead,          "io",      "Test if path is a directory", contract!((path: string) -> bool)),
     ("is_file", CapabilityClass::FsRead,         "io",      "Test if path is a regular file", contract!((path: string) -> bool)),
     ("realpath", CapabilityClass::FsRead,        "io",      "Canonicalise a path: resolve every symlink + `.`/`..` to the absolute real path (like `readlink -f` / realpath(3)). The path MUST exist. realpath(path) -> string | nil (nil ONLY when a component is missing; a permission/IO/symlink-loop/non-UTF-8 failure RAISES — v0.103.14). NORMALISATION ONLY, not a race-free authorization primitive: canonicalise-then-use is not atomic, so for an exec/open safety check, exec/open the RETURNED canonical path (which has no symlinks to re-traverse), not the original (v0.31.2)", contract!((path: string) -> any_of(string, nil); failure[raises])),
     ("glob", CapabilityClass::FsRead,            "io",      "List files matching a glob pattern (supports ** globstar in v0.2.1)", contract!((pattern: string) -> list(string); failure[raises])),
     ("ls", CapabilityClass::FsRead,              "io",      "List directory entries", contract!((path?: string) -> list(string); failure[raises])),
-    ("mkdir", CapabilityClass::FsWrite,           "io",      "Create directory: mkdir(path[, {parents}]). parents defaults to true (create_dir_all). {parents: false} creates only the final component and fails if the parent is missing — the form to use when the parent was placed deliberately and re-creating it would hide its removal (v0.42.0)", contract!((path: string, opts?: map) -> nil; failure[raises])),
-    ("flock", CapabilityClass::FsWrite,           "io",      "Take a process-held advisory file lock: flock(path[, {shared, wait}]) -> bool. Exclusive and non-blocking by default; contention returns false, genuine filesystem errors raise. wait is seconds (0 = do not wait). Repeated acquisition of the same canonical path by this process is idempotent-true (v0.43.0)", contract!((path: string, opts?: map) -> bool; failure[raises])),
+    ("mkdir", CapabilityClass::FsWrite,           "io",      "Create directory: mkdir(path[, {parents}]). parents defaults to true (create_dir_all). {parents: false} creates only the final component and fails if the parent is missing — the form to use when the parent was placed deliberately and re-creating it would hide its removal (v0.42.0)", contract!((path: string, opts?: any_of(map, nil)) -> nil; failure[raises])),
+    ("flock", CapabilityClass::FsWrite,           "io",      "Take a process-held advisory file lock: flock(path[, {shared, wait}]) -> bool. Exclusive and non-blocking by default; contention returns false, genuine filesystem errors raise. wait is seconds (0 = do not wait). Repeated acquisition of the same canonical path by this process is idempotent-true (v0.43.0)", contract!((path: string, opts?: any_of(map, nil)) -> bool; failure[raises])),
     ("funlock", CapabilityClass::FsWrite,         "io",      "Release and close this process's advisory lock for path. Returns true when held, false when not held (v0.43.0)", contract!((path: string) -> bool; failure[raises])),
-    ("fcntl_lock", CapabilityClass::FsWrite,      "io",      "Take a POSIX record lock over the whole file: fcntl_lock(path[, {shared, wait}]) -> bool — the fcntl(2) lock namespace C daemons use for pidfiles/lockfiles, which flock(2) locks never see (Linux keeps the two families separate). Contract-identical to flock: exclusive + non-blocking default, contention false, real errors raise, per-process idempotent-true by canonical path. Implemented as open-file-description locks (F_OFD_SETLK): they conflict with other processes' traditional fcntl records, and survive this process opening/closing the same path elsewhere — a read_file of the locked path cannot drop them (v0.71.0)", contract!((path: string, opts?: map) -> bool; failure[raises])),
+    ("fcntl_lock", CapabilityClass::FsWrite,      "io",      "Take a POSIX record lock over the whole file: fcntl_lock(path[, {shared, wait}]) -> bool — the fcntl(2) lock namespace C daemons use for pidfiles/lockfiles, which flock(2) locks never see (Linux keeps the two families separate). Contract-identical to flock: exclusive + non-blocking default, contention false, real errors raise, per-process idempotent-true by canonical path. Implemented as open-file-description locks (F_OFD_SETLK): they conflict with other processes' traditional fcntl records, and survive this process opening/closing the same path elsewhere — a read_file of the locked path cannot drop them (v0.71.0)", contract!((path: string, opts?: any_of(map, nil)) -> bool; failure[raises])),
     ("fcntl_unlock", CapabilityClass::FsWrite,    "io",      "Release and close this process's POSIX record lock for path. true when held, false when not (v0.71.0)", contract!((path: string) -> bool; failure[raises])),
     ("copy", CapabilityClass::FsWrite,            "io",      "Copy a single file: copy(src, dst). Overwrites dst; preserves the source permission bits. Use copy_tree for a directory (v0.22.0).", contract!((src: string, dst: string) -> nil; failure[raises])),
     ("copy_tree", CapabilityClass::FsWrite,       "io",      "Recursively copy a directory: copy_tree(src, dst). Creates dst, copies files (perms preserved) and symlinks (as symlinks); merges into an existing dst (v0.22.0).", contract!((src: string, dst: string) -> nil; failure[raises])),
@@ -275,7 +275,7 @@ builtin_table! {
     ("remove_dir", CapabilityClass::FsWrite,      "io",      "Recursively remove a directory and its contents: remove_dir(path) (rm -rf). No-op if already gone (v0.22.0).", contract!((path: string) -> nil; failure[raises])),
     ("chmod", CapabilityClass::FsWrite,           "io",      "Set file/directory permissions. chmod(path, 0o755) — mode as a VALUE (use an octal literal) or an octal string \"0755\" (v0.11.0: a number is now the value, not its decimal digits read as octal)", contract!((path: string, mode: any_of(number, string)) -> nil; failure[raises])),
     ("chown", CapabilityClass::FsWrite,           "io",      "Set file owner/group by numeric uid/gid: chown(path, 1000, 1000). Follows symlinks. Numeric only (no name resolution) (v0.17.1)", contract!((path: string, uid: number, gid: number) -> nil; failure[raises])),
-    ("stat", CapabilityClass::FsRead,            "io",      "Stat a path → map {uid, gid, nlink, size, mode, perm, ino, dev, ctime, mtime, atime, ctime_nsec, mtime_nsec, atime_nsec, is_file, is_dir, is_symlink}. ino/dev are STRINGS (u64, exceed f64 exact range); mode is full st_mode, perm = mode & 0o7777; *time are epoch seconds (f64) and *_nsec the sub-second part 0..=999999999 (v0.44.0) — compare the PAIR to see a same-second rewrite. Follows symlinks by default; stat(path, {follow_symlinks:false}) is lstat (v0.17.1)", contract!((path: string, opts?: map) -> map("stat", {uid: number, gid: number, nlink: number, size: number, mode: number, perm: number, ino: string, dev: string, ctime: number, mtime: number, atime: number, ctime_nsec: number, mtime_nsec: number, atime_nsec: number, is_file: bool, is_dir: bool, is_symlink: bool}); failure[raises])),
+    ("stat", CapabilityClass::FsRead,            "io",      "Stat a path → map {uid, gid, nlink, size, mode, perm, ino, dev, ctime, mtime, atime, ctime_nsec, mtime_nsec, atime_nsec, is_file, is_dir, is_symlink}. ino/dev are STRINGS (u64, exceed f64 exact range); mode is full st_mode, perm = mode & 0o7777; *time are epoch seconds (f64) and *_nsec the sub-second part 0..=999999999 (v0.44.0) — compare the PAIR to see a same-second rewrite. Follows symlinks by default; stat(path, {follow_symlinks:false}) is lstat (v0.17.1)", contract!((path: string, opts?: any_of(map("stat_options", {follow_symlinks: bool}), nil)) -> map("stat", {uid: number, gid: number, nlink: number, size: number, mode: number, perm: number, ino: string, dev: string, ctime: number, mtime: number, atime: number, ctime_nsec: number, mtime_nsec: number, atime_nsec: number, is_file: bool, is_dir: bool, is_symlink: bool}); failure[raises])),
     ("line_count", CapabilityClass::FsRead,      "io",      "Count lines in a file by streaming — never loads the whole file (byte-oriented, so it works on non-UTF-8 files too) (streams since v0.28.1)", contract!((path: string) -> number; failure[raises])),
     ("head", CapabilityClass::FsRead,            "io",      "First N lines of a file as a list (default 10) — streams and stops after N lines, never reads the rest (the no-slurp twin of take(read_lines(p), n)) (v0.28.1)", contract!((path: string, n?: number) -> list(string); failure[raises])),
     ("tail", CapabilityClass::FsRead,            "io",      "Last N lines of a file as a list (default 10) — reads backwards in blocks from EOF, never slurps the whole file (the no-slurp twin of take(read_lines(p), -n)) (v0.28.1)", contract!((path: string, n?: number) -> list(string); failure[raises])),
@@ -284,22 +284,23 @@ builtin_table! {
     ("extname", CapabilityClass::Pure,         "io",      "Return the file extension (including the leading dot)", contract!((path: string) -> string)),
     ("path_join", CapabilityClass::Pure,       "io",      "Join path components with the native separator", contract!((a: string, b: string) -> string)),
     ("path_parts", CapabilityClass::Pure,      "io",      "Decompose a path into {dir, base, stem, ext} (v0.2.1)", contract!((path: string) -> map("path_parts", {dir: string, base: string, stem: string, ext: string}))),
-    ("walk", CapabilityClass::FsRead,            "io",      "Recursive directory walk: walk(dir, {max_depth, follow_symlinks, include_dirs}); invalid max_depth raises instead of becoming unlimited (strict since v0.55.0)", contract!((dir: string, opts?: map) -> list(string); failure[raises])),
+    ("walk", CapabilityClass::FsRead,            "io",      "Recursive directory walk: walk(dir, {max_depth, follow_symlinks, include_dirs}); invalid max_depth raises instead of becoming unlimited (strict since v0.55.0)", contract!((dir: string, opts?: any_of(map("walk_options", {max_depth: number, follow_symlinks: bool, include_dirs: bool}), nil)) -> list(string); failure[raises])),
     ("readline", CapabilityClass::Env,        "io",      "Read a line from stdin (optional prompt argument)", contract!((prompt?: string) -> string; effects[blocking])),
     ("read_stdin", CapabilityClass::Env,      "io",      "Read all of stdin to EOF as a string (for pipe/hook input). STRICT UTF-8 — binary stdin raises; use read_stdin_bytes for that", contract!(() -> string; effects[blocking])),
-    ("read_stdin_bytes", CapabilityClass::Env, "io",     "Read all of stdin to EOF as raw bytes — the binary twin of read_stdin, which refuses invalid UTF-8. Optional arg caps the read: read_stdin_bytes(8192) reads at most 8192 bytes, the same cap contract as read_file_bytes (v0.65.0)", contract!((max?: number) -> bytes; effects[blocking]; failure[raises])),
+    ("read_stdin_bytes", CapabilityClass::Env, "io",     "Read all of stdin to EOF as raw bytes — the binary twin of read_stdin, which refuses invalid UTF-8. Optional arg caps the read: read_stdin_bytes(8192) reads at most 8192 bytes, the same cap contract as read_file_bytes (v0.65.0)", contract!((max?: any_of(number, nil)) -> bytes; effects[blocking]; failure[raises])),
     ("tty_mode", CapabilityClass::Env,          "io",      "Put the controlling terminal into raw or cooked mode: tty_mode(\"raw\") disables canonical buffering, echo and signal generation (a lone ESC arrives as one byte — the keystroke-recorder primitive), tty_mode(\"cooked\") restores the saved termios. The original termios is restored on process exit if the caller never returns to cooked (v0.103.9)", contract!((mode: string) -> nil; failure[raises])),
     ("stdin_copy", CapabilityClass::Env,        "io",      "Copy stdin to a file, flushing every chunk, until EOF — the incremental twin of read_stdin_bytes, so a recorder killed mid-stream keeps the bytes it already read. Pair with tty_mode(\"raw\") to capture keystrokes (v0.103.9)", contract!((path: string) -> nil; effects[blocking]; failure[raises])),
     ("sqlopen", CapabilityClass::FsWrite,         "io",      "Open a SQLite database and return a handle", contract!((path: string, mode?: string) -> number; failure[raises])),
     ("sqlexec", CapabilityClass::FsWrite,         "io",      "Execute SQL on a SQLite handle, return result rows", contract!((handle: number, sql: string, params?: any) -> any_of(list, map); failure[raises])),
     ("sqlclose", CapabilityClass::FsWrite,        "io",      "Close a SQLite database handle", contract!((handle: number) -> nil; failure[raises])),
-    ("db_query", CapabilityClass::Db,        "db",      "Query the host-injected scoped DB: db_query(sql, [params]) → rows", contract!((sql: string, params?: list) -> list; effects[blocking]; failure[raises])),
-    ("db_exec", CapabilityClass::Db,         "db",      "Exec on the host-injected scoped DB: db_exec(sql, [params]) → {affected, last_insert_id}", contract!((sql: string, params?: list) -> map("db_exec_result", {affected: number, last_insert_id: number}); effects[blocking]; failure[raises])),
-    ("jmap", CapabilityClass::Jmap,            "jmap",    "Call the host-injected JMAP upstream: jmap(method, args) → result, or jmap([[method,args,callId],…]) → methodResponses", contract!((method: any_of(string, list), args?: map) -> any_of(map, list); effects[blocking]; failure[raises])),
-    ("jmap_upload", CapabilityClass::Jmap,     "jmap",    "Upload bytes as a JMAP blob via the host-injected upstream: jmap_upload(body[, content_type]) → blobId (the compose half of the mail seam; Email/set create is blob-only)", contract!((body: any_of(string, bytes, buffer), content_type?: string) -> string; effects[blocking]; failure[raises])),
-    ("bus_call", CapabilityClass::Bus,         "bus",     "Call a host-injected Bus verb under delegated identity: bus_call(verb, args) → reply. The embedder bounds which verbs are reachable and injects the delegation envelope; the script names no host/peer/actor", contract!((verb: string, args?: map) -> any; effects[blocking]; failure[raises])),
-    ("publish", CapabilityClass::Bus,          "bus",     "One-call topic publish (0.63.0): publish(topic, body[, opts]) builds the SPEC-02 wire frame and sends it via noded topic.publish — no hand-built ---\\n frames, no body=/name= header-route trap. body is the payload STRING (json_encode a map first); opts: {retain: bool, command: string (inner frame header override, defaults to topic), headers: map}. Sets $rc/$result like `send`; returns rc (0 = published)", contract!((topic: string, body?: any_of(string, nil), opts?: map) -> number; effects[blocking]; failure[raises])),
+    ("db_query", CapabilityClass::Db,        "db",      "Query the host-injected scoped DB: db_query(sql, [params]) → rows", contract!((sql: string, params?: any_of(list, nil)) -> list; effects[blocking]; failure[raises])),
+    ("db_exec", CapabilityClass::Db,         "db",      "Exec on the host-injected scoped DB: db_exec(sql, [params]) → {affected, last_insert_id}", contract!((sql: string, params?: any_of(list, nil)) -> map("db_exec_result", {affected: number, last_insert_id: number}); effects[blocking]; failure[raises])),
+    ("jmap", CapabilityClass::Jmap,            "jmap",    "Call the host-injected JMAP upstream: jmap(method, args) → result, or jmap([[method,args,callId],…]) → methodResponses", contract!((method: any_of(string, list), args?: any_of(map, nil)) -> any_of(map, list); effects[blocking]; failure[raises])),
+    ("jmap_upload", CapabilityClass::Jmap,     "jmap",    "Upload bytes as a JMAP blob via the host-injected upstream: jmap_upload(body[, content_type]) → blobId (the compose half of the mail seam; Email/set create is blob-only)", contract!((body: any_of(string, bytes, buffer), content_type?: any_of(string, nil)) -> string; effects[blocking]; failure[raises])),
+    ("bus_call", CapabilityClass::Bus,         "bus",     "Call a host-injected Bus verb under delegated identity: bus_call(verb, args) → reply. The embedder bounds which verbs are reachable and injects the delegation envelope; the script names no host/peer/actor", contract!((verb: string, args?: any_of(map, nil)) -> any; effects[blocking]; failure[raises])),
+    ("publish", CapabilityClass::Bus,          "bus",     "One-call topic publish (0.63.0): publish(topic, body[, opts]) builds the SPEC-02 wire frame and sends it via noded topic.publish — no hand-built ---\\n frames, no body=/name= header-route trap. body is the payload STRING (json_encode a map first); opts: {retain: bool, command: string (inner frame header override, defaults to topic), headers: map}. Sets $rc/$result like `send`; returns rc (0 = published)", contract!((topic: string, body?: any_of(string, nil), opts?: any_of(map, nil)) -> number; effects[blocking]; failure[raises]; hints[body: "encode it first (json_encode, data_encode or to_string)"])),
     ("serve_name", CapabilityClass::Pure,      "bus",     "The Bus service name this `mix --serve` citizen registered under — the `--name` value, else the script-stem derivation — or nil in a plain script or the REPL. Read it instead of hard-coding the name: a second instance started with `--name other` must publish `other`, not the first instance's name, in anything that routes replies or clicks back to it. `$me = serve_name() ?? \"quoin-panel\"` keeps a script runnable outside serve mode (v0.91.0)", contract!(() -> any_of(string, nil))),
+    ("is_reload_candidate", CapabilityClass::Pure, "bus", "True only while a `--serve` hot-reload candidate's init body is executing (false during the initial boot, in a plain script, and in every committed generation). A loader branches on it: the candidate must prepare passive state only — no starts, no spawns, no stopping old behaviour, no persisted writes — because a failed candidate reverts to the old evaluator with its managed children intact, and the committed generation reaps the old children before its own `lifecycle.commit` handler starts anything. Commit-time work belongs in an `on lifecycle.commit` handler, which the runtime queues locally exactly once per committed swap", contract!(() -> bool)),
 
     ("env", CapabilityClass::Env,             "system",  "Get environment variable value (\"\" if unset); env(name, default) returns default when unset or empty", contract!((name: string, default?: any) -> any)),
     ("time", CapabilityClass::Pure,            "system",  "Return current Unix timestamp as float", contract!(() -> number)),
@@ -313,16 +314,16 @@ builtin_table! {
     ("exit", CapabilityClass::Process,            "system",  "Exit with optional status code", contract!((code?: number) -> nil; effects[terminates]; failure[terminates])),
     ("sleep", CapabilityClass::Pure,           "system",  "Sleep for N seconds (async)", contract!((n: number) -> nil; effects[blocking]; failure[raises])),
     ("task_start", CapabilityClass::Process, "system", "Start an in-process handler task; command must have an async handler. No Bus traffic. Requires the runner's LocalSet; drained on shutdown", contract!((command: string, body: string) -> nil; failure[raises])),
-    ("run", CapabilityClass::Process,             "system",  "Run shell command via sh, return trimmed stdout as string. run(cmd, [{timeout: seconds}]) — 0 (default) = no deadline; a timed-out child is PG-killed and run dies (catchable)", contract!((cmd: string, opts?: map) -> string; effects[blocking, shell]; failure[raises])),
-    ("run_rc", CapabilityClass::Process,          "system",  "Run shell command, return {rc, stdout, stderr, timed_out, interrupted} map. run_rc(cmd, [{timeout: seconds}]) — 0 (default) = no deadline; timeout → rc=-1 timed_out=true", contract!((cmd: string, opts?: map) -> map("run_rc_result", {rc: number, stdout: string, stderr: string, timed_out: bool, interrupted: bool}); effects[must_use, blocking, shell]; failure[returns_result])),
-    ("run_stream", CapabilityClass::Process,      "system",  "Run an argv LIST directly (no sh), inheriting stdio so output streams live and the child can use the terminal (interactive when it has a pty, e.g. ssh -t); returns the exit code. run_stream(argv, [{env, clear_env, cwd}]) — same env/cwd semantics as run_argv, so an interactive child gets variables without an `env` prefix exposing them in its ps argv (v0.51.0). The run_argv-only opts (timeout, stdin, stdout, stderr, max_output, stream) are rejected by name: this runner blocks until the child exits and captures nothing", contract!((argv: list(string), opts?: map("run_stream_options", {env: map, clear_env: bool, cwd: any_of(string, nil)})) -> number; effects[must_use, blocking]; failure[returns_result])),
-    ("run_argv", CapabilityClass::Process,        "system",  "Run an argv list directly (no shell) with structured stdio routing and a whole-call deadline that starts before route opening. opts: timeout; grace (seconds: at the deadline SIGTERM the process group, wait up to grace for it, then SIGKILL — default 0 = SIGKILL at once; refused with timeout:0); stdin nil|string|bytes|buffer|{file}|{null:true}|{inherit:true} (only when mix's own stdin is not a terminal, else STDIN_TERMINAL — use run_stream); stdout capture|inherit|null|{file,append?,mode?}; stderr capture|inherit|null|stdout|{file,append?,mode?}; cwd/env/clear_env; max_output; stream. stdout/stderr default capture; output files default truncate, mode 0o600. Routed non-capture streams return \"\" with truncation false and are not capped. stderr:stdout merges into stdout. File-open failure or route-open deadline is a PROCESS_STDIO value and the child is not spawned. Captured output abandoned at a deadline is returned partially with its truncation flag true. stream:true + stdout:inherit and all bad options raise OPTION_INVALID before spawn. Ordinary command/setup failure is encoded in the VALUE; timeout default 30s; max_output default 8 MiB per captured stream", contract!((argv: list(string), opts?: map("run_argv_options", {timeout: number, grace: number, stdin: any_of(string, bytes, buffer, map, nil), stdout: any_of(string, map), stderr: any_of(string, map), cwd: any_of(string, nil), env: map, clear_env: bool, max_output: number, stream: bool})) -> map("process_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any}); effects[must_use, blocking]; failure[returns_result])),
-    ("run_parallel", CapabilityClass::Process,    "system",  "Run many argv jobs concurrently with a bounded worker pool: run_parallel(jobs[, {max, timeout}]) -> list of process_result maps in INPUT order. Each job is an argv list (like run_argv's first arg) OR a {argv, stdin, cwd, env, clear_env, stdout, stderr, max_output, timeout, grace} map mirroring run_argv's options. max bounds concurrency (default 8, hard-capped at 256 live workers — excess jobs still run, drained by index); a top-level timeout (seconds) overrides every job's own. A job may NOT disable its deadline (timeout: 0 is refused) — one hung job would park the whole batch. Each result is EXACTLY run_argv's process_result map, so existing result-handling code ports unchanged; one job's ordinary failure (nonzero/timeout/spawn) is DATA in its map, never a raise. Process-level fan-out (std::thread over the run_argv engine), NOT in-language concurrency — the evaluator is single-threaded and Values never cross a thread; a job's `stream` flag is ignored (parallel tee would interleave). The killer use is ssh_mix fan-out: run_parallel of ssh argvs. A parse error in ANY job fails the whole call before spawning (v0.82.0)", contract!((jobs: list, opts?: map("run_parallel_options", {max: number, timeout: number})) -> list; effects[must_use, blocking]; failure[returns_result])),
-    ("run_argv_must", CapabilityClass::Process,   "system",  "Fail-fast run_argv with the same structured stdio opts: returns captured stdout unchanged when ok and no captured stream truncated (\"\" when stdout is routed), else raises PROCESS_EXIT_NONZERO / PROCESS_TIMEOUT / PROCESS_SIGNAL / PROCESS_INTERRUPTED / PROCESS_OUTPUT_LIMIT or the result's setup/lifecycle error_code (PROCESS_STDIO / PROCESS_SPAWN / PROCESS_IO / PROCESS_INTERNAL) with the complete result map in $err.details.result", contract!((argv: list(string), opts?: map("run_argv_options", {timeout: number, grace: number, stdin: any_of(string, bytes, buffer, map, nil), stdout: any_of(string, map), stderr: any_of(string, map), cwd: any_of(string, nil), env: map, clear_env: bool, max_output: number, stream: bool})) -> string; effects[blocking]; failure[raises])),
-    ("run_pipeline", CapabilityClass::Process,    "system",  "Run one or more argv stages without a shell, connecting each stdout to the next stdin. Stage maps accept argv/cwd/env/clear_env/stderr, plus stdin on the first stage and stdout on the last, using run_argv's stdio grammar. Every route and pipe is prepared before any stage runs, so PIPELINE_STDIO means no stage ran. Returns a distinct pipeline_result with final stdout/exit fields and per-stage outcomes. One whole-call deadline starts before route opening; captured output abandoned at that deadline is partial with its truncation flag true. Non-final SIGPIPE is NOT accepted by default: any stage killed by a signal makes the pipeline not-ok, matching `set -o pipefail`. Pass allow_signal:true to accept a non-final SIGPIPE when every downstream stage succeeded (the `yes | head -1` idiom). Every stage carries status ok|exit_nonzero|signal|broken_pipe|timeout|interrupted|setup_error and broken_pipe (killed by SIGPIPE: its reader closed); the result carries status ok|exit_nonzero|signal|broken_pipe|timeout|interrupted|setup_error, failed_stage (the RIGHTMOST non-ok stage, pipefail's rule; nil when none) and a one-line human summary — gates branch on status, never on text. Ordinary failure is encoded in the VALUE — never raises", contract!((stages: list, opts?: map("run_pipeline_options", {timeout: number, max_output: number, allow_signal: bool})) -> map("pipeline_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any, stages: list(map("pipeline_stage_result", {index: number, argv: list(string), ok: bool, exit_code: any, signal: any, duration_ms: number, stderr: string, stderr_truncated: bool, utf8_lossy: bool, accepted_signal: bool, status: string, broken_pipe: bool})), status: string, failed_stage: any, summary: string}); effects[must_use, blocking]; failure[returns_result])),
-    ("run_pipeline_must", CapabilityClass::Process, "system", "Fail-fast run_pipeline twin: returns final stdout unchanged when the pipeline is ok and no captured output truncated; otherwise raises PIPELINE_* with the complete pipeline_result in $err.details.result", contract!((stages: list, opts?: map("run_pipeline_options", {timeout: number, max_output: number, allow_signal: bool})) -> string; effects[blocking]; failure[raises])),
+    ("run", CapabilityClass::Process,             "system",  "Run shell command via sh, return trimmed stdout as string. run(cmd, [{timeout: seconds}]) — 0 (default) = no deadline; a timed-out child is PG-killed and run dies (catchable)", contract!((cmd: string, opts?: any_of(map, nil)) -> string; effects[blocking, shell]; failure[raises])),
+    ("run_rc", CapabilityClass::Process,          "system",  "Run shell command, return {rc, stdout, stderr, timed_out, interrupted} map. run_rc(cmd, [{timeout: seconds}]) — 0 (default) = no deadline; timeout → rc=-1 timed_out=true", contract!((cmd: string, opts?: any_of(map, nil)) -> map("run_rc_result", {rc: number, stdout: string, stderr: string, timed_out: bool, interrupted: bool}); effects[must_use, blocking, shell]; failure[returns_result])),
+    ("run_stream", CapabilityClass::Process,      "system",  "Run an argv LIST directly (no sh), inheriting stdio so output streams live and the child can use the terminal (interactive when it has a pty, e.g. ssh -t); returns the exit code. run_stream(argv, [{env, clear_env, cwd}]) — same env/cwd semantics as run_argv, so an interactive child gets variables without an `env` prefix exposing them in its ps argv (v0.51.0). The run_argv-only opts (timeout, stdin, stdout, stderr, max_output, stream) are rejected by name: this runner blocks until the child exits and captures nothing", contract!((argv: list(string), opts?: any_of(map("run_stream_options", {env: map, clear_env: bool, cwd: any_of(string, nil)}), nil)) -> number; effects[must_use, blocking]; failure[returns_result])),
+    ("run_argv", CapabilityClass::Process,        "system",  "Run an argv list directly (no shell) with structured stdio routing and a whole-call deadline that starts before route opening. opts: timeout; grace (seconds: at the deadline SIGTERM the process group, wait up to grace for it, then SIGKILL — default 0 = SIGKILL at once; refused with timeout:0); stdin nil|string|bytes|buffer|{file}|{null:true}|{inherit:true} (only when mix's own stdin is not a terminal, else STDIN_TERMINAL — use run_stream); stdout capture|inherit|null|{file,append?,mode?}; stderr capture|inherit|null|stdout|{file,append?,mode?}; cwd/env/clear_env; max_output; stream. stdout/stderr default capture; output files default truncate, mode 0o600. Routed non-capture streams return \"\" with truncation false and are not capped. stderr:stdout merges into stdout. File-open failure or route-open deadline is a PROCESS_STDIO value and the child is not spawned. Captured output abandoned at a deadline is returned partially with its truncation flag true. stream:true + stdout:inherit and all bad options raise OPTION_INVALID before spawn. opts may be nil (defaults). Ordinary command/setup failure is encoded in the VALUE; timeout default 30s; max_output default 8 MiB per captured stream", contract!((argv: list(string), opts?: any_of(map("run_argv_options", {timeout: number, grace: number, stdin: any_of(string, bytes, buffer, map, nil), stdout: any_of(string, map), stderr: any_of(string, map), cwd: any_of(string, nil), env: map, clear_env: bool, max_output: number, stream: bool}), nil)) -> map("process_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any}); effects[must_use, blocking]; failure[returns_result])),
+    ("run_parallel", CapabilityClass::Process,    "system",  "Run many argv jobs concurrently with a bounded worker pool: run_parallel(jobs[, {max, timeout}]) -> list of process_result maps in INPUT order. Each job is an argv list (like run_argv's first arg) OR a {argv, stdin, cwd, env, clear_env, stdout, stderr, max_output, timeout, grace} map mirroring run_argv's options. max bounds concurrency (default 8, hard-capped at 256 live workers — excess jobs still run, drained by index); a top-level timeout (seconds) overrides every job's own. A job may NOT disable its deadline (timeout: 0 is refused) — one hung job would park the whole batch. Each result is EXACTLY run_argv's process_result map, so existing result-handling code ports unchanged; one job's ordinary failure (nonzero/timeout/spawn) is DATA in its map, never a raise. Process-level fan-out (std::thread over the run_argv engine), NOT in-language concurrency — the evaluator is single-threaded and Values never cross a thread; a job's `stream` flag is ignored (parallel tee would interleave). The killer use is ssh_mix fan-out: run_parallel of ssh argvs. A parse error in ANY job fails the whole call before spawning (v0.82.0)", contract!((jobs: list, opts?: any_of(map("run_parallel_options", {max: number, timeout: number}), nil)) -> list; effects[must_use, blocking]; failure[returns_result])),
+    ("run_argv_must", CapabilityClass::Process,   "system",  "Fail-fast run_argv with the same structured stdio opts: returns captured stdout unchanged when ok and no captured stream truncated (\"\" when stdout is routed), else raises PROCESS_EXIT_NONZERO / PROCESS_TIMEOUT / PROCESS_SIGNAL / PROCESS_INTERRUPTED / PROCESS_OUTPUT_LIMIT or the result's setup/lifecycle error_code (PROCESS_STDIO / PROCESS_SPAWN / PROCESS_IO / PROCESS_INTERNAL) with the complete result map in $err.details.result", contract!((argv: list(string), opts?: any_of(map("run_argv_options", {timeout: number, grace: number, stdin: any_of(string, bytes, buffer, map, nil), stdout: any_of(string, map), stderr: any_of(string, map), cwd: any_of(string, nil), env: map, clear_env: bool, max_output: number, stream: bool}), nil)) -> string; effects[blocking]; failure[raises])),
+    ("run_pipeline", CapabilityClass::Process,    "system",  "Run one or more argv stages without a shell, connecting each stdout to the next stdin. Stage maps accept argv/cwd/env/clear_env/stderr, plus stdin on the first stage and stdout on the last, using run_argv's stdio grammar. Every route and pipe is prepared before any stage runs, so PIPELINE_STDIO means no stage ran. Returns a distinct pipeline_result with final stdout/exit fields and per-stage outcomes. One whole-call deadline starts before route opening; captured output abandoned at that deadline is partial with its truncation flag true. Non-final SIGPIPE is NOT accepted by default: any stage killed by a signal makes the pipeline not-ok, matching `set -o pipefail`. Pass allow_signal:true to accept a non-final SIGPIPE when every downstream stage succeeded (the `yes | head -1` idiom). Every stage carries status ok|exit_nonzero|signal|broken_pipe|timeout|interrupted|setup_error and broken_pipe (killed by SIGPIPE: its reader closed); the result carries status ok|exit_nonzero|signal|broken_pipe|timeout|interrupted|setup_error, failed_stage (the RIGHTMOST non-ok stage, pipefail's rule; nil when none) and a one-line human summary — gates branch on status, never on text. Ordinary failure is encoded in the VALUE — never raises", contract!((stages: list, opts?: any_of(map("run_pipeline_options", {timeout: number, max_output: number, allow_signal: bool}), nil)) -> map("pipeline_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any, stages: list(map("pipeline_stage_result", {index: number, argv: list(string), ok: bool, exit_code: any, signal: any, duration_ms: number, stderr: string, stderr_truncated: bool, utf8_lossy: bool, accepted_signal: bool, status: string, broken_pipe: bool})), status: string, failed_stage: any, summary: string}); effects[must_use, blocking]; failure[returns_result])),
+    ("run_pipeline_must", CapabilityClass::Process, "system", "Fail-fast run_pipeline twin: returns final stdout unchanged when the pipeline is ok and no captured output truncated; otherwise raises PIPELINE_* with the complete pipeline_result in $err.details.result", contract!((stages: list, opts?: any_of(map("run_pipeline_options", {timeout: number, max_output: number, allow_signal: bool}), nil)) -> string; effects[blocking]; failure[raises])),
     ("spawn", CapabilityClass::Process, "system", "Start a child and return its PID. String form uses a shell and optional stdout/stderr paths. Argv form runs directly with options: detach, die_with_parent, exit_event, tag, cwd, env, clear_env, stdout, stderr. exit_event:true (Linux pidfd) registers the sole reaper in this evaluator and emits proc.exited {pid,tag,exit_code,signal}; tag is a string up to 4096 bytes, default empty. Cannot detach a managed child. Managed children are killed and reaped when their evaluator retires, after handler drain; failed reload leaves old managed children intact. die_with_parent additionally arms kernel parent-death SIGKILL. Without exit_event, existing detached/owned/plain spawn semantics apply. Stdio defaults null, capture is refused; cwd/env/clear_env match run_argv. See system manual for lifetime rules", contract!((cmd: any_of(string, list(string)), stdout?: any_of(string, map("spawn_options", {detach: bool, die_with_parent: bool, exit_event: bool, tag: string, cwd: any_of(string, nil), env: map, clear_env: bool, stdout: any_of(string, map), stderr: any_of(string, map)})), stderr?: string) -> number; effects[shell]; failure[raises])),
-    ("kill", CapabilityClass::Process,            "system",  "Send signal to process (default SIGTERM); returns false when the signal could not be delivered. Both arguments must be whole NUMBERS and neither is coerced — a bool/string pid raises TYPE_MISMATCH rather than becoming 0 (which signals this process's whole group), and an unrecognised signal raises rather than silently defaulting to SIGTERM (strict since v0.52.0)", contract!((pid: number, signal?: number) -> bool; effects[must_use]; failure[returns_result])),
+    ("kill", CapabilityClass::Process,            "system",  "Send signal to process (default SIGTERM); returns false when the signal could not be delivered. Both arguments must be whole NUMBERS and neither is coerced — a bool/string pid raises TYPE_MISMATCH rather than becoming 0 (which signals this process's whole group), and an unrecognised signal raises rather than silently defaulting to SIGTERM (strict since v0.52.0)", contract!((pid: number, signal?: number) -> bool; effects[must_use]; failure[returns_result]; hints[pid: "no coercion — a coerced pid of 0 addresses this process's entire group", signal: "no coercion — pass the signal number, e.g. 9 for SIGKILL; names are not accepted"])),
     ("shell_quote", CapabilityClass::Pure,     "system",  "Single-quote-wrap a string for safe interpolation into a POSIX shell command", contract!((s: string) -> string)),
     ("sql_quote", CapabilityClass::Pure,       "system",  "Escape a string for SQL string literals: doubles ' and escapes \\ (MySQL/MariaDB-safe — the documented target; also safe for SQLite, where a literal backslash arrives doubled — use sqlexec binds for exact bytes); NUL bytes stripped", contract!((s: string) -> string)),
     ("random_password", CapabilityClass::Pure, "system",  "Generate an alphanumeric password (default len 16, no O/o, guaranteed upper+lower+digit)", contract!((len?: number) -> string)),
@@ -330,8 +331,8 @@ builtin_table! {
     ("ssh_must", CapabilityClass::Network,        "system",  "ssh_run wrapper: returns stdout on success, throws a Mix error otherwise", contract!((host: string, cmd: any_of(string, list), opts?: map) -> string; effects[blocking]; failure[raises])),
     ("ssh_mix", CapabilityClass::Network,         "system",  "Run Mix source on a remote host: ships the source over ssh stdin into `/opt/cosmix/bin/mix -`, bypassing ALL shell quoting. ssh_mix(host, source, [opts]) -> same map as ssh_run; bindings maps valid Mix identifier names to strict-data-encoded values prepended as `$name` assignments, and decode:\"data\"|\"json\" adds a parsed `.value` from stdout. max_output caps local capture per stream (0 rejected; omit for unbounded); a truncated stdout REFUSES to decode (raises) — a truncated prefix can parse as a smaller, wrong value — so omit decode and inspect stdout/stdout_truncated to work with partial output. Accepts every ssh_run opt except stdin/env_transport. Remote command failure stays in the result value; invalid arguments/options raise locally. (v0.20.4)", contract!((host: string, source: string, opts?: map("ssh_mix_options", {timeout: number, max_output: number, connect_timeout: number, multiplex: bool, batch: bool, strict_host_key: string, env: map, cwd: string, extra_ssh_args: list(string), decode: string, bindings: map})) -> map("ssh_result", {stdout: string, stderr: string, exit_code: number, ok: bool, duration_ms: number, host: string, timed_out: bool, interrupted: bool, utf8_lossy: bool, stdout_truncated: bool, stderr_truncated: bool, value: any}); effects[must_use, blocking]; failure[returns_result])),
     ("ssh_mix_many", CapabilityClass::Network,    "system",  "ssh_mix on many hosts at once: ssh_mix_many(hosts, source[, opts]) -> map host -> ssh_result, keyed in INPUT order. Every host gets the same source, bindings, env and decode, and each result is EXACTLY ssh_mix's ssh_result map, so per-host handling code ports unchanged. opts = every ssh_mix opt plus max (concurrency, default 8, at most 256 live workers — run_parallel's numbers, its own loop). Options are validated once (even for an empty host list) and every host is checked before any ssh spawns; a wrong argument type raises TYPE_MISMATCH. After that nothing raises — one host's failure is DATA in its own map: unreachable, nonzero exit and timeout arrive as ok:false; a local spawn/pipe failure as ok:false with error_code (`PROCESS_SPAWN`, `PROCESS_STDIO`, …) and error; a decode refusal (truncated or unparseable stdout, where ssh_mix raises) as ok:false, decode_error and no value; a host never started because of Ctrl-C as ok:false, interrupted:true. hosts must be unique strings; timeout:0 is refused (one hung host would park the batch); there is no whole-call deadline", contract!((hosts: list(string), source: string, opts?: map("ssh_mix_many_options", {timeout: number, max_output: number, connect_timeout: number, multiplex: bool, batch: bool, strict_host_key: string, env: map, cwd: string, extra_ssh_args: list(string), decode: string, bindings: map, max: number})) -> map; effects[must_use, blocking]; failure[returns_result])),
-    ("send_mail", CapabilityClass::Process,       "system",  "Send a plain-text email through the local MTA: send_mail({to, from, subject, body[, headers]}[, {host, sendmail, timeout}]) -> run_argv's process_result + message_id (+ host, only with the host opt). Renders an RFC 5322 message (From, To, Subject, Date, Message-ID, MIME-Version, text/plain utf-8) and pipes it to `sendmail -t -i -f <envelope>` on stdin — never a network SMTP client; ok means the MTA accepted it, not that it was delivered. to is a string or list of strings; Cc/Bcc go in headers. from is exactly one mailbox, addr or Name <addr> (a comment, a second mailbox or <> raises); its address is the envelope sender. Long headers are folded within 78 columns (an unbreakable run over 998 raises); a non-ASCII body or one with a line over 998 bytes goes quoted-printable, else 7bit. A non-ASCII subject is RFC 2047-encoded; every other header value must be ASCII, and CR/LF/NUL in any header raises. headers adds headers or replaces the generated Date/Message-ID/MIME-Version; From/To/Subject there raise (set them in msg), and so do Content-Type/Content-Transfer-Encoding (send_mail encodes the body itself, always text/plain utf-8). sendmail is found on PATH, then /usr/sbin/sendmail, /usr/lib/sendmail, unless the sendmail opt names it. host sends from that host via ssh_exec (remote default /usr/sbin/sendmail). An MTA failure or missing sendmail is DATA (ok:false, exit_code, stderr, error_code); bad input raises before anything runs: OPTION_INVALID (msg fields, options), TYPE_MISMATCH (msg not a map, arity), or ssh_exec's own validation errors with host", contract!((msg: map("send_mail_msg", {to: any_of(string, list), from: string, subject: string, body: string, headers: map}), opts?: map("send_mail_options", {host: string, sendmail: string, timeout: number})) -> map("process_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any, message_id: string, host: string}); effects[must_use, blocking]; failure[returns_result]; cond_caps[host: Network])),
-    ("ssh_exec", CapabilityClass::Network,        "system",  "Run an argv list DIRECTLY on a remote host via a strict-data driver and remote run_argv. Remote stdio allowlist: stdin nil|string|{file}|{null:true} (a stdin STRING is always data, as locally — there is no stdin \"inherit\" route on either side); stdout capture|null|{file}; stderr capture|null|stdout|{file}. File paths resolve remotely. stdout/stderr inherit and stream:true raise OPTION_INVALID locally before ssh because they would corrupt or bypass the result envelope. Binary stdin also raises locally. Transport/protocol failures and remote command failure are returned in the process_result plus host; a remote without run_argv returns SSH_REMOTE_UNSUPPORTED without running the command", contract!((host: string, argv: list(string), opts?: map) -> map("process_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any, host: string}); effects[must_use, blocking]; failure[returns_result])),
+    ("send_mail", CapabilityClass::Process,       "system",  "Send a plain-text email through the local MTA: send_mail({to, from, subject, body[, headers]}[, {host, sendmail, timeout}]) -> run_argv's process_result + message_id (+ host, only with the host opt). Renders an RFC 5322 message (From, To, Subject, Date, Message-ID, MIME-Version, text/plain utf-8) and pipes it to `sendmail -t -i -f <envelope>` on stdin — never a network SMTP client; ok means the MTA accepted it, not that it was delivered. to is a string or list of strings; Cc/Bcc go in headers. from is exactly one mailbox, addr or Name <addr> (a comment, a second mailbox or <> raises); its address is the envelope sender. Long headers are folded within 78 columns (an unbreakable run over 998 raises); a non-ASCII body or one with a line over 998 bytes goes quoted-printable, else 7bit. A non-ASCII subject is RFC 2047-encoded; every other header value must be ASCII, and CR/LF/NUL in any header raises. headers adds headers or replaces the generated Date/Message-ID/MIME-Version; From/To/Subject there raise (set them in msg), and so do Content-Type/Content-Transfer-Encoding (send_mail encodes the body itself, always text/plain utf-8). sendmail is found on PATH, then /usr/sbin/sendmail, /usr/lib/sendmail, unless the sendmail opt names it. host sends from that host via ssh_exec (remote default /usr/sbin/sendmail). An MTA failure or missing sendmail is DATA (ok:false, exit_code, stderr, error_code); bad input raises before anything runs: OPTION_INVALID (msg fields, options), TYPE_MISMATCH (msg not a map, arity), or ssh_exec's own validation errors with host", contract!((msg: map("send_mail_msg", {to: any_of(string, list), from: string, subject: string, body: string, headers: map}), opts?: any_of(map("send_mail_options", {host: string, sendmail: string, timeout: number}), nil)) -> map("process_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any, message_id: string, host: string}); effects[must_use, blocking]; failure[returns_result]; cond_caps[host: Network])),
+    ("ssh_exec", CapabilityClass::Network,        "system",  "Run an argv list DIRECTLY on a remote host via a strict-data driver and remote run_argv. Remote stdio allowlist: stdin nil|string|{file}|{null:true} (a stdin STRING is always data, as locally — there is no stdin \"inherit\" route on either side); stdout capture|null|{file}; stderr capture|null|stdout|{file}. File paths resolve remotely. stdout/stderr inherit and stream:true raise OPTION_INVALID locally before ssh because they would corrupt or bypass the result envelope. Binary stdin also raises locally. Transport/protocol failures and remote command failure are returned in the process_result plus host; a remote without run_argv returns SSH_REMOTE_UNSUPPORTED without running the command", contract!((host: string, argv: list(string), opts?: any_of(map, nil)) -> map("process_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any, host: string}); effects[must_use, blocking]; failure[returns_result])),
     ("process_alive", CapabilityClass::Process,   "system",  "Test if a process exists (signal 0 check). EPERM counts as alive: existence does not imply permission to signal, including another user's process. pid must be a positive whole NUMBER; no coercion. Nonpositive, bool or string PIDs raise TYPE_MISMATCH. Reaps exited unmanaged children; controller-owned job PIDs use only signal 0 so their sole wait owner retains every status (zombies may briefly report alive).", contract!((pid: number) -> bool)),
     ("net_watch", CapabilityClass::Env, "system", "Subscribe to Linux rtnetlink link/address changes; returns an evaluator-owned opaque handle. Delivers net.changed {watch, changes:[{kind:\"link\"|\"addr\", ifname, index, up, removed, operstate?, loopback?, wireless?, family?, address?, prefix?}], overflow, closed?} via $event.args; bursts coalesce per link/address, repeats that change nothing are dropped, overflow means re-read net_state(). opts {events: [\"link\",\"addr\"]}. No polling fallback", contract!((opts?: map("net_watch_options", {events: list(string)})) -> string; failure[raises])),
     ("net_unwatch", CapabilityClass::Env, "system", "Cancel a net_watch handle and its pending changes", contract!((handle: string) -> nil; failure[raises])),
@@ -340,11 +341,11 @@ builtin_table! {
     ("audio_unwatch", CapabilityClass::Process, "system", "Cancel an audio_watch handle: kills and reaps its pactl child, drops pending changes", contract!((handle: string) -> nil; failure[raises])),
     ("audio_state", CapabilityClass::Process, "system", "Default audio sink volume via one `wpctl get-volume @DEFAULT_AUDIO_SINK@` (2 s deadline): {ok, volume, level (0-100+), muted, reason?}. No default sink, a wpctl that is missing or cannot start, or a timeout is ok:false with a reason, never an error. opts {runtime_dir}", contract!((opts?: map("audio_state_options", {runtime_dir: string})) -> map("audio_state", {ok: bool, volume: number, level: number, muted: bool, reason: string}); effects[must_use, blocking]; failure[returns_result])),
     ("panic", CapabilityClass::Process,           "system",  "Abort via an uncatchable Rust panic (distinct from catchable die); the SPEC 18 §3.4 handler boundary isolates it in --serve mode", contract!((msg: string) -> nil; effects[terminates]; failure[terminates])),
-    ("raise", CapabilityClass::Pure,           "system",  "Raise a catchable structured error: raise(code, message[, details]) — code is UPPER_SNAKE (e.g. \"VALIDATION_REQUIRED\", stable identifiers, scripts may define their own); a non-string message is coerced to its string form; catch with `catch $msg, $err` and read $err.code / $err.details / $err.frames (v0.29.0)", contract!((code: string, message: any, details?: map) -> nil; failure[raises])),
+    ("raise", CapabilityClass::Pure,           "system",  "Raise a catchable structured error: raise(code, message[, details]) — code is UPPER_SNAKE (e.g. \"VALIDATION_REQUIRED\", stable identifiers, scripts may define their own); a non-string message is coerced to its string form; catch with `catch $msg, $err` and read $err.code / $err.details / $err.frames (v0.29.0)", contract!((code: string, message: any, details?: any_of(map, nil)) -> nil; failure[raises])),
 
     ("require_key", CapabilityClass::Pure,     "validate", "Assert a map key is present with a non-nil value and return it; raises VALIDATION_REQUIRED with details {path, expected, actual_type} (v0.29.0)", contract!((map: map, key: string) -> any; failure[raises])),
     ("expect_type", CapabilityClass::Pure,     "validate", "Assert a value's type and return it: expect_type($v, \"integer\") — types: any nil bool number integer string bytes buffer list map function (integer = finite whole within ±2^53-1); raises VALIDATION_TYPE (v0.29.0)", contract!((v: any, kind: string) -> any; failure[raises])),
-    ("nonblank", CapabilityClass::Pure,        "validate", "Assert a string contains a non-whitespace character, return it UNTRIMMED; the optional label names the value in the error; raises VALIDATION_NONBLANK — the boundary guard against nil/\"\" flowing into hostnames and paths (v0.29.0)", contract!((v: any, label?: string) -> string; failure[raises])),
+    ("nonblank", CapabilityClass::Pure,        "validate", "Assert a string contains a non-whitespace character, return it UNTRIMMED; the optional label names the value in the error; raises VALIDATION_NONBLANK — the boundary guard against nil/\"\" flowing into hostnames and paths (v0.29.0)", contract!((v: any, label?: any_of(string, nil)) -> string; failure[raises])),
     ("get_or", CapabilityClass::Pure,          "validate", "Map lookup with a default that covers BOTH an absent key and a nil value (the tolerant twin of require_key) (v0.29.0)", contract!((map: map, key: string, default: any) -> any)),
     ("validate", CapabilityClass::Pure,        "validate", "Validate a map against a field spec at a job/API boundary: validate($raw, {node: {type: \"string\", nonblank: true}, plan: {enum: [\"gold\", \"silver\"]}, vmid: {type: \"integer\", min: 100, max: 999999}, tags: {required: false, type: \"list\", items: {type: \"string\"}}, owner: {type: \"map\", schema: {name: {nonblank: true}}}}). Rules: required (default TRUE) / type (string or list of types) / nonblank / enum / min / max / min_length / max_length / items / schema. Returns the ORIGINAL map unchanged; optional absent-or-nil fields skip their rules; unknown INPUT fields pass through; unknown RULE keys raise VALIDATION_SPEC; violations raise VALIDATION_* with details {path, expected, actual_type} — paths like owner.name and tags[2] (v0.29.0)", contract!((value: map, spec: map) -> map; failure[raises])),
     ("hostname", CapabilityClass::Env,        "system",  "Return the system hostname", contract!(() -> string)),
@@ -362,27 +363,28 @@ builtin_table! {
     ("relative_time", CapabilityClass::Pure,   "system",  "Format timestamp as relative string (e.g. \"3 hours ago\")", contract!((ts: number) -> string; failure[raises])),
     ("base64_encode", CapabilityClass::Pure,   "system",  "Encode string as base64", contract!((s: any_of(string, bytes, buffer)) -> string)),
     ("base64_decode", CapabilityClass::Pure,   "system",  "Decode base64 string", contract!((s: any_of(string, bytes, buffer)) -> bytes; failure[raises])),
-    ("hash_blake3", CapabilityClass::Pure,     "system",  "BLAKE3 hash of a string/bytes/buffer → lowercase hex; pass {raw:true} for the raw digest as bytes (v0.66.0)", contract!((s: any_of(string, bytes, buffer), opts?: map) -> any_of(string, bytes); failure[raises])),
-    ("hash_sha256", CapabilityClass::Pure,     "system",  "SHA-256 hash of a string/bytes/buffer → lowercase hex; pass {raw:true} for the raw 32 digest bytes (v0.66.0 — before that a second argument was silently IGNORED)", contract!((s: any_of(string, bytes, buffer), opts?: map) -> any_of(string, bytes); failure[raises])),
-    ("hash_md5", CapabilityClass::Pure,        "system",  "MD5 hash of a string/bytes/buffer → lowercase hex; {raw:true} → bytes. ⚠ CRYPTOGRAPHICALLY BROKEN (collisions since 2004) — legacy interop only (Content-MD5, mail dedup keys, checksums against existing tools), NEVER a security decision; use hash_sha256/hash_blake3 for those (v0.66.0)", contract!((s: any_of(string, bytes, buffer), opts?: map) -> any_of(string, bytes); failure[raises])),
-    ("hash_sha1", CapabilityClass::Pure,       "system",  "SHA-1 hash of a string/bytes/buffer → lowercase hex; {raw:true} → bytes. ⚠ CRYPTOGRAPHICALLY BROKEN (SHAttered, 2017) — legacy interop only (git object ids, older ETags/APIs), NEVER a security decision; use hash_sha256/hash_blake3 for those (v0.66.0)", contract!((s: any_of(string, bytes, buffer), opts?: map) -> any_of(string, bytes); failure[raises])),
-    ("hmac_sha256", CapabilityClass::Pure,     "system",  "HMAC-SHA256 (RFC 2104) of a message with a secret key → lowercase hex; {raw:true} → the 32 MAC bytes (v0.66.0) — webhook signature verification (Stripe-Signature etc). Accepts string/bytes/buffer for both args (requires crypto feature)", contract!((key: any_of(string, bytes, buffer), msg: any_of(string, bytes, buffer), opts?: map) -> any_of(string, bytes); failure[raises])),
-    ("password_hash", CapabilityClass::Pure,   "system",  "Hash a password: password_hash(plaintext[, cost]) → bcrypt $2b$… string (cost 4-31, default 12; input over 72 bytes raises), or password_hash(plaintext, {scheme: \"sha512-crypt\"[, rounds]}) → $6$… for Dovecot/NS passdbs (rounds 1000-999999999, default 5000). Client-side hashing before writing maild.accounts.password over the Bus — a raw props.set stores the field verbatim (requires crypto feature; v0.71.0, sha512-crypt v0.102.6)", contract!((plaintext: string, opts?: map) -> string; failure[raises])),
+    ("hash_blake3", CapabilityClass::Pure,     "system",  "BLAKE3 hash of a string/bytes/buffer → lowercase hex; pass {raw:true} for the raw digest as bytes (v0.66.0)", contract!((s: any_of(string, bytes, buffer), opts?: any_of(map, nil)) -> any_of(string, bytes); failure[raises])),
+    ("hash_sha256", CapabilityClass::Pure,     "system",  "SHA-256 hash of a string/bytes/buffer → lowercase hex; pass {raw:true} for the raw 32 digest bytes (v0.66.0 — before that a second argument was silently IGNORED)", contract!((s: any_of(string, bytes, buffer), opts?: any_of(map, nil)) -> any_of(string, bytes); failure[raises])),
+    ("hash_md5", CapabilityClass::Pure,        "system",  "MD5 hash of a string/bytes/buffer → lowercase hex; {raw:true} → bytes. ⚠ CRYPTOGRAPHICALLY BROKEN (collisions since 2004) — legacy interop only (Content-MD5, mail dedup keys, checksums against existing tools), NEVER a security decision; use hash_sha256/hash_blake3 for those (v0.66.0)", contract!((s: any_of(string, bytes, buffer), opts?: any_of(map, nil)) -> any_of(string, bytes); failure[raises])),
+    ("hash_sha1", CapabilityClass::Pure,       "system",  "SHA-1 hash of a string/bytes/buffer → lowercase hex; {raw:true} → bytes. ⚠ CRYPTOGRAPHICALLY BROKEN (SHAttered, 2017) — legacy interop only (git object ids, older ETags/APIs), NEVER a security decision; use hash_sha256/hash_blake3 for those (v0.66.0)", contract!((s: any_of(string, bytes, buffer), opts?: any_of(map, nil)) -> any_of(string, bytes); failure[raises])),
+    ("hmac_sha256", CapabilityClass::Pure,     "system",  "HMAC-SHA256 (RFC 2104) of a message with a secret key → lowercase hex; {raw:true} → the 32 MAC bytes (v0.66.0) — webhook signature verification (Stripe-Signature etc). Accepts string/bytes/buffer for both args (requires crypto feature)", contract!((key: any_of(string, bytes, buffer), msg: any_of(string, bytes, buffer), opts?: any_of(map, nil)) -> any_of(string, bytes); failure[raises])),
+    ("password_hash", CapabilityClass::Pure,   "system",  "Hash a password: password_hash(plaintext[, cost]) → bcrypt $2b$… string (cost 4-31, default 12; input over 72 bytes raises), or password_hash(plaintext, {scheme: \"sha512-crypt\"[, rounds]}) → $6$… for Dovecot/NS passdbs (rounds 1000-999999999, default 5000). Client-side hashing before writing maild.accounts.password over the Bus — a raw props.set stores the field verbatim (requires crypto feature; v0.71.0, sha512-crypt v0.102.6)", contract!((plaintext: string, opts?: any_of(number, map, nil)) -> string; failure[raises])),
     ("password_verify", CapabilityClass::Pure, "system",  "Check a plaintext password against a hash: bcrypt (any $2a$/$2b$/$2y$ form) or SHA-crypt ($6$/$5$, incl. the Dovecot {SHA512-CRYPT} prefix) → bool. A malformed hash RAISES rather than answering false — a corrupt stored hash is a config fault, not a wrong password (requires crypto feature; v0.71.0, sha-crypt v0.102.6)", contract!((plaintext: string, hash: string) -> bool; failure[raises])),
     ("constant_time_eq", CapabilityClass::Pure, "system",  "Timing-safe equality for secrets/MACs: compares full length with no early exit (plain == leaks a timing oracle). Use for webhook signature comparison. Accepts string/bytes/buffer", contract!((a: any_of(string, bytes, buffer), b: any_of(string, bytes, buffer)) -> bool)),
-    ("hash_file", CapabilityClass::FsRead,     "system",  "Streaming digest of a file, fixed 64 KiB working set whatever the size: hash_file(path[, \"md5\"|\"sha1\"|\"sha256\"|\"blake3\"][, {raw:true}]) → lowercase hex, or bytes with {raw:true}. md5/sha1 added v0.66.0 and are BROKEN hashes for legacy interop only (v0.24.0)", contract!((path: string, algo?: string, opts?: map) -> any_of(string, bytes); failure[raises])),
+    ("jwt_rs256_sign", CapabilityClass::Pure, "system", "Sign JSON object claims with a PEM RSA private key using RS256; optional JSON object headers, alg pinned to RS256. Returns a compact JWT; crypto feature. No token exchange or expiry/audience policy", contract!((claims_json: string, private_pem: string, header_json?: any_of(string, nil)) -> string; failure[raises])),
+    ("hash_file", CapabilityClass::FsRead,     "system",  "Streaming digest of a file, fixed 64 KiB working set whatever the size: hash_file(path[, \"md5\"|\"sha1\"|\"sha256\"|\"blake3\"|nil][, {raw:true}]) → lowercase hex, or bytes with {raw:true}. md5/sha1 added v0.66.0 and are BROKEN hashes for legacy interop only (v0.24.0)", contract!((path: string, algo?: any_of(string, nil), opts?: any_of(map, nil)) -> any_of(string, bytes); failure[raises]; hints[algo: "one of \"md5\", \"sha1\", \"sha256\" or \"blake3\"; a map here is the options map placed one position early — write hash_file(path, \"sha256\", {raw: true})"])),
     ("uuid", CapabilityClass::Pure,            "system",  "Generate a new random UUID v4 string", contract!(() -> string)),
     ("dkim_keygen", CapabilityClass::Pure,     "system",  "Generate a DKIM keypair. dkim_keygen(\"rsa\", [bits=2048]) or dkim_keygen(\"ed25519\") → {algorithm, private_pem, public_b64, dns_txt_record}", contract!((algo: string, bits?: number) -> map("dkim_keypair", {algorithm: string, private_pem: string, public_b64: string, dns_txt_record: string}))),
-    ("http_get", CapabilityClass::Network,        "system",  "HTTP GET. http_get(url, [headers], [{timeout, ssl_verify, ca_file, ca_pem}] — timeout default 30, 0 disables; ssl_verify default true, false skips TLS cert/hostname checks like curl -k; ca_file/ca_pem ADD a private CA to the default roots — mutually exclusive with each other and with ssl_verify:false, 4 MiB cap, bad PEM raises HTTP_TLS, v0.29.0) → {status, body, bytes, headers, final_url, duration_ms, error_code, error} (headers lowercase-name→list; final_url after redirects; transport failure = status:0 + HTTP_* error_code; v0.30.0). `body` is the response decoded as UTF-8 (nil if not valid UTF-8); `bytes` is the raw byte buffer. Response bodies are capped at 64 MiB (over-cap → {status:0, error}).", contract!((url: string, headers?: map, opts?: map) -> map("http_response", {status: number, body: any, bytes: bytes, headers: map, final_url: string, duration_ms: number, error_code: any, error: any}); effects[must_use, blocking]; failure[returns_result]; cond_caps[ca_file: FsRead])),
-    ("http_post", CapabilityClass::Network,       "system",  "HTTP POST. http_post(url, body, [headers], [{timeout, ssl_verify, ca_file, ca_pem}]) → {status, body, bytes, headers, final_url, duration_ms, error_code, error} (headers lowercase-name→list; final_url after redirects; transport failure = status:0 + HTTP_* error_code; v0.30.0). Opts (incl. ssl_verify: false → skip TLS verification like curl -k) and `body`/`bytes` semantics (incl. the 64 MiB body cap) match http_get.", contract!((url: string, body: any, headers?: map, opts?: map) -> map("http_response", {status: number, body: any, bytes: bytes, headers: map, final_url: string, duration_ms: number, error_code: any, error: any}); effects[must_use, blocking]; failure[returns_result]; cond_caps[ca_file: FsRead])),
-    ("http_request", CapabilityClass::Network,    "system",  "HTTP any-verb. http_request(method, url, [body], [headers], [{timeout, ssl_verify, ca_file, ca_pem}]) → {status, body, bytes, headers, final_url, duration_ms, error_code, error} (headers lowercase-name→list; final_url after redirects; transport failure = status:0 + HTTP_* error_code; v0.30.0). Opts (incl. ssl_verify: false → skip TLS verification like curl -k) and `body`/`bytes` semantics (incl. the 64 MiB body cap) match http_get.", contract!((method: string, url: string, body?: any, headers?: map, opts?: map) -> map("http_response", {status: number, body: any, bytes: bytes, headers: map, final_url: string, duration_ms: number, error_code: any, error: any}); effects[must_use, blocking]; failure[returns_result]; cond_caps[ca_file: FsRead])),
-    ("http_post_multipart", CapabilityClass::Network, "system", "HTTP POST with a multipart/form-data body: http_post_multipart(url, fields, files, [headers], [opts]) → http_response map. `fields` is a map of string form fields; `files` is a map of field_name → {filename, content_type?, data: bytes|buffer} (raw binary payloads, the webhook/file-upload slot — v0.103.12). The boundary is generated, and the Content-Type header is set accordingly.", contract!((url: string, fields: map, files: map, headers?: map, opts?: map) -> map("http_response", {status: number, body: any, bytes: bytes, headers: map, final_url: string, duration_ms: number, error_code: any, error: any}); effects[must_use, blocking]; failure[returns_result]; cond_caps[ca_file: FsRead])),
+    ("http_get", CapabilityClass::Network,        "system",  "HTTP GET. http_get(url, [headers], [{timeout, ssl_verify, ca_file, ca_pem}] — timeout default 30, 0 disables; ssl_verify default true, false skips TLS cert/hostname checks like curl -k; ca_file/ca_pem ADD a private CA to the default roots — mutually exclusive with each other and with ssl_verify:false, 4 MiB cap, bad PEM raises HTTP_TLS, v0.29.0) → {status, body, bytes, headers, final_url, duration_ms, error_code, error} (headers lowercase-name→list; final_url after redirects; transport failure = status:0 + HTTP_* error_code; v0.30.0). `body` is the response decoded as UTF-8 (nil if not valid UTF-8); `bytes` is the raw byte buffer. Response bodies are capped at 64 MiB (over-cap → {status:0, error}).", contract!((url: string, headers?: any_of(map, nil), opts?: any_of(map, nil)) -> map("http_response", {status: number, body: any, bytes: bytes, headers: map, final_url: string, duration_ms: number, error_code: any, error: any}); effects[must_use, blocking]; failure[returns_result]; cond_caps[ca_file: FsRead])),
+    ("http_post", CapabilityClass::Network,       "system",  "HTTP POST. http_post(url, body, [headers], [{timeout, ssl_verify, ca_file, ca_pem}]) → {status, body, bytes, headers, final_url, duration_ms, error_code, error} (headers lowercase-name→list; final_url after redirects; transport failure = status:0 + HTTP_* error_code; v0.30.0). Opts (incl. ssl_verify: false → skip TLS verification like curl -k) and `body`/`bytes` semantics (incl. the 64 MiB body cap) match http_get.", contract!((url: string, body: any, headers?: any_of(map, nil), opts?: any_of(map, nil)) -> map("http_response", {status: number, body: any, bytes: bytes, headers: map, final_url: string, duration_ms: number, error_code: any, error: any}); effects[must_use, blocking]; failure[returns_result]; cond_caps[ca_file: FsRead])),
+    ("http_request", CapabilityClass::Network,    "system",  "HTTP any-verb. http_request(method, url, [body], [headers], [{timeout, ssl_verify, ca_file, ca_pem}]) → {status, body, bytes, headers, final_url, duration_ms, error_code, error} (headers lowercase-name→list; final_url after redirects; transport failure = status:0 + HTTP_* error_code; v0.30.0). Opts (incl. ssl_verify: false → skip TLS verification like curl -k) and `body`/`bytes` semantics (incl. the 64 MiB body cap) match http_get.", contract!((method: string, url: string, body?: any, headers?: any_of(map, nil), opts?: any_of(map, nil)) -> map("http_response", {status: number, body: any, bytes: bytes, headers: map, final_url: string, duration_ms: number, error_code: any, error: any}); effects[must_use, blocking]; failure[returns_result]; cond_caps[ca_file: FsRead])),
+    ("http_post_multipart", CapabilityClass::Network, "system", "HTTP POST with a multipart/form-data body: http_post_multipart(url, fields, files, [headers], [opts]) → http_response map. `fields` is a map of string form fields; `files` is a map of field_name → {filename, content_type?, data: bytes|buffer} (raw binary payloads, the webhook/file-upload slot — v0.103.12). The boundary is generated, and the Content-Type header is set accordingly.", contract!((url: string, fields: map, files: map, headers?: any_of(map, nil), opts?: any_of(map, nil)) -> map("http_response", {status: number, body: any, bytes: bytes, headers: map, final_url: string, duration_ms: number, error_code: any, error: any}); effects[must_use, blocking]; failure[returns_result]; cond_caps[ca_file: FsRead])),
     ("http_put_file", CapabilityClass::Network, "system", "Stream a regular file or inclusive range with exact Content-Length. Opts: method PUT/POST/PATCH (default PUT), range:{start,end}, headers, idle_timeout (seconds, default 30), deadline (seconds, default 0), ssl_verify, ca_file, ca_pem. Redirects disabled; 3xx returned. Deadline is cooperative and best-effort during blocking DNS/IO. Fixed 64 KiB transfer buffer; response capped at 64 MiB. Operational errors return status:0; invalid options raise. bytes_written counts source bytes consumed, size is window size, blake3 hashes that window (nil on failure). published is false (no local publication).", contract!((url: string, path: string, opts?: map("http_put_file_options", {method: string, range: map, headers: map, idle_timeout: number, deadline: number, ssl_verify: bool, ca_file: string, ca_pem: any})) -> map("http_file_response", {status: number, headers: map, bytes_written: number, size: number, blake3: any, body: any, bytes: bytes, final_url: string, duration_ms: number, error_code: any, error: any, published: bool}); effects[must_use, blocking]; failure[returns_result]; caps[FsRead])),
     ("http_get_file", CapabilityClass::Network, "system", "Stream GET through a unique temp sibling and publish atomically. Opts: overwrite (default false), append (default false; requires expect_blake3 and matching 206 Content-Range), expect_blake3 (64 lowercase hex), max_bytes (final size), headers, idle_timeout (seconds, default 30), deadline (seconds, default 0), ssl_verify, ca_file, ca_pem. 200/206 require identity framing and Content-Length; missing length or encoded responses return HTTP_IDENTITY_FRAMING. Append copies and hashes the existing prefix. Redirects returned; error bodies never installed. No-replace is atomic. Deadline is cooperative and best-effort during blocking DNS/IO. bytes_written counts downloaded bytes, size includes prefix, blake3 hashes the final file. published records publication even if directory fsync fails. Operational errors return status:0; invalid options raise.", contract!((url: string, path: string, opts?: map("http_get_file_options", {overwrite: bool, append: bool, expect_blake3: string, max_bytes: number, headers: map, idle_timeout: number, deadline: number, ssl_verify: bool, ca_file: string, ca_pem: any})) -> map("http_file_response", {status: number, headers: map, bytes_written: number, size: number, blake3: any, body: any, bytes: bytes, final_url: string, duration_ms: number, error_code: any, error: any, published: bool}); effects[must_use, blocking]; failure[returns_result]; caps[FsWrite]; cond_caps[append: FsRead, ca_file: FsRead])),
     ("bytes_len", CapabilityClass::Pure,       "system",  "Length of a Value::Bytes buffer in bytes (v0.3.1)", contract!((b: any_of(bytes, buffer)) -> number)),
     ("string_to_bytes", CapabilityClass::Pure, "system",  "Convert a string to its UTF-8 byte representation (v0.3.1)", contract!((s: string) -> bytes)),
-    ("bytes_to_string", CapabilityClass::Pure, "system",  "Convert a bytes buffer to a string; strict UTF-8, or pass {lossy:true} for a from_utf8_lossy decode (v0.17.2). Also accepts a Buffer.", contract!((b: any_of(bytes, buffer), opts?: map) -> string)),
-    ("bytes_find", CapabilityClass::Pure,      "system",  "0-based byte offset of needle in a bytes/buffer value, -1 if absent; optional `from` (signed, clamped) starts the scan and the result stays ABSOLUTE. Needle: bytes/buffer/string/byte number 0-255, and must not be empty. ⚠ NEVER use bare in a condition: -1 is truthy, 0 is falsy (MIX-W2305) (v0.64.0)", contract!((b: any_of(bytes, buffer), needle: any_of(bytes, buffer, string, number), from?: number) -> number; failure[raises])),
+    ("bytes_to_string", CapabilityClass::Pure, "system",  "Convert a bytes buffer to a string; strict UTF-8, or pass {lossy:true} for a from_utf8_lossy decode (v0.17.2). Also accepts a Buffer.", contract!((b: any_of(bytes, buffer), opts?: any_of(map("bytes_to_string_options", {lossy: bool}), nil)) -> string)),
+    ("bytes_find", CapabilityClass::Pure,      "system",  "0-based byte offset of needle in a bytes/buffer value, -1 if absent; optional `from` (signed, clamped) starts the scan and the result stays ABSOLUTE. Needle: bytes/buffer/string/byte number 0-255, and must not be empty. ⚠ NEVER use bare in a condition: -1 is truthy, 0 is falsy (MIX-W2305) (v0.64.0)", contract!((b: any_of(bytes, buffer), needle: any_of(bytes, buffer, string, number), from?: any_of(number, nil)) -> number; failure[raises])),
     ("bytes_starts_with", CapabilityClass::Pure, "system", "Test whether a bytes/buffer value starts with a prefix (bytes/buffer/string/byte number 0-255); an empty prefix is true (v0.64.0)", contract!((b: any_of(bytes, buffer), prefix: any_of(bytes, buffer, string, number)) -> bool; failure[raises])),
     ("bytes_ends_with", CapabilityClass::Pure, "system", "Test whether a bytes/buffer value ends with a suffix (bytes/buffer/string/byte number 0-255); an empty suffix is true (v0.70.0)", contract!((b: any_of(bytes, buffer), suffix: any_of(bytes, buffer, string, number)) -> bool; failure[raises])),
     ("bytes_split", CapabilityClass::Pure,     "system",  "Split a bytes/buffer value on a separator (bytes/buffer/string/byte number 0-255) → list of bytes. Same piece rules as split(): absent separator → one whole piece, leading/trailing separator → empty piece. An EMPTY separator raises (v0.64.0)", contract!((b: any_of(bytes, buffer), sep: any_of(bytes, buffer, string, number)) -> list(bytes); failure[raises])),
@@ -390,24 +392,24 @@ builtin_table! {
     ("bytes_from", CapabilityClass::Pure,      "system",  "Build bytes from a LIST, flat-splicing each item — int 0-255 = one byte, string = its UTF-8, bytes/buffer = its content (same item vocabulary as buffer([items])) (v0.64.0)", contract!((items: list) -> bytes; failure[raises])),
     ("bytes_to_hex", CapabilityClass::Pure,    "system",  "Lowercase hex of a bytes/buffer value, two chars per byte, no separator (v0.64.0)", contract!((b: any_of(bytes, buffer)) -> string; failure[raises])),
     ("bytes_from_hex", CapabilityClass::Pure,  "system",  "Decode a hex string to bytes — strict: even length, [0-9a-fA-F] only, no separators or whitespace. Exact inverse of bytes_to_hex (v0.64.0)", contract!((hex: string) -> bytes; failure[raises])),
-    ("buffer", CapabilityClass::Pure,          "buffer",  "Create a reference-semantic MUTABLE byte buffer (the escape hatch from value semantics for large binary/audio/video). buffer() empty; buffer(n) n zero bytes; buffer(string) UTF-8; buffer(bytes|buffer) independent copy; buffer([items]) flat splice of int 0-255 / string / bytes / buffer. Append with buffer_push (O(1) amortized, aliases share); freeze() to a value-semantic bytes (v0.26.0)", contract!((init?: any_of(number, string, bytes, buffer, list)) -> buffer)),
+    ("buffer", CapabilityClass::Pure,          "buffer",  "Create a reference-semantic MUTABLE byte buffer (the escape hatch from value semantics for large binary/audio/video). buffer() or buffer(nil) empty; buffer(n) n zero bytes; buffer(string) UTF-8; buffer(bytes|buffer) independent copy; buffer([items]) flat splice of int 0-255 / string / bytes / buffer. Append with buffer_push (O(1) amortized, aliases share); freeze() to a value-semantic bytes (v0.26.0)", contract!((init?: any_of(number, string, bytes, buffer, list, nil)) -> buffer)),
     ("buffer_push", CapabilityClass::Pure,     "buffer",  "Append bytes to a buffer IN PLACE (reference-semantic: every alias sees the growth). Each item is an int 0-255, string (UTF-8), bytes, or buffer. Self-append-safe (v0.26.0)", contract!((buf: buffer, item: any_of(number, string, bytes, buffer), rest: ...any_of(number, string, bytes, buffer)) -> nil; effects[mutates_args])),
     ("buffer_get", CapabilityClass::Pure,      "buffer",  "Byte at 0-based index i as a number 0-255, or nil if out of range (v0.26.0)", contract!((buf: buffer, i: number) -> any_of(number, nil))),
     ("buffer_set", CapabilityClass::Pure,      "buffer",  "Write byte (0-255) at 0-based index i, in place; errors if i is out of range — grow with buffer_push first (v0.26.0)", contract!((buf: buffer, i: number, byte: number) -> nil; effects[mutates_args])),
     ("freeze", CapabilityClass::Pure,          "buffer",  "Snapshot a buffer to a value-semantic bytes (a copy of the current content) — the bridge into write_file/hash/base64/http (v0.26.0)", contract!((buf: buffer) -> bytes)),
     ("dns_lookup", CapabilityClass::Network,      "system",  "Resolve a hostname to a list of IP address strings", contract!((host: string) -> list(string); effects[blocking]; failure[raises])),
     ("udp_send", CapabilityClass::Network,        "system",  "Send ONE UDP datagram: udp_send(host, port, payload) -> bytes sent. Payload (string/bytes/buffer) goes out verbatim; host is resolved. Not a socket API — nothing to hold or close (v0.71.0)", contract!((host: string, port: number, payload: any_of(string, bytes, buffer)) -> number; effects[blocking]; failure[raises])),
-    ("udp_recv", CapabilityClass::Network,        "system",  "Receive ONE UDP datagram: udp_recv(port[, {timeout, host, max}]) -> {bytes, text, from_host, from_port}, or nil on timeout (an ordinary answer, not a fault). timeout seconds default 30, 0 = wait forever; host = bind address default 0.0.0.0; max caps the read (default 65535 = never truncates; a longer datagram truncates to max, recvfrom(2)'s own contract). text is the payload as UTF-8 or nil — bytes always carries the truth (v0.71.0)", contract!((port: number, opts?: map) -> any; effects[blocking]; failure[raises])),
-    ("ws_connect", CapabilityClass::Network,      "system",  "Open a websocket (ws:// or wss://): ws_connect(url[, {insecure, headers, timeout}]) -> numeric handle. insecure:true skips TLS cert verification (self-signed device endpoints — the LG SSAP case); headers adds handshake request headers; timeout seconds bounds connect AND handshake (default 30, must be positive). Requires ws feature (v0.74.0)", contract!((url: string, opts?: map) -> number; effects[blocking]; failure[raises])),
+    ("udp_recv", CapabilityClass::Network,        "system",  "Receive ONE UDP datagram: udp_recv(port[, {timeout, host, max}]) -> {bytes, text, from_host, from_port}, or nil on timeout (an ordinary answer, not a fault). timeout seconds default 30, 0 = wait forever; host = bind address default 0.0.0.0; max caps the read (default 65535 = never truncates; a longer datagram truncates to max, recvfrom(2)'s own contract). text is the payload as UTF-8 or nil — bytes always carries the truth (v0.71.0)", contract!((port: number, opts?: any_of(map, nil)) -> any; effects[blocking]; failure[raises])),
+    ("ws_connect", CapabilityClass::Network,      "system",  "Open a websocket (ws:// or wss://): ws_connect(url[, {insecure, headers, timeout}]) -> numeric handle. insecure:true skips TLS cert verification (self-signed device endpoints — the LG SSAP case); headers adds handshake request headers; timeout seconds bounds connect AND handshake (default 30, must be positive). Requires ws feature (v0.74.0)", contract!((url: string, opts?: any_of(map, nil)) -> number; effects[blocking]; failure[raises])),
     ("ws_send", CapabilityClass::Network,         "system",  "Send one websocket frame: text for a string payload, binary for bytes/buffer; flushed before returning. A closed connection raises and retires the handle (v0.74.0)", contract!((handle: number, payload: any_of(string, bytes, buffer)) -> nil; effects[blocking]; failure[raises])),
-    ("ws_recv", CapabilityClass::Network,         "system",  "Wait for the next DATA frame: ws_recv(handle[, timeout]) -> string (text frame) | bytes (binary frame) | nil on timeout (poll again). timeout seconds default 30, 0 = wait forever. Ping/pong handled internally. A peer close RAISES (catchable) and retires the handle — closed is not confusable with quiet. In a Class C async body, numeric ws_recv(handle[, timeout]) yields on native readiness; subscribed numeric handles refuse SOCKET_SUBSCRIBED. Source-id recv yields outside serve mode; serve mode refuses SOCKET_RECV_SERVE so the event pump cannot steal frames. nil on timeout keeps the connection usable; a terminal raises SOCKET_CLOSED (v0.74.0)", contract!((handle: any_of(number, string), timeout?: number) -> any; effects[blocking]; failure[raises])),
+    ("ws_recv", CapabilityClass::Network,         "system",  "Wait for the next DATA frame: ws_recv(handle[, timeout]) -> string (text frame) | bytes (binary frame) | nil on timeout (poll again). timeout seconds default 30, 0 = wait forever. Ping/pong handled internally. A peer close RAISES (catchable) and retires the handle — closed is not confusable with quiet. In a Class C async body, numeric ws_recv(handle[, timeout]) yields on native readiness; subscribed numeric handles refuse SOCKET_SUBSCRIBED. Source-id recv yields outside serve mode; serve mode refuses SOCKET_RECV_SERVE so the event pump cannot steal frames. nil on timeout keeps the connection usable; a terminal raises SOCKET_CLOSED (v0.74.0)", contract!((handle: any_of(number, string), timeout?: any_of(number, nil)) -> any; effects[blocking]; failure[raises])),
     ("ws_close", CapabilityClass::Network,        "system",  "Close a websocket handle: true when it was live, false when unknown/already retired (never raises for the not-held case, like funlock) (v0.74.0)", contract!((handle: number) -> bool; failure[raises])),
-    ("http_serve", CapabilityClass::Network,      "system",  "BLOCKING static file server — the python -m http.server slot: http_serve(root[, {port, host, duration, index, listing, render_md, requests}]) -> requests served. GET/HEAD only (405 otherwise), NO TLS ever and NO dynamic handlers (both are webd's job). port 0 (default) binds ephemeral and PRINTS the URL; host defaults 127.0.0.1 (pass \"0.0.0.0\" to expose); duration 0 = until SIGINT; listing opts into directory indexes; render_md serves .md as HTML (markdown feature); spa (true=index, or a shell filename) answers an extensionless would-be-404 with that shell so a client-side router boots — for a single-shell SPA; clean_urls serves /foo.html for /foo (GitHub Pages parity — for a pre-rendered page-per-route site), tried before spa. Traversal-proof: every canonicalised path must stay under the canonicalised root (v0.75.0)", contract!((root: string, opts?: map) -> number; effects[blocking]; failure[raises])),
-    ("http_recv", CapabilityClass::Network,       "system",  "Accept ONE HTTP request, answer it, return it: http_recv(port[, {timeout, host, max, respond}]) -> {method, path, query, headers, body, bytes, from_host, from_port}, or nil on timeout. The OAuth-localhost-redirect / webhook-catch shape. respond: {status, body, content_type, headers} (default 200 \"ok\"); max caps the request body (default 1 MiB); host defaults 127.0.0.1 (v0.75.0)", contract!((port: number, opts?: map) -> any; effects[blocking]; failure[raises])),
-    ("tcp_connect", CapabilityClass::Network,     "system",  "Open a raw TCP connection: tcp_connect(host, port[, {timeout, tls, insecure}]) -> numeric handle. tls:true wraps in TLS (ring-pinned, webpki roots); insecure:true skips cert verification. The stream-socket primitive for a line/binary protocol (SMTP/redis/memcached probe, banner grab) UDP/WS/HTTP don't cover (v0.78.0)", contract!((host: string, port: number, opts?: map) -> number; effects[blocking]; failure[raises])),
+    ("http_serve", CapabilityClass::Network,      "system",  "BLOCKING static file server — the python -m http.server slot: http_serve(root[, {port, host, duration, index, listing, render_md, requests}]) -> requests served. GET/HEAD only (405 otherwise), NO TLS ever and NO dynamic handlers (both are webd's job). port 0 (default) binds ephemeral and PRINTS the URL; host defaults 127.0.0.1 (pass \"0.0.0.0\" to expose); duration 0 = until SIGINT; listing opts into directory indexes; render_md serves .md as HTML (markdown feature); spa (true=index, or a shell filename) answers an extensionless would-be-404 with that shell so a client-side router boots — for a single-shell SPA; clean_urls serves /foo.html for /foo (GitHub Pages parity — for a pre-rendered page-per-route site), tried before spa. Traversal-proof: every canonicalised path must stay under the canonicalised root (v0.75.0)", contract!((root: string, opts?: any_of(map("http_serve_options", {port: number, host: string, duration: number, index: string, listing: bool, render_md: bool, requests: number, spa: any_of(bool, string), clean_urls: bool}), nil)) -> number; effects[blocking]; failure[raises])),
+    ("http_recv", CapabilityClass::Network,       "system",  "Accept ONE HTTP request, answer it, return it: http_recv(port[, {timeout, host, max, respond}]) -> {method, path, query, headers, body, bytes, from_host, from_port}, or nil on timeout. The OAuth-localhost-redirect / webhook-catch shape. respond: {status, body, content_type, headers} (default 200 \"ok\"); max caps the request body (default 1 MiB); host defaults 127.0.0.1 (v0.75.0)", contract!((port: number, opts?: any_of(map, nil)) -> any; effects[blocking]; failure[raises])),
+    ("tcp_connect", CapabilityClass::Network,     "system",  "Open a raw TCP connection: tcp_connect(host, port[, {timeout, tls, insecure}]) -> numeric handle. tls:true wraps in TLS (ring-pinned, webpki roots); insecure:true skips cert verification. The stream-socket primitive for a line/binary protocol (SMTP/redis/memcached probe, banner grab) UDP/WS/HTTP don't cover (v0.78.0)", contract!((host: string, port: number, opts?: any_of(map, nil)) -> number; effects[blocking]; failure[raises])),
     ("tcp_send", CapabilityClass::Network,        "system",  "Send bytes on a TCP handle: tcp_send(h, payload) -> bytes sent (string/bytes/buffer, verbatim; flushed) (v0.78.0)", contract!((handle: number, payload: any_of(string, bytes, buffer)) -> number; effects[blocking]; failure[raises])),
-    ("tcp_recv", CapabilityClass::Network,        "system",  "Read available bytes: tcp_recv(h[, {timeout, max}]) -> bytes (buffered bytes first, then one read of at most 256 KiB — poll again for more even when max is larger) | nil on timeout (poll again). Bytes not string — a stream has no frame boundary. A peer close RAISES and retires the handle. timeout default 30 (0=forever), max default 64 KiB. Numeric Class C recv yields on native readiness. Source-id recv yields outside serve; serve mode refuses SOCKET_RECV_SERVE and consumes frames through handlers. nil on timeout keeps the connection usable; terminal raises SOCKET_CLOSED (v0.78.0)", contract!((handle: any_of(number, string), opts?: map) -> any; effects[blocking]; failure[raises])),
-    ("tcp_recv_line", CapabilityClass::Network,   "system",  "Read the next LINE: tcp_recv_line(h[, {timeout, max}]) -> string (LF + one trailing CR stripped) | nil on timeout. Buffers across reads; if `max` bytes accumulate with no newline the handle RAISES and RETIRES (a peer that never terminates a line — broken framing). For line protocols (SMTP/redis) so a caller need not hand-roll a \\r\\n scanner. Numeric Class C recv yields on native readiness. A line-mode source-id recv yields outside serve; serve mode refuses SOCKET_RECV_SERVE and uses event handlers. nil on timeout keeps the connection usable; terminal raises SOCKET_CLOSED (v0.78.0)", contract!((handle: any_of(number, string), opts?: map) -> any; effects[blocking]; failure[raises])),
+    ("tcp_recv", CapabilityClass::Network,        "system",  "Read available bytes: tcp_recv(h[, {timeout, max}]) -> bytes (buffered bytes first, then one read of at most 256 KiB — poll again for more even when max is larger) | nil on timeout (poll again). Bytes not string — a stream has no frame boundary. A peer close RAISES and retires the handle. timeout default 30 (0=forever), max default 64 KiB. Numeric Class C recv yields on native readiness. Source-id recv yields outside serve; serve mode refuses SOCKET_RECV_SERVE and consumes frames through handlers. nil on timeout keeps the connection usable; terminal raises SOCKET_CLOSED (v0.78.0)", contract!((handle: any_of(number, string), opts?: any_of(map, nil)) -> any; effects[blocking]; failure[raises])),
+    ("tcp_recv_line", CapabilityClass::Network,   "system",  "Read the next LINE: tcp_recv_line(h[, {timeout, max}]) -> string (LF + one trailing CR stripped) | nil on timeout. Buffers across reads; if `max` bytes accumulate with no newline the handle RAISES and RETIRES (a peer that never terminates a line — broken framing). For line protocols (SMTP/redis) so a caller need not hand-roll a \\r\\n scanner. Numeric Class C recv yields on native readiness. A line-mode source-id recv yields outside serve; serve mode refuses SOCKET_RECV_SERVE and uses event handlers. nil on timeout keeps the connection usable; terminal raises SOCKET_CLOSED (v0.78.0)", contract!((handle: any_of(number, string), opts?: any_of(map, nil)) -> any; effects[blocking]; failure[raises])),
     ("ws_on",   CapabilityClass::Network,         "system",  "Subscribe a ws_connect handle to the event stream: ws_on(handle, command) -> source id (string). The connection MOVES to an evaluator-generation reader thread: ordered frames arrive as `command` events {watch, frame:{kind:\"text\"|\"binary\", data}} (binary data hex-encoded), a peer close as ONE terminal {watch, closed:{reason}} — then the source retires. ws_send on the moved handle routes to the owner and awaits its receipt; numeric ws_recv refuses. Serve handlers receive frames as events. The reader parks in poll(2) when idle (no timer). Overflow hard-closes the socket with exactly one terminal event, never a silent drop. ws_unwatch cancels, joins and emits NO terminal marker (v0.107.0)", contract!((handle: number, command: string) -> string; failure[raises])),
     ("ws_unwatch", CapabilityClass::Network,      "system",  "Cancel a ws_on subscription: ws_unwatch(source) -> nil. Cancels and joins the reader, drops queued frames and wakes a parked ws_recv with SOCKET_WATCH_HANDLE. Emits NO terminal event (explicit close — documented). Unknown or retired sources raise (v0.107.0)", contract!((handle: string) -> nil; failure[raises])),
     ("tcp_on",   CapabilityClass::Network,        "system",  "Subscribe a tcp_connect handle to the event stream: tcp_on(handle, command[, {frame:\"line\"|\"bytes\", max}]) -> source id (string). frame defaults to \"bytes\": ordered raw chunks of at most 64 KiB; frame:\"line\" splits on LF (one trailing CR stripped) with max capping the line length (default 65536) — a line over max hard-closes with one terminal event. Same ownership, ordering, overflow and retirement rules as ws_on; tcp_recv consumes a bytes source, tcp_recv_line a line source, and a mismatched verb refuses (SOCKET_KIND) (v0.107.0)", contract!((handle: number, command: string, opts?: map) -> string; failure[raises])),
@@ -431,8 +433,8 @@ builtin_table! {
     ("jq", CapabilityClass::Pure,              "json",    "Run a jq filter; filter MUST yield 0 (→nil) or 1 (→value) output, >1 raises. jq(value, filter)", contract!((v: any, filter: string) -> any)),
     ("jq_all", CapabilityClass::Pure,          "json",    "Run a jq filter, collect ALL outputs as a list (the stream case). jq_all(value, filter)", contract!((v: any, filter: string) -> list)),
     ("read_json", CapabilityClass::FsRead,       "json",    "Read a single-record JSON file directly into a Mix value (v0.2.3)", contract!((path: string) -> any; failure[raises])),
-    ("read_jsonl", CapabilityClass::FsRead,      "json",    "Read a JSON-lines file — list of records, strict by default, {skip_errors: true} for lenient (v0.2.3)", contract!((path: string, opts?: map) -> list; failure[raises])),
-    ("yaml_parse", CapabilityClass::Pure,      "json",    "Parse a YAML string into a Mix value (requires yaml feature; v0.71.0). Single document by default (0 docs → nil, >1 raises); pass {docs:true} for a list of every document. Anchors/aliases resolved; scalar mapping keys become string keys; a non-scalar key raises", contract!((s: string, opts?: map) -> any; failure[raises])),
+    ("read_jsonl", CapabilityClass::FsRead,      "json",    "Read a JSON-lines file — list of records, strict by default, {skip_errors: true} for lenient (v0.2.3)", contract!((path: string, opts?: any_of(map("read_jsonl_options", {skip_errors: bool}), nil)) -> list; failure[raises])),
+    ("yaml_parse", CapabilityClass::Pure,      "json",    "Parse a YAML string into a Mix value (requires yaml feature; v0.71.0). Single document by default (0 docs → nil, >1 raises); pass {docs:true} for a list of every document. Anchors/aliases resolved; scalar mapping keys become string keys; a non-scalar key raises", contract!((s: string, opts?: any_of(map, nil)) -> any; failure[raises])),
     ("yaml_encode", CapabilityClass::Pure,     "json",    "Encode a Mix value as YAML (requires yaml feature; v0.71.0). No leading --- marker, trailing newline guaranteed; whole numbers emit as integers; nil/bool/number/string/list/map only — bytes, buffer or function values raise", contract!((v: any) -> string; failure[raises])),
     ("toml_parse", CapabilityClass::Pure,      "json",    "Parse TOML string into Mix map", contract!((s: string) -> map)),
     ("toml_encode", CapabilityClass::Pure,     "json",    "Encode Mix value as TOML. Raises TOML_UNREPRESENTABLE with {path,type} details for nil, function, bytes, or buffer values instead of silently replacing them with empty strings (strict since v0.55.0)", contract!((v: any) -> string; failure[raises])),
@@ -440,8 +442,8 @@ builtin_table! {
     ("data_parse", CapabilityClass::Pure,      "json",    "Parse a strict-data `.conf.mix` string into a Mix value (inverse of data_encode) (v0.3.2)", contract!((s: string) -> any; failure[raises])),
     ("data_encode", CapabilityClass::Pure,     "json",    "Encode a Mix value as a strict-data `.conf.mix` string with correct \\$ / \\~ / \\\\ escaping; round-trips through data_parse. data_encode(value, [pretty]) — truthy 2nd arg emits multi-line indented output (v0.3.2)", contract!((v: any, pretty?: any) -> string)),
 
-    ("ds_patch_elements", CapabilityClass::Pure, "datastar", "Frame an HTML fragment as a Datastar patch-elements SSE event: ds_patch_elements(html, [{selector, mode, view_transition}]) → event string. mode=outer(default)/inner/remove/replace/prepend/append/before/after. Caller MUST html_escape() untrusted content first — this only frames (requires datastar feature) (v0.18.1)", contract!((html: string, opts?: map) -> string)),
-    ("ds_patch_signals", CapabilityClass::Pure, "datastar", "Frame a signal update as a Datastar patch-signals SSE event: ds_patch_signals(signals_map_or_json, [{only_if_missing}]) → event string. A map is JSON-encoded; a string is used verbatim (requires datastar feature) (v0.18.1)", contract!((signals: any_of(map, string, list), opts?: map) -> string)),
+    ("ds_patch_elements", CapabilityClass::Pure, "datastar", "Frame an HTML fragment as a Datastar patch-elements SSE event: ds_patch_elements(html, [{selector, mode, view_transition}]) → event string. mode=outer(default)/inner/remove/replace/prepend/append/before/after. Caller MUST html_escape() untrusted content first — this only frames (requires datastar feature) (v0.18.1)", contract!((html: string, opts?: any_of(map("ds_patch_elements_options", {selector: string, mode: string, view_transition: bool}), nil)) -> string)),
+    ("ds_patch_signals", CapabilityClass::Pure, "datastar", "Frame a signal update as a Datastar patch-signals SSE event: ds_patch_signals(signals_map_or_json, [{only_if_missing}]) → event string. A map is JSON-encoded; a string is used verbatim (requires datastar feature) (v0.18.1)", contract!((signals: any_of(map, string, list), opts?: any_of(map("ds_patch_signals_options", {only_if_missing: bool}), nil)) -> string)),
     ("ds_sse", CapabilityClass::Pure,          "datastar", "Assemble a text/event-stream response body from one event string or a list of them: ds_sse(event | [events]) → body. Pair with headers={\"Content-Type\":\"text/event-stream\"} (requires datastar feature) (v0.18.1)", contract!((event: any_of(string, list)) -> string)),
 }
 
@@ -821,6 +823,7 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
         }),
         #[cfg(feature = "crypto")]
         "constant_time_eq" => builtin_constant_time_eq(args),
+        "jwt_rs256_sign" => builtin_jwt_rs256_sign(args),
         #[cfg(not(feature = "crypto"))]
         "constant_time_eq" => Err(MixError::RuntimeError {
             span: None,
@@ -940,6 +943,7 @@ pub const EVAL_SPECIAL_BUILTINS: &[&str] = &[
     "tcp_on",
     "ws_unwatch",
     "tcp_unwatch",
+    "is_reload_candidate",
 ];
 
 /// Membership gate the evaluator consults before dispatching to
@@ -4445,7 +4449,14 @@ pub(crate) fn spawn_argv_native(args: Vec<Value>, mut native: Option<&mut crate:
     }
     #[cfg(target_os = "linux")]
     if die_with_parent {
-        owned_spawns::register(child.id() as libc::pid_t);
+        // Tag the registration with the spawning evaluator's owner id so a
+        // serve hot-reload can retire legacy children per generation: the
+        // committed swap sweeps every owner except its own; a failed
+        // candidate sweeps only its own.
+        owned_spawns::register_owned(
+            child.id() as libc::pid_t,
+            native.as_ref().map(|n| n.owner_id()),
+        );
     }
     Ok(Some(Value::Number(child.id() as f64)))
 }
@@ -4512,7 +4523,13 @@ pub mod owned_spawns {
     /// How long the graceful sweep waits between SIGTERM and SIGKILL.
     pub const SWEEP_GRACE: Duration = Duration::from_secs(2);
 
-    static OWNED: Mutex<Vec<libc::pid_t>> = Mutex::new(Vec::new());
+    /// Registry entries carry the spawning evaluator's owner id (`None` for
+    /// spawns that reached the builtin without an evaluator context). Owner
+    /// tags make a serve hot-reload generation-scoped: the committed swap
+    /// retires every earlier generation's legacy children, and a failed
+    /// candidate retires only the ones IT spawned — neither sweep can touch
+    /// the other side of the swap.
+    static OWNED: Mutex<Vec<(libc::pid_t, Option<u64>)>> = Mutex::new(Vec::new());
 
     /// The one thread allowed to create owned children. PDEATHSIG is keyed to
     /// the creating THREAD and the registry is process-wide, so the facility
@@ -4549,10 +4566,17 @@ pub mod owned_spawns {
     /// dropped, so a long-lived citizen's registry stays bounded by the groups
     /// that are actually alive. A dead leader whose group still has members is
     /// KEPT unreaped — its zombie pins the pgid for the sweep.
+    #[cfg(test)]
     pub(crate) fn register(pid: libc::pid_t) {
+        register_owned(pid, None);
+    }
+
+    /// Register an owned child and record which evaluator generation spawned
+    /// it (see the registry doc on [`OWNED`]).
+    pub(crate) fn register_owned(pid: libc::pid_t, owner: Option<u64>) {
         let mut owned = OWNED.lock().unwrap_or_else(|e| e.into_inner());
-        owned.retain(|pid| retain_entry(*pid));
-        owned.push(pid);
+        owned.retain(|(pid, _)| retain_entry(*pid));
+        owned.push((pid, owner));
     }
 
     /// Keep an entry? Reaps (and drops) a finished one. Call with the lock
@@ -4579,7 +4603,7 @@ pub mod owned_spawns {
     /// check and get its group signalled. `None` when `pid` is not owned.
     pub(crate) fn observe(pid: libc::pid_t) -> Option<bool> {
         let mut owned = OWNED.lock().unwrap_or_else(|e| e.into_inner());
-        let index = owned.iter().position(|p| *p == pid)?;
+        let index = owned.iter().position(|(p, _)| *p == pid)?;
         let alive = leader_state(pid) == Some(false);
         if !retain_entry(pid) {
             owned.swap_remove(index);
@@ -4614,10 +4638,55 @@ pub mod owned_spawns {
     /// signals nothing. A group whose leader was already reaped elsewhere is
     /// skipped — its pgid can no longer be proven ours.
     pub fn sweep() -> usize {
-        // The lock is held for the whole sweep: no other path may reap an
-        // owned pid between the identity check below and the last signal.
-        let mut owned = OWNED.lock().unwrap_or_else(|e| e.into_inner());
-        let pids = std::mem::take(&mut *owned);
+        let pids = {
+            let mut owned = OWNED.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *owned)
+                .into_iter()
+                .map(|(pid, _)| pid)
+                .collect()
+        };
+        sweep_live(pids)
+    }
+
+    /// Generation-scoped retire: end exactly the children `owner` spawned,
+    /// leaving every other registration (and its children) running. The
+    /// failed-candidate half of the hot-reload contract — a candidate whose
+    /// init raised still had its `die_with_parent` starts swept, while the
+    /// old generation's children are untouched.
+    pub fn sweep_owned_by(owner: u64) -> usize {
+        let mine = {
+            let mut owned = OWNED.lock().unwrap_or_else(|e| e.into_inner());
+            let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut *owned)
+                .into_iter()
+                .partition(|(_, o)| *o == Some(owner));
+            *owned = rest;
+            mine
+        };
+        sweep_live(mine.into_iter().map(|(pid, _)| pid).collect())
+    }
+
+    /// Generation-scoped retire: end every owned child EXCEPT `owner`'s. The
+    /// committed-swap half of the hot-reload contract — the earlier
+    /// generation's legacy children retire after the swap commits, while the
+    /// replacement evaluator's own init-time starts survive to serve.
+    pub fn sweep_owned_except(owner: u64) -> usize {
+        let doomed = {
+            let mut owned = OWNED.lock().unwrap_or_else(|e| e.into_inner());
+            let (mine, doomed): (Vec<_>, Vec<_>) = std::mem::take(&mut *owned)
+                .into_iter()
+                .partition(|(_, o)| *o == Some(owner));
+            *owned = mine;
+            doomed
+        };
+        sweep_live(doomed.into_iter().map(|(pid, _)| pid).collect())
+    }
+
+    /// The shared kill sequence: SIGTERM+SIGCONT the groups, wait up to
+    /// [`SWEEP_GRACE`] for every GROUP to empty (not just its leader), then
+    /// SIGKILL and reap the leaders. The registry lock is NOT held here —
+    /// the caller already removed these entries, so no other path can reap
+    /// one of these pids between the identity check and the last signal.
+    fn sweep_live(pids: Vec<libc::pid_t>) -> usize {
         let live: Vec<libc::pid_t> = pids
             .into_iter()
             .filter(|pid| leader_state(*pid).is_some())
@@ -6045,6 +6114,29 @@ fn opt_invalid(caller: &str, msg: impl std::fmt::Display) -> MixError {
     MixError::structured("OPTION_INVALID", format!("{caller}: {msg}"))
 }
 
+/// Read an optional boolean option field. A present field must be an actual
+/// `Value::Bool`: truthy coercion is gone, so `"false"`, `1`, `nil`, `[]`
+/// and `{}` all refuse with TYPE_MISMATCH (naming builtin and option) instead
+/// of silently flipping the flag. `None` means the field was absent and the
+/// caller keeps its default; a `Some(bool)` is only ever an explicit
+/// true/false. Call this on the *field* value — `m.get(option)` — not the
+/// whole options argument, because the nil-ARGUMENT exemption (an omitted
+/// options map) is handled by each caller, while a nil FIELD is a wrong
+/// value and must refuse.
+fn bool_option(caller: &str, option: &str, v: Option<&Value>) -> MixResult<Option<bool>> {
+    match v {
+        None => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(other) => Err(MixError::structured(
+            "TYPE_MISMATCH",
+            format!(
+                "{caller}: option '{option}' must be a bool (true or false), got {}",
+                other.type_name()
+            ),
+        )),
+    }
+}
+
 fn parse_stdio_path(caller: &str, stream: &str, value: &Value) -> MixResult<String> {
     match value {
         Value::String(path) if path.contains('\0') => Err(opt_invalid(
@@ -6713,6 +6805,7 @@ fn proc_spec_from<'a>(argv: &'a [String], opts: &'a RunArgvOpts, caller: &'a str
         cwd: opts.cwd.as_deref(),
         env: &opts.env,
         clear_env: opts.clear_env,
+        env_unset: &opts.env_unset,
         max_output: opts.max_output,
         stream: opts.stream,
     }
@@ -8349,6 +8442,8 @@ struct ProcSpec<'a> {
     /// (or on an empty one when `clear_env`).
     env: &'a [(String, String)],
     clear_env: bool,
+    /// Removed after explicit sets; clear_env is applied before both.
+    env_unset: &'a [String],
     /// Per-stream output cap in bytes; `None` = unbounded. Excess is
     /// drained and DISCARDED (the child is not killed, the pipe never
     /// backs up) with the outcome's truncation flag set.
@@ -9402,6 +9497,9 @@ fn run_pipeline_processes(
             for (key, value) in &stage.opts.env {
                 command.env(key, value);
             }
+            for key in &stage.opts.env_unset {
+                command.env_remove(key);
+            }
             if let Some(cwd) = &stage.opts.cwd {
                 command.current_dir(cwd);
             }
@@ -10189,6 +10287,7 @@ fn run_process(spec: &ProcSpec<'_>) -> MixResult<ProcOutcome> {
         cwd,
         env,
         clear_env,
+        env_unset,
         max_output,
         stream,
     } = spec;
@@ -10315,6 +10414,9 @@ fn run_process(spec: &ProcSpec<'_>) -> MixResult<ProcOutcome> {
     }
     for (k, v) in env.iter() {
         cmd.env(k, v);
+    }
+    for k in env_unset.iter() {
+        cmd.env_remove(k);
     }
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
@@ -10750,6 +10852,7 @@ fn run_ssh_process(
         cwd: None,
         env: &[],
         clear_env: false,
+        env_unset: &[],
         max_output,
         stream: false,
     })?;
@@ -12952,6 +13055,36 @@ fn builtin_read_lines(args: Vec<Value>) -> MixResult<Option<Value>> {
     Ok(Some(Value::list(lines)))
 }
 
+/// Run `f` over the byte payload a file-write builtin puts on disk. Only
+/// `string`, `bytes` and `buffer` are accepted; `bytes`/`buffer` write
+/// verbatim, `string` writes its UTF-8 bytes. Anything else — nil, map,
+/// list, function, number, bool — raises TYPE_MISMATCH BEFORE any
+/// filesystem open/create/truncate/append, so an invalid argument can
+/// never create, truncate or extend a file.
+///
+/// The closure receives a BORROWED slice: for a mutable Buffer the
+/// `RefCell` borrow guard is held across the whole I/O, so a large buffer
+/// is never deep-copied into a second allocation on its way to disk
+/// (A3b — the earlier `Cow::Owned` form cloned). The hint names the
+/// encode builtins so a caller reaches for json_encode / data_encode /
+/// to_string instead of the old silent stringification (write_file used
+/// to stringify anything, which turned a wrong value into a silently
+/// wrong file).
+fn with_write_payload<R>(caller: &str, v: &Value, f: impl FnOnce(&[u8]) -> R) -> MixResult<R> {
+    match v {
+        Value::String(s) => Ok(f(s.as_bytes())),
+        Value::Bytes(b) => Ok(f(b.as_slice())),
+        Value::Buffer(b) => Ok(f(b.borrow().as_slice())),
+        other => Err(MixError::structured(
+            "TYPE_MISMATCH",
+            format!(
+                "{caller}: data must be a string, bytes or buffer, got {} — encode it first (json_encode, data_encode or to_string)",
+                other.type_name()
+            ),
+        )),
+    }
+}
+
 /// `write_file($path, $content)` — write to `path`, creating or
 /// overwriting. Symlinks are followed (deliberate, standard shell
 /// semantics — like `> path` redirection); use `write_new` when the
@@ -12959,21 +13092,12 @@ fn builtin_read_lines(args: Vec<Value>) -> MixResult<Option<Value>> {
 fn builtin_write_file(args: Vec<Value>) -> MixResult<Option<Value>> {
     expect_args("write_file", &args, 2)?;
     let path = args[0].to_mix_string();
-    // `Value::Bytes` is written verbatim — the whole point of the
-    // bytes type is that it carries high-bit bytes without going
-    // through a UTF-8 round-trip. Every other Value renders through
-    // `to_mix_string` (matching the prior behaviour for String,
-    // Number, Bool, List, Map, Nil, Function).
-    let write_result = match &args[1] {
-        Value::Bytes(buf) => std::fs::write(&path, buf.as_slice()),
-        // A mutable buffer writes its current bytes verbatim, like Bytes.
-        Value::Buffer(b) => std::fs::write(&path, b.borrow().as_slice()),
-        other => std::fs::write(&path, other.to_mix_string()),
-    };
-    write_result.map_err(|e| MixError::RuntimeError {
-        span: None,
-        msg: format!("write_file '{}': {}", path, e),
-    })?;
+    with_write_payload("write_file", &args[1], |payload| {
+        std::fs::write(&path, payload).map_err(|e| MixError::RuntimeError {
+            span: None,
+            msg: format!("write_file '{}': {}", path, e),
+        })
+    })??;
     Ok(Some(Value::Nil))
 }
 
@@ -12981,25 +13105,20 @@ fn builtin_append_file(args: Vec<Value>) -> MixResult<Option<Value>> {
     expect_args("append_file", &args, 2)?;
     let path = args[0].to_mix_string();
     use std::io::Write;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|e| MixError::RuntimeError {
+    with_write_payload("append_file", &args[1], |payload| {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| MixError::RuntimeError {
+                span: None,
+                msg: format!("append_file '{}': {}", path, e),
+            })?;
+        file.write_all(payload).map_err(|e| MixError::RuntimeError {
             span: None,
             msg: format!("append_file '{}': {}", path, e),
-        })?;
-    // Symmetric with `write_file`: `Value::Bytes` appends raw, every
-    // other Value goes through `to_mix_string`.
-    let write_result = match &args[1] {
-        Value::Bytes(buf) => file.write_all(buf),
-        Value::Buffer(b) => file.write_all(b.borrow().as_slice()),
-        other => file.write_all(other.to_mix_string().as_bytes()),
-    };
-    write_result.map_err(|e| MixError::RuntimeError {
-        span: None,
-        msg: format!("append_file '{}': {}", path, e),
-    })?;
+        })
+    })??;
     Ok(Some(Value::Nil))
 }
 
@@ -13017,8 +13136,9 @@ fn builtin_exists(args: Vec<Value>) -> MixResult<Option<Value>> {
         match opts {
             Value::Nil => {}
             Value::Map(m) => {
-                if let Some(v) = m.get("follow_symlinks") {
-                    follow_symlinks = v.is_truthy();
+                if let Some(b) = bool_option("exists()", "follow_symlinks", m.get("follow_symlinks"))?
+                {
+                    follow_symlinks = b;
                 }
             }
             other => {
@@ -14248,8 +14368,9 @@ fn builtin_stat(args: Vec<Value>) -> MixResult<Option<Value>> {
         match opts {
             Value::Nil => {}
             Value::Map(m) => {
-                if let Some(v) = m.get("follow_symlinks") {
-                    follow_symlinks = v.is_truthy();
+                if let Some(b) = bool_option("stat()", "follow_symlinks", m.get("follow_symlinks"))?
+                {
+                    follow_symlinks = b;
                 }
             }
             other => {
@@ -14343,29 +14464,26 @@ fn builtin_write_new(args: Vec<Value>) -> MixResult<Option<Value>> {
     use std::os::unix::fs::OpenOptionsExt;
     expect_args("write_new", &args, 3)?;
     let path = args[0].to_mix_string();
+    // Validate the payload BEFORE the O_EXCL open so a wrong-typed
+    // argument can never create (or claim) the file. write_new is used
+    // for DKIM secrets / single-shot key material, so silently writing
+    // a stringified wrong value would be a security-grade bug.
     let mode_u32 = parse_octal_mode("write_new", &path, &args[2])?;
-    let mut f = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(mode_u32)
-        .open(&path)
-        .map_err(|e| MixError::RuntimeError {
+    with_write_payload("write_new", &args[1], |payload| {
+        let mut f = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(mode_u32)
+            .open(&path)
+            .map_err(|e| MixError::RuntimeError {
+                span: None,
+                msg: format!("write_new '{}': {}", path, e),
+            })?;
+        f.write_all(payload).map_err(|e| MixError::RuntimeError {
             span: None,
             msg: format!("write_new '{}': {}", path, e),
-        })?;
-    // Mirror write_file/append_file: a `Value::Bytes` argument writes
-    // raw bytes; anything else stringifies. write_new is used for DKIM
-    // secrets / single-shot key material, so silently writing the
-    // `<bytes:N>` placeholder would be a security-grade silent bug.
-    let write_result = match &args[1] {
-        Value::Bytes(buf) => f.write_all(buf),
-        Value::Buffer(b) => f.write_all(b.borrow().as_slice()),
-        other => f.write_all(other.to_mix_string().as_bytes()),
-    };
-    write_result.map_err(|e| MixError::RuntimeError {
-        span: None,
-        msg: format!("write_new '{}': {}", path, e),
-    })?;
+        })
+    })??;
     Ok(Some(Value::Nil))
 }
 
@@ -14542,9 +14660,10 @@ fn builtin_write_atomic(args: Vec<Value>) -> MixResult<Option<Value>> {
             ));
         }
     };
-    // Strict: a string, bytes or a buffer. write_file's "stringify anything"
-    // would write `<bytes:N>`-style renderings of a wrong value atomically —
-    // a perfectly durable wrong answer.
+    // Strict: a string, bytes or a buffer — the same discipline as
+    // write_file/append_file/write_new, which refuse anything else rather
+    // than writing a `<bytes:N>`-style rendering of a wrong value as a
+    // perfectly durable wrong answer.
     let data: Vec<u8> = match &args[1] {
         Value::String(s) => s.as_bytes().to_vec(),
         Value::Bytes(b) => b.as_slice().to_vec(),
@@ -15177,7 +15296,9 @@ fn builtin_read_jsonl(args: Vec<Value>) -> MixResult<Option<Value>> {
     let path = args[0].to_mix_string();
     let skip_errors = match args.get(1) {
         None | Some(Value::Nil) => false,
-        Some(Value::Map(m)) => m.get("skip_errors").map(|v| v.is_truthy()).unwrap_or(false),
+        Some(Value::Map(m)) => {
+            bool_option("read_jsonl()", "skip_errors", m.get("skip_errors"))?.unwrap_or(false)
+        }
         Some(other) => {
             return Err(MixError::RuntimeError {
                 span: None,
@@ -16144,8 +16265,9 @@ fn builtin_walk(args: Vec<Value>) -> MixResult<Option<Value>> {
         match opts {
             Value::Nil => {}
             Value::Map(m) => {
-                if let Some(v) = m.get("follow_symlinks") {
-                    follow_symlinks = v.is_truthy();
+                if let Some(b) = bool_option("walk()", "follow_symlinks", m.get("follow_symlinks"))?
+                {
+                    follow_symlinks = b;
                 }
                 if let Some(v) = m.get("max_depth") {
                     max_depth = Some(as_count(
@@ -16154,8 +16276,8 @@ fn builtin_walk(args: Vec<Value>) -> MixResult<Option<Value>> {
                         usize::MAX,
                     )?);
                 }
-                if let Some(v) = m.get("include_dirs") {
-                    include_dirs = v.is_truthy();
+                if let Some(b) = bool_option("walk()", "include_dirs", m.get("include_dirs"))? {
+                    include_dirs = b;
                 }
             }
             other => {
@@ -17454,9 +17576,11 @@ fn builtin_ds_patch_elements(args: Vec<Value>) -> MixResult<Option<Value>> {
             {
                 mode = ds_parse_mode(&v.to_mix_string())?;
             }
-            if let Some(v) = m.get("view_transition") {
-                view_transition = Some(v.is_truthy());
-            }
+            view_transition = bool_option(
+                "ds_patch_elements",
+                "view_transition",
+                m.get("view_transition"),
+            )?;
         }
         Some(other) => {
             return Err(MixError::RuntimeError {
@@ -17531,10 +17655,10 @@ fn builtin_ds_patch_signals(args: Vec<Value>) -> MixResult<Option<Value>> {
 
     let only_if_missing = match args.get(1) {
         None | Some(Value::Nil) => false,
-        Some(Value::Map(m)) => m
-            .get("only_if_missing")
-            .map(Value::is_truthy)
-            .unwrap_or(false),
+        Some(Value::Map(m)) => {
+            bool_option("ds_patch_signals", "only_if_missing", m.get("only_if_missing"))?
+                .unwrap_or(false)
+        }
         Some(other) => {
             return Err(MixError::RuntimeError {
                 span: None,
@@ -17617,14 +17741,38 @@ fn builtin_sanitize(args: Vec<Value>) -> MixResult<Option<Value>> {
 fn builtin_csv_parse(args: Vec<Value>) -> MixResult<Option<Value>> {
     expect_args("csv_parse", &args, 1)?;
     let text = args[0].to_mix_string();
-    let delim = args
-        .get(1)
-        .map(|v| v.to_mix_string())
-        .unwrap_or_else(|| ",".into());
-    let delim = delim.chars().next().unwrap_or(',');
+    // The delimiter is exactly ONE ASCII byte. Anything else — empty,
+    // multi-byte/multi-char, a non-string (a number must not stringify
+    // into its first digit), nil, or a byte the splitter cannot tell
+    // apart from data (NUL/CR/LF/quote) — raises TYPE_MISMATCH instead of
+    // silently defaulting or truncating. Omit the argument for a comma.
+    let delim = match args.get(1) {
+        None => b',',
+        Some(Value::String(s)) => {
+            let bytes = s.as_bytes();
+            if bytes.len() != 1 || !bytes[0].is_ascii() || matches!(bytes[0], 0 | b'\r' | b'\n' | b'"') {
+                return Err(MixError::structured(
+                    "TYPE_MISMATCH",
+                    format!(
+                        "csv_parse: delim must be exactly one ASCII byte and not NUL, CR, LF or a double quote, got {s:?}"
+                    ),
+                ));
+            }
+            bytes[0]
+        }
+        Some(other) => {
+            return Err(MixError::structured(
+                "TYPE_MISMATCH",
+                format!(
+                    "csv_parse: delim must be a single-byte string (the CSV delimiter, e.g. \",\" or \";\") — omit it for a comma, got {}",
+                    other.type_name()
+                ),
+            ));
+        }
+    };
     let mut lines = text.lines();
     let headers: Vec<String> = match lines.next() {
-        Some(h) => h.split(delim).map(|s| s.trim().to_string()).collect(),
+        Some(h) => h.split(delim as char).map(|s| s.trim().to_string()).collect(),
         None => return Ok(Some(Value::list(Vec::new()))),
     };
     let mut rows = Vec::new();
@@ -17633,7 +17781,7 @@ fn builtin_csv_parse(args: Vec<Value>) -> MixResult<Option<Value>> {
             continue;
         }
         let mut map = indexmap::IndexMap::new();
-        for (i, field) in line.split(delim).enumerate() {
+        for (i, field) in line.split(delim as char).enumerate() {
             let key = headers.get(i).cloned().unwrap_or_else(|| format!("col{i}"));
             map.insert(key, Value::String(field.trim().to_string()));
         }
@@ -18712,8 +18860,8 @@ fn builtin_bytes_to_string(args: Vec<Value>) -> MixResult<Option<Value>> {
         match opts {
             Value::Nil => {}
             Value::Map(m) => {
-                if let Some(v) = m.get("lossy") {
-                    lossy = v.is_truthy();
+                if let Some(b) = bool_option("bytes_to_string()", "lossy", m.get("lossy"))? {
+                    lossy = b;
                 }
             }
             other => {
@@ -19710,6 +19858,30 @@ fn builtin_hmac_sha256(args: Vec<Value>) -> MixResult<Option<Value>> {
     // caller can `constant_time_eq` them against a decoded signature without
     // a hex round trip in between.
     hash_output("hmac_sha256", outer.finalize().to_vec(), args.get(2))
+}
+
+/// Generic compact JWT signing; the feature-disabled entry stays callable.
+fn builtin_jwt_rs256_sign(args: Vec<Value>) -> MixResult<Option<Value>> {
+    if !(2..=3).contains(&args.len()) {
+        return Err(MixError::structured("ARITY_MISMATCH", "jwt_rs256_sign expects 2 or 3 arguments"));
+    }
+    #[cfg(feature = "crypto")]
+    {
+        let Value::String(claims) = &args[0] else {
+            return Err(MixError::structured("TYPE_MISMATCH", "jwt_rs256_sign: claims_json must be a string; use json_encode first"));
+        };
+        let Value::String(pem) = &args[1] else {
+            return Err(MixError::structured("TYPE_MISMATCH", "jwt_rs256_sign: private_pem must be a string"));
+        };
+        let header = match args.get(2) {
+            None | Some(Value::Nil) => None,
+            Some(Value::String(s)) => Some(s.as_str()),
+            Some(_) => return Err(MixError::structured("TYPE_MISMATCH", "jwt_rs256_sign: header_json must be a string or nil")),
+        };
+        Ok(Some(Value::String(crate::jwt::sign_rs256(claims, pem, header)?)))
+    }
+    #[cfg(not(feature = "crypto"))]
+    Err(MixError::structured("FEATURE_DISABLED", "jwt_rs256_sign requires the crypto feature"))
 }
 
 /// `constant_time_eq(a, b)` — length-checked, full-scan equality with no
@@ -25243,11 +25415,11 @@ fn builtin_http_serve(args: Vec<Value>) -> MixResult<Option<Value>> {
                 if let Some(v) = m.get("index") {
                     index = v.to_mix_string();
                 }
-                if let Some(v) = m.get("listing") {
-                    listing = v.is_truthy();
+                if let Some(b) = bool_option("http_serve()", "listing", m.get("listing"))? {
+                    listing = b;
                 }
-                if let Some(v) = m.get("render_md") {
-                    render_md = v.is_truthy();
+                if let Some(b) = bool_option("http_serve()", "render_md", m.get("render_md"))? {
+                    render_md = b;
                 }
                 if let Some(v) = m.get("requests") {
                     requests_cap = as_exact_integer(
@@ -25299,8 +25471,8 @@ fn builtin_http_serve(args: Vec<Value>) -> MixResult<Option<Value>> {
                         spa = Some(canon.to_string_lossy().into_owned());
                     }
                 }
-                if let Some(v) = m.get("clean_urls") {
-                    clean_urls = v.is_truthy();
+                if let Some(b) = bool_option("http_serve()", "clean_urls", m.get("clean_urls"))? {
+                    clean_urls = b;
                 }
             }
             other => {
@@ -29548,6 +29720,53 @@ mod owned_spawns_tests {
         }
         assert!(swept, "the sweep must end the pinned group's descendant");
         assert_eq!(state(pid), None, "the sweep reaps the leader");
+    }
+
+    /// Generation-scoped retires (the hot-reload contract): a failed
+    /// candidate sweeps exactly its own children, leaving the old
+    /// generation's running; a committed swap sweeps every owner except
+    /// the replacement's.
+    #[test]
+    #[allow(clippy::zombie_processes)]
+    fn generation_scoped_sweeps_spare_the_other_side_of_the_swap() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = owned_spawns::sweep();
+        let spawn = || {
+            std::process::Command::new("sleep")
+                .arg("60")
+                .process_group(0)
+                .spawn()
+                .unwrap()
+                .id() as i32
+        };
+        let old_pid = spawn();
+        let cand_pid = spawn();
+        owned_spawns::register_owned(old_pid, Some(7));
+        owned_spawns::register_owned(cand_pid, Some(8));
+
+        // The failed-candidate retire: exactly the candidate's child dies.
+        assert_eq!(owned_spawns::sweep_owned_by(8), 1);
+        assert!(
+            state(old_pid).is_some(),
+            "the old generation's child survives a failed candidate"
+        );
+        assert!(gone(cand_pid, Duration::from_secs(5)), "the candidate's child is retired");
+        assert_eq!(owned_spawns::sweep_owned_by(8), 0, "the entry was consumed");
+
+        // The committed-swap retire: everything except the replacement's
+        // own init-time starts.
+        let fresh_pid = spawn();
+        owned_spawns::register_owned(fresh_pid, Some(9));
+        assert_eq!(owned_spawns::sweep_owned_except(9), 1);
+        assert!(gone(old_pid, Duration::from_secs(5)), "the old generation retires at commit");
+        assert!(
+            state(fresh_pid).is_some(),
+            "the replacement's own start survives the commit sweep"
+        );
+
+        // The process-end sweep still covers what remains.
+        assert_eq!(owned_spawns::sweep(), 1);
+        assert!(gone(fresh_pid, Duration::from_secs(5)));
     }
 }
 
@@ -33975,6 +34194,8 @@ mod char_aware_tests {
             "sort",
             "split",
             "sprintf",
+            "is_reload_candidate",
+            "jwt_rs256_sign",
             "sql_quote",
             "starts_with",
             "string_to_bytes",
@@ -35481,5 +35702,596 @@ mod run_parallel_tests {
             elapsed < std::time::Duration::from_millis(1200),
             "4x0.4s with max=4 took {elapsed:?} — not parallel",
         );
+    }
+}
+
+/// A3 (write_file/append_file/write_new payload strictness) and A4 (strict
+/// boolean option fields) regression tests. These call the builtins
+/// DIRECTLY, so they prove the builtin enforces the rule even where the
+/// evaluator's contract gate is strict-mode-only (pure builtins) — the
+/// body's refusal is the mode-independent half of the A6 nil policy.
+#[cfg(test)]
+mod strict_write_and_bool_option_tests {
+    use super::*;
+    use crate::value::Value;
+
+    fn tmpdir(suffix: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "cosmix-mix-strictbool-{}-{}",
+            std::process::id(),
+            suffix
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn s(p: &std::path::Path) -> Value {
+        Value::String(p.to_string_lossy().into())
+    }
+
+    fn opts(pairs: &[(&str, Value)]) -> Value {
+        let mut m = indexmap::IndexMap::new();
+        for (k, v) in pairs {
+            m.insert((*k).to_string(), v.clone());
+        }
+        Value::map(m)
+    }
+
+    fn is_type_mismatch(err: &MixError) -> bool {
+        err.info().map(|i| i.code.as_str()) == Some("TYPE_MISMATCH")
+    }
+
+    /// The wrong payload types A3 must refuse (function is exercised through
+    /// the evaluator path in tests/contract_args.rs, where a lambda is easy to
+    /// build; the same `other =>` arm handles it here).
+    fn wrong_payloads() -> Vec<Value> {
+        vec![
+            Value::Nil,
+            Value::Number(7.0),
+            Value::Bool(true),
+            Value::list(vec![Value::Number(1.0)]),
+            Value::map(indexmap::IndexMap::new()),
+        ]
+    }
+
+    /// A3b: the payload helper must hand the I/O closure a slice that
+    /// BORROWS the buffer's storage for the whole write. A clone here
+    /// would (a) move the slice off the buffer's allocation and (b) drop
+    /// the Ref before the closure runs — the two assertions pin the
+    /// zero-copy contract, not just the bytes on disk.
+    #[test]
+    fn write_payload_borrows_the_buffer_for_the_whole_io() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let buf = Value::Buffer(Rc::new(RefCell::new(b"BORROWED".to_vec())));
+        let data_ptr = match &buf {
+            Value::Buffer(b) => b.borrow().as_ptr(),
+            _ => unreachable!(),
+        };
+        let (same_allocation, borrow_still_held, len) =
+            with_write_payload("write_file", &buf, |slice| {
+                let held = match &buf {
+                    Value::Buffer(b) => b.try_borrow_mut().is_err(),
+                    _ => unreachable!(),
+                };
+                (std::ptr::eq(slice.as_ptr(), data_ptr), held, slice.len())
+            })
+            .unwrap();
+        assert!(
+            same_allocation,
+            "the closure saw a copy, not the buffer's storage"
+        );
+        assert!(
+            borrow_still_held,
+            "the buffer's Ref was released before the I/O closure ran"
+        );
+        assert_eq!(len, b"BORROWED".len());
+    }
+
+    /// A6: csv_parse's delimiter is exactly one ASCII byte. Rejected
+    /// values raise TYPE_MISMATCH and must not silently default to a
+    /// comma or truncate to a first character. csv_parse is pure, so the
+    /// refusal is the whole observable effect.
+    #[test]
+    fn csv_parse_delimiter_is_exactly_one_valid_ascii_byte() {
+        let text = || Value::String("a,b\n1,2".into());
+        for bad in ["ab", "é", "", "\0", "\r", "\n", "\""] {
+            let err = builtin_csv_parse(vec![text(), Value::String(bad.into())]).unwrap_err();
+            assert!(is_type_mismatch(&err), "delimiter {bad:?}: {err}");
+        }
+        for bad in [Value::Number(1.0), Value::Bool(true), Value::Nil] {
+            let err = builtin_csv_parse(vec![text(), bad]).unwrap_err();
+            assert!(is_type_mismatch(&err), "{err}");
+        }
+        // Omitted stays comma; an explicit comma (and other single bytes)
+        // still parse.
+        for call in [
+            builtin_csv_parse(vec![text()]),
+            builtin_csv_parse(vec![text(), Value::String(",".into())]),
+            builtin_csv_parse(vec![Value::String("a|b\n1|2".into()), Value::String("|".into())]),
+        ] {
+            let rows = call.unwrap().unwrap();
+            match &rows {
+                Value::List(l) => assert_eq!(l.len(), 1, "{rows:?}"),
+                other => panic!("expected a list of rows, got {}", other.type_name()),
+            }
+        }
+    }
+
+    /// A6: the registry declares nil wherever the runtime treats an
+    /// explicit nil as the omitted-argument sentinel, so `mix builtins
+    /// --json` and lint never misreport a working call. Since the gate's
+    /// blanket nil skip was REMOVED, a declaration here is the ONLY way
+    /// an explicit nil reaches the builtin in strict mode (and in every
+    /// mode for the critical classes) — this pins the DECLARATIONS.
+    /// The hash_file gate hint must name every algorithm `DigestAlgo`
+    /// accepts — it is static text and cannot derive from
+    /// `accepted_list()`.
+    #[test]
+    fn declared_nil_sentinels_match_runtime_omission_semantics() {
+        use crate::builtin_info::TypeShape;
+        let cases: &[(&str, &str)] = &[
+            // The original six, kept for history:
+            ("normalize", "form"),
+            ("hash_file", "algo"),
+            ("buffer", "init"),
+            ("exists", "opts"),
+            ("run_argv", "opts"),
+            ("write_atomic", "opts"),
+            ("publish", "body"),
+            ("slice", "end"),
+            // File/IO family:
+            ("stat", "opts"),
+            ("walk", "opts"),
+            ("read_jsonl", "opts"),
+            ("mkdir", "opts"),
+            ("flock", "opts"),
+            ("fcntl_lock", "opts"),
+            ("read_stdin_bytes", "max"),
+            ("bytes_to_string", "opts"),
+            ("bytes_find", "from"),
+            // Process family:
+            ("run", "opts"),
+            ("run_rc", "opts"),
+            ("run_stream", "opts"),
+            ("run_argv_must", "opts"),
+            ("run_parallel", "opts"),
+            ("run_pipeline", "opts"),
+            ("run_pipeline_must", "opts"),
+            ("send_mail", "opts"),
+            ("ssh_exec", "opts"),
+            // Network family:
+            ("http_get", "headers"),
+            ("http_get", "opts"),
+            ("http_post", "headers"),
+            ("http_post", "opts"),
+            ("http_request", "headers"),
+            ("http_request", "opts"),
+            ("http_post_multipart", "headers"),
+            ("http_post_multipart", "opts"),
+            ("http_serve", "opts"),
+            ("http_recv", "opts"),
+            ("udp_recv", "opts"),
+            ("ws_connect", "opts"),
+            ("ws_recv", "timeout"),
+            ("tcp_connect", "opts"),
+            ("tcp_recv", "opts"),
+            ("tcp_recv_line", "opts"),
+            // Data/encoding family:
+            ("hash_blake3", "opts"),
+            ("hash_sha256", "opts"),
+            ("hash_md5", "opts"),
+            ("hash_sha1", "opts"),
+            ("hmac_sha256", "opts"),
+            ("hash_file", "opts"),
+            ("password_hash", "opts"),
+            ("xml_parse", "opts"),
+            ("yaml_parse", "opts"),
+            ("rfc2047_encode", "opts"),
+            ("ds_patch_elements", "opts"),
+            ("ds_patch_signals", "opts"),
+            ("replace_must", "opts"),
+            ("re_replace_must", "opts"),
+            // Validation/utility family:
+            ("nonblank", "label"),
+            ("raise", "details"),
+            // Host-injected seams:
+            ("publish", "opts"),
+            ("bus_call", "args"),
+            ("jmap", "args"),
+            ("jmap_upload", "content_type"),
+            ("db_query", "params"),
+            ("db_exec", "params"),
+        ];
+        // A truncated list must fail loudly, never shrink silently.
+        assert!(cases.len() > 60, "only {} declared-nil cases — list truncated?", cases.len());
+        for (builtin, arg) in cases {
+            let info = super::builtin_info_of(builtin)
+                .unwrap_or_else(|| panic!("'{builtin}' is not in the registry"));
+            let arg_info = info
+                .contract
+                .args
+                .iter()
+                .find(|a| a.name == *arg)
+                .unwrap_or_else(|| panic!("{builtin} has no '{arg}' argument"));
+            let accepts_nil = match arg_info.kind {
+                TypeShape::Nil => true,
+                TypeShape::AnyOf(shapes) => {
+                    shapes.iter().any(|s| matches!(s, TypeShape::Nil))
+                }
+                _ => false,
+            };
+            assert!(
+                accepts_nil,
+                "{builtin}.{arg} accepts an explicit nil at runtime but the contract does not declare it"
+            );
+        }
+        let file_info = super::builtin_info_of("hash_file").unwrap();
+        let hint = file_info
+            .contract
+            .arg_hint("algo")
+            .expect("hash_file's algo argument declares a gate hint");
+        for &algo in super::DigestAlgo::ALL {
+            assert!(
+                hint.contains(algo.name()),
+                "the algo gate hint must list '{}' (it is static text, not accepted_list())",
+                algo.name()
+            );
+        }
+    }
+
+    /// A6 conformance, refusal half: these slots REFUSE an explicit nil at
+    /// runtime (a nil would coerce to a literal string, or the body has an
+    /// explicit refusal), so the contract must NOT declare nil for them —
+    /// with the blanket skip gone, the gate raises TYPE_MISMATCH in every
+    /// mode for the critical classes and in strict mode for the rest.
+    /// A future `any_of(…, nil)` here without a runtime change to match
+    /// would silently widen a refusal into a coercion.
+    #[test]
+    fn nil_refusing_slots_do_not_declare_nil() {
+        use crate::builtin_info::TypeShape;
+        let refusals: &[(&str, &str)] = &[
+            ("spawn", "cmd"),
+            ("spawn", "stdout"),
+            ("spawn", "stderr"),
+            ("csv_parse", "delim"),
+            ("write_file", "path"),
+            ("write_file", "data"),
+            ("append_file", "s"),
+            ("write_new", "content"),
+            ("write_atomic", "path"),
+            ("write_atomic", "data"),
+            ("mkdir", "path"),
+            ("remove", "path"),
+            ("remove_dir", "path"),
+            ("ls", "path"),
+            ("head", "n"),
+            ("tail", "n"),
+            ("date_format", "fmt"),
+            ("sqlopen", "mode"),
+            ("http_put_file", "opts"),
+            ("http_get_file", "opts"),
+            ("ssh_run", "opts"),
+            ("ssh_must", "opts"),
+            ("ssh_mix", "opts"),
+            ("ssh_mix_many", "opts"),
+            ("kill", "pid"),
+            ("kill", "signal"),
+            ("fs_watch", "opts"),
+            ("net_watch", "opts"),
+            ("audio_watch", "opts"),
+            ("audio_state", "opts"),
+        ];
+        // A truncated list must fail loudly, never shrink silently.
+        assert!(refusals.len() > 25, "only {} refusal cases — list truncated?", refusals.len());
+        for (builtin, arg) in refusals {
+            let info = super::builtin_info_of(builtin)
+                .unwrap_or_else(|| panic!("'{builtin}' is not in the registry"));
+            let arg_info = info
+                .contract
+                .args
+                .iter()
+                .find(|a| a.name == *arg)
+                .unwrap_or_else(|| panic!("{builtin} has no '{arg}' argument"));
+            let accepts_nil = match arg_info.kind {
+                TypeShape::Nil => true,
+                TypeShape::AnyOf(shapes) => {
+                    shapes.iter().any(|s| matches!(s, TypeShape::Nil))
+                }
+                _ => false,
+            };
+            assert!(
+                !accepts_nil,
+                "{builtin}.{arg} refuses an explicit nil at runtime but the contract declares it accepted"
+            );
+        }
+    }
+
+    /// A6 metadata: wrapping an option map in `any_of(…, nil)` must not
+    /// discard the named-map field detail — the review regression where
+    /// `write_atomic`/`exists`/`run_argv` were collapsed to an opaque
+    /// `any_of(map, nil)`. The introspection surface (`mix builtins
+    /// --json`) and its serialisers export these fields.
+    #[test]
+    fn nullable_option_maps_keep_their_named_fields() {
+        use crate::builtin_info::TypeShape;
+        fn fields_of(kind: &TypeShape) -> &[crate::builtin_info::FieldInfo] {
+            match kind {
+                TypeShape::AnyOf(shapes) => {
+                    let maps: Vec<&[crate::builtin_info::FieldInfo]> = shapes
+                        .iter()
+                        .filter_map(|s| match s {
+                            TypeShape::Map { shape, fields } if shape.is_some() => Some(*fields),
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(maps.len(), 1, "expected exactly one named map, got {kind:?}");
+                    maps[0]
+                }
+                other => panic!("expected any_of(map(…), nil), got {other:?}"),
+            }
+        }
+        let cases: &[(&str, &str, &[&str])] = &[
+            ("exists", "opts", &["follow_symlinks"]),
+            ("write_atomic", "opts", &["durability", "mode", "max_bytes"]),
+            ("run_argv", "opts", &["timeout", "stream"]),
+            ("stat", "opts", &["follow_symlinks"]),
+            ("walk", "opts", &["max_depth", "follow_symlinks", "include_dirs"]),
+            ("read_jsonl", "opts", &["skip_errors"]),
+            ("bytes_to_string", "opts", &["lossy"]),
+            ("run_stream", "opts", &["env", "clear_env", "cwd"]),
+            ("run_parallel", "opts", &["max", "timeout"]),
+            ("run_pipeline", "opts", &["timeout", "max_output", "allow_signal"]),
+            ("http_serve", "opts", &["port", "host", "duration"]),
+            ("send_mail", "opts", &["host", "sendmail", "timeout"]),
+            ("ds_patch_elements", "opts", &["selector", "mode", "view_transition"]),
+            ("ds_patch_signals", "opts", &["only_if_missing"]),
+        ];
+        for (builtin, arg, want) in cases {
+            let info = super::builtin_info_of(builtin).unwrap();
+            let arg_info = info
+                .contract
+                .args
+                .iter()
+                .find(|a| a.name == *arg)
+                .unwrap_or_else(|| panic!("{builtin} has no '{arg}' argument"));
+            let fields = fields_of(&arg_info.kind);
+            for w in *want {
+                assert!(
+                    fields.iter().any(|f| f.name == *w),
+                    "{builtin}.{arg} lost its '{w}' field under any_of(…, nil): {fields:?}"
+                );
+            }
+        }
+        // bytes_to_string's lossy FIELD stays a strict bool — the nullable
+        // wrap is on the whole map, never on the field (A4).
+        let b2s = super::builtin_info_of("bytes_to_string").unwrap();
+        let opts = b2s.contract.args.iter().find(|a| a.name == "opts").unwrap();
+        let fields = fields_of(&opts.kind);
+        assert!(
+            matches!(fields[0].kind, TypeShape::Bool),
+            "lossy must stay a plain bool, got {:?}",
+            fields[0].kind
+        );
+    }
+
+    #[test]
+    fn write_file_refuses_wrong_types_before_creating() {
+        let d = tmpdir("wf-absent");
+        let p = d.join("absent.txt");
+        for bad in wrong_payloads() {
+            let err = builtin_write_file(vec![s(&p), bad]).unwrap_err();
+            assert!(is_type_mismatch(&err), "{err:?}");
+            assert!(format!("{err}").contains("encode it first"), "{err}");
+            assert!(!p.exists(), "wrong-typed write created {}", p.display());
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn write_and_append_refuse_wrong_types_leaving_contents_unchanged() {
+        let d = tmpdir("wf-existing");
+        let p = d.join("live.txt");
+        std::fs::write(&p, "ORIGINAL").unwrap();
+        for bad in wrong_payloads() {
+            let err = builtin_write_file(vec![s(&p), bad]).unwrap_err();
+            assert!(is_type_mismatch(&err), "{err:?}");
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), "ORIGINAL");
+        }
+        for bad in wrong_payloads() {
+            let err = builtin_append_file(vec![s(&p), bad]).unwrap_err();
+            assert!(is_type_mismatch(&err), "{err:?}");
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), "ORIGINAL");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn write_new_refuses_wrong_types_without_creating() {
+        let d = tmpdir("wn-absent");
+        let p = d.join("new.txt");
+        for bad in wrong_payloads() {
+            let err =
+                builtin_write_new(vec![s(&p), bad, Value::String("0600".into())]).unwrap_err();
+            assert!(is_type_mismatch(&err), "{err:?}");
+            assert!(!p.exists(), "wrong-typed write_new created {}", p.display());
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn non_utf8_bytes_write_verbatim_for_all_three() {
+        let d = tmpdir("rawbytes");
+        let payload: Vec<u8> = vec![0xFF, 0xFE, 0x00, 0x80, 0x81];
+        let p1 = d.join("a.bin");
+        builtin_write_file(vec![s(&p1), Value::bytes(payload.clone())]).unwrap();
+        assert_eq!(std::fs::read(&p1).unwrap(), payload);
+        let p2 = d.join("b.bin");
+        builtin_append_file(vec![s(&p2), Value::bytes(payload.clone())]).unwrap();
+        assert_eq!(std::fs::read(&p2).unwrap(), payload);
+        let p3 = d.join("c.bin");
+        builtin_write_new(vec![
+            s(&p3),
+            Value::bytes(payload.clone()),
+            Value::String("0600".into()),
+        ])
+        .unwrap();
+        assert_eq!(std::fs::read(&p3).unwrap(), payload);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // --- A4: boolean option fields refuse truthy coercion ---
+
+    #[test]
+    fn exists_follow_symlinks_is_a_strict_bool() {
+        let d = tmpdir("exists");
+        // Omitted (default true) and explicit true/false all work on a dir.
+        assert!(builtin_exists(vec![s(&d)]).unwrap().unwrap().is_truthy());
+        assert!(builtin_exists(vec![s(&d), opts(&[("follow_symlinks", Value::Bool(true))])])
+            .unwrap()
+            .unwrap()
+            .is_truthy());
+        assert!(builtin_exists(vec![s(&d), opts(&[("follow_symlinks", Value::Bool(false))])])
+            .unwrap()
+            .unwrap()
+            .is_truthy());
+        // A nil ARGUMENT stays the omitted-options sentinel.
+        assert!(builtin_exists(vec![s(&d), Value::Nil]).unwrap().unwrap().is_truthy());
+        // A nil or string FIELD is a wrong value, not a truthiness.
+        for bad in [
+            Value::String("false".into()),
+            Value::Nil,
+            Value::Number(0.0),
+            Value::list(vec![]),
+        ] {
+            let err =
+                builtin_exists(vec![s(&d), opts(&[("follow_symlinks", bad)])]).unwrap_err();
+            assert!(is_type_mismatch(&err), "{err:?}");
+            assert!(format!("{err}").contains("follow_symlinks"), "{err}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn stat_follow_symlinks_is_a_strict_bool() {
+        let d = tmpdir("stat");
+        assert!(builtin_stat(vec![s(&d)]).is_ok());
+        assert!(builtin_stat(vec![s(&d), opts(&[("follow_symlinks", Value::Bool(false))])])
+            .is_ok());
+        let err = builtin_stat(vec![s(&d), opts(&[("follow_symlinks", Value::String("false".into()))])])
+            .unwrap_err();
+        assert!(is_type_mismatch(&err), "{err:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn walk_bool_options_are_strict_and_validate_before_traversal() {
+        let d = tmpdir("walk");
+        std::fs::write(d.join("a.txt"), "x").unwrap();
+        assert!(builtin_walk(vec![s(&d)]).is_ok());
+        assert!(builtin_walk(vec![s(&d), opts(&[("include_dirs", Value::Bool(true))])]).is_ok());
+        for (key, bad) in [
+            ("follow_symlinks", Value::String("false".into())),
+            ("include_dirs", Value::Number(1.0)),
+            ("follow_symlinks", Value::Nil),
+        ] {
+            let err = builtin_walk(vec![s(&d), opts(&[(key, bad)])]).unwrap_err();
+            assert!(is_type_mismatch(&err), "{err:?}");
+            assert!(format!("{err}").contains(key), "{err}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn bytes_to_string_lossy_is_a_strict_bool() {
+        let raw = Value::bytes(vec![0xFF, 0xFE]);
+        // Explicit nil ARGUMENT is still strict (not lossy).
+        assert!(builtin_bytes_to_string(vec![raw.clone(), Value::Nil]).is_err());
+        // Omitted/true/false are the only accepted spellings; lossy:true decodes.
+        assert!(builtin_bytes_to_string(vec![raw.clone()]).is_err());
+        assert!(builtin_bytes_to_string(vec![raw.clone(), opts(&[("lossy", Value::Bool(true))])])
+            .is_ok());
+        assert!(builtin_bytes_to_string(vec![raw.clone(), opts(&[("lossy", Value::Bool(false))])])
+            .is_err());
+        // A string "false" (or a nil field) refuses rather than picking falsy.
+        for bad in [Value::String("false".into()), Value::Nil, Value::Number(0.0)] {
+            let err = builtin_bytes_to_string(vec![raw.clone(), opts(&[("lossy", bad)])])
+                .unwrap_err();
+            assert!(is_type_mismatch(&err), "{err:?}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "json")]
+    fn read_jsonl_skip_errors_is_a_strict_bool() {
+        let d = tmpdir("jsonl");
+        let p = d.join("dirty.jsonl");
+        std::fs::write(&p, "{\"a\":1}\n").unwrap();
+        assert!(builtin_read_jsonl(vec![s(&p)]).is_ok());
+        assert!(builtin_read_jsonl(vec![s(&p), opts(&[("skip_errors", Value::Bool(true))])])
+            .is_ok());
+        for bad in [Value::String("false".into()), Value::Nil, Value::Number(1.0)] {
+            let err = builtin_read_jsonl(vec![s(&p), opts(&[("skip_errors", bad)])]).unwrap_err();
+            assert!(is_type_mismatch(&err), "{err:?}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    #[cfg(feature = "datastar")]
+    fn ds_patch_elements_view_transition_is_a_strict_bool() {
+        let html = Value::String("<p>x</p>".into());
+        assert!(builtin_ds_patch_elements(vec![html.clone()]).is_ok());
+        assert!(builtin_ds_patch_elements(vec![
+            html.clone(),
+            opts(&[("view_transition", Value::Bool(true))])
+        ])
+        .is_ok());
+        for bad in [Value::String("false".into()), Value::Nil, Value::Number(1.0)] {
+            let err = builtin_ds_patch_elements(vec![
+                html.clone(),
+                opts(&[("view_transition", bad)]),
+            ])
+            .unwrap_err();
+            assert!(is_type_mismatch(&err), "{err:?}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "datastar")]
+    fn ds_patch_signals_only_if_missing_is_a_strict_bool() {
+        let signals = Value::map(indexmap::IndexMap::new());
+        assert!(builtin_ds_patch_signals(vec![signals.clone()]).is_ok());
+        assert!(builtin_ds_patch_signals(vec![
+            signals.clone(),
+            opts(&[("only_if_missing", Value::Bool(true))])
+        ])
+        .is_ok());
+        for bad in [Value::String("false".into()), Value::Nil, Value::Number(1.0)] {
+            let err = builtin_ds_patch_signals(vec![
+                signals.clone(),
+                opts(&[("only_if_missing", bad)]),
+            ])
+            .unwrap_err();
+            assert!(is_type_mismatch(&err), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn http_serve_bool_options_refuse_before_bind() {
+        let d = tmpdir("http");
+        // Validation happens before bind/listen, so a wrong bool returns an
+        // error immediately rather than starting a server.
+        for (key, bad) in [
+            ("listing", Value::String("false".into())),
+            ("render_md", Value::Number(1.0)),
+            ("clean_urls", Value::Nil),
+        ] {
+            let err = builtin_http_serve(vec![s(&d), opts(&[(key, bad)])]).unwrap_err();
+            assert!(is_type_mismatch(&err), "{err:?}");
+            assert!(format!("{err}").contains(key), "{err}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

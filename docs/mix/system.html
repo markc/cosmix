@@ -566,7 +566,9 @@ no-deadline contract, and the writer is not detached as a leaked thread.</p>
 <code>[A-Za-z_][A-Za-z0-9_]*</code>, values string/number/bool — a <strong>nil</strong> value
 REMOVES the variable from the child, the <code>env -u</code> form), and <code>clear_env</code>
 (bool — start from an empty environment) retain their existing meanings.
-Removals apply AFTER sets, so a key both set and unset ends unset.</p>
+Removals apply AFTER sets, so a key both set and unset ends unset.
+This also applies to <code>run_argv_must</code>, <code>run_parallel</code> jobs and each
+<code>run_pipeline</code> stage, including captured and routed output.</p>
 </li>
 <li>
 <p><code>max_output</code>: bytes <strong>per captured stream</strong>, default 8 MiB, <code>0</code> disables.
@@ -1704,6 +1706,7 @@ hash_blake3(s[, {raw:true}])  BLAKE3 digest
 hash_md5(s[, {raw:true}])     MD5 digest    -- BROKEN hash, legacy interop only
 hash_sha1(s[, {raw:true}])    SHA-1 digest  -- BROKEN hash, legacy interop only
 hmac_sha256(key, msg[, {raw:true}])  HMAC-SHA256 (RFC 2104) — webhook signatures
+jwt_rs256_sign(claims_json, private_pem[, header_json])  compact RS256 JWT
 constant_time_eq(a, b) timing-safe equality — compare MACs/secrets with this, not ==
 hash_file(p[, algo][, {raw:true}])   streaming digest of a FILE
                        algo: "sha256" (default) "blake3" "md5" "sha1"
@@ -1806,7 +1809,26 @@ verifying webhook signatures — e.g. Stripe's <code>Stripe-Signature</code> <co
 <pre><code class="language-text">5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843
 </code></pre>
 <p>Compare a computed MAC against a received signature with
-<code>constant_time_eq(a, b)</code>, never <code>==</code> — plain equality short-circuits on the
+<code>jwt_rs256_sign(claims_json, private_pem[, header_json])</code> signs a compact
+JWT with an RSA private key in PKCS8 or PKCS1 PEM form (crypto feature).
+The RSA modulus must be at least 2048 bits. The first PEM item must be the
+private key; certificate-first bundles are refused.
+Pass JSON objects as strings, typically from <code>json_encode</code>. The default
+header is <code>{"alg":"RS256","typ":"JWT"}</code>. A supplied header keeps its
+extra fields such as <code>kid</code>; a missing <code>alg</code> is filled with <code>RS256</code>, and
+any other algorithm is refused. Explicit nil means the default header.
+Input JSON is parsed and re-encoded, so duplicate object keys collapse to
+the final value. Each input is limited to 256 KiB. Malformed or non-object
+JSON raises <code>JWT_CLAIMS_INVALID</code> / <code>JWT_HEADER_INVALID</code>; unsupported or
+invalid keys raise <code>JWT_KEY_INVALID</code>, and signing failure raises
+<code>JWT_SIGN_FAILED</code>. These errors do not echo input values.</p>
+<p>The primitive signs only: scripts choose claims, expiry and audience,
+exchange tokens and call any provider. Keep keys in files or bindings,
+rather than source literals. For example:</p>
+<pre><code class="language-mix">$claims = json_encode({iss: $issuer, aud: $audience, iat: time(), exp: time() + 3600})
+$jwt = jwt_rs256_sign($claims, read_file($key_file))
+</code></pre>
+<p>Compare MACs with <code>constant_time_eq(a, b)</code>, never <code>==</code> — plain equality short-circuits on the
 first differing byte, a timing oracle. <code>constant_time_eq</code> scans the full
 length unconditionally (a length mismatch returns false immediately; MAC
 lengths are public):</p>

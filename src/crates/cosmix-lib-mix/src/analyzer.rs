@@ -95,14 +95,13 @@ pub struct AnalyzerConfig {
     pub allow_functions: Vec<String>,
     /// Suppress every undefined-NAME check, as a `source`/`include` does.
     ///
-    /// Set for the nested analysis of an `ssh_mix` remote body whose
-    /// injected names cannot be read statically. Such a body's free names
-    /// come from `ssh_mix`'s `bindings`/`env` options; when those are map
-    /// literals their keys are passed as `allow_globals` and name checks
-    /// run, and when they are not (an opts VARIABLE) resolution would be
-    /// pure noise, so it is switched off. Reuses the existing `dynamic`
-    /// suppression rather than inventing a second switch. An embedder that
-    /// sets it also skips `ssh_mix` body analysis, as before.
+    /// An embedder sets it when a body's free names genuinely cannot be
+    /// reasoned about. The nested `ssh_mix` body analysis no longer uses
+    /// this for unknown opts — that case keeps undefined-FUNCTION checks
+    /// running (strict-data bindings cannot create a callable) and
+    /// suppresses only variable checks, reported as MIX-D3018. An
+    /// embedder that sets this also skips `ssh_mix` body analysis, as
+    /// before.
     pub suppress_name_checks: bool,
     /// The file's SOURCE text, when the caller has it (0.90.0).
     ///
@@ -389,20 +388,29 @@ fn has_dynamic_include(stmts: &[Stmt]) -> (bool, Option<usize>) {
 
 /// The whole-file analyzer entry point.
 pub fn analyze(stmts: &[Stmt], file: Option<&str>, cfg: &AnalyzerConfig) -> Analysis {
-    analyze_at(stmts, file, cfg, false)
+    analyze_at(stmts, file, cfg, false, false)
 }
 
 /// [`analyze`], told whether `stmts` is itself an `ssh_mix` remote body.
 /// A body's own `ssh_mix` calls are not descended into: the one-level
 /// guard that keeps a body nested in a body from being re-analysed.
+///
+/// `unknown_injected` marks a remote body whose `bindings`/`env` could
+/// not be read statically: dynamic bindings may supply any free DATA
+/// variable, so undefined-VARIABLE checks stand down — but a function
+/// name cannot ride in through strict-data bindings, so undefined-
+/// FUNCTION checks keep running, and a variable read that looks like a
+/// typo of a name the body does bind gets a MIX-D3017 note instead of
+/// silence.
 fn analyze_at(
     stmts: &[Stmt],
     file: Option<&str>,
     cfg: &AnalyzerConfig,
     remote_body: bool,
+    unknown_injected: bool,
 ) -> Analysis {
     let mut a = Analysis::default();
-    let ctx = FileContext::build(stmts, file, cfg, remote_body);
+    let ctx = FileContext::build(stmts, file, cfg, remote_body, unknown_injected);
 
     // W2401 + undefined-check suppression on dynamic includes.
     if let (true, line) = has_dynamic_include(stmts) {
@@ -939,15 +947,29 @@ struct FileContext {
     known_callables: HashSet<String>,
     /// name → (min, max) for names with exactly ONE definition.
     user_fn_arity: HashMap<String, (usize, usize)>,
-    /// Undefined-name checks suppressed (dynamic include present).
+    /// Undefined-name checks suppressed (dynamic include present, or an
+    /// embedder's `suppress_name_checks`). Suppresses BOTH variable and
+    /// callable checks — the conservative pre-existing meaning.
     dynamic: bool,
+    /// Undefined-VARIABLE checks suppressed: everything `dynamic` covers,
+    /// plus a remote body whose injected names are unknown (dynamic
+    /// bindings/env may supply any free DATA variable). Callable checks
+    /// are NOT suppressed by this alone — strict-data bindings cannot
+    /// create a function, so an undefined function stays undefined.
+    dynamic_vars: bool,
+    /// This context IS a remote body whose injected names are unknown
+    /// (set alongside `dynamic_vars`; `dynamic` may hold for other
+    /// reasons). Variable reads that look like a typo of a bound name get
+    /// a MIX-D3017 note here instead of the silence a source/include
+    /// file gets.
+    remote_unknown_vars: bool,
     /// These statements are an `ssh_mix` remote body, a separate program:
     /// "this file" in a message would point at the wrong scope.
     remote_body: bool,
     /// String nodes shipped as `ssh_mix` bodies (by [`node_id`]) → the
     /// names that are the remote program's own; MIX-W2402 stays silent
     /// for those (see [`remote_body_names`]).
-    remote_body_names: HashMap<usize, HashSet<String>>,
+    remote_body_names: RemoteBodyNames,
 }
 
 impl FileContext {
@@ -956,6 +978,7 @@ impl FileContext {
         file: Option<&str>,
         cfg: &AnalyzerConfig,
         remote_body: bool,
+        unknown_injected: bool,
     ) -> FileContext {
         let mut top_level_names = HashSet::new();
         // The TOP-LEVEL bound universe: blocks don't scope and
@@ -1005,6 +1028,8 @@ impl FileContext {
             known_callables,
             user_fn_arity,
             dynamic,
+            dynamic_vars: dynamic || unknown_injected,
+            remote_unknown_vars: unknown_injected,
             remote_body,
             remote_body_names: remote_body_names(stmts),
         }
@@ -1573,6 +1598,147 @@ fn check_scope(
     }
 }
 
+// ── W2311 fmt/sprintf surplus operands (A5) ─────────────────────────
+
+/// Which runtime formatter's grammar a template follows.
+#[derive(Clone, Copy)]
+enum FormatDialect {
+    /// `builtin_fmt` → `mix_format` (builtins.rs): flags `- 0`, width
+    /// digits or `*`, literal precision, conversions `s d f`, `%%`.
+    Fmt,
+    /// `builtin_sprintf` → `sprintf_format` (builtins.rs): flags
+    /// `- + 0 #` and space, width/precision digits or `*`, parsed-and-
+    /// ignored length modifiers (`hh h l ll L q j z t`), conversions
+    /// `d i u o x X f F e E g G s c`.
+    Sprintf,
+}
+
+/// How many operand arguments a literal template consumes — a count over
+/// the EXACT runtime grammars, transcribed from `mix_format` and
+/// `sprintf_format` in builtins.rs (one shared walker, not a divergent
+/// regex or conversion-character count):
+///
+/// - `%%` is a literal percent and consumes nothing;
+/// - a `*` width pulls one operand (fmt), and so does a `*` precision
+///   (sprintf — fmt rejects `.*` at runtime);
+/// - sprintf length modifiers (`h h l L q j z t`) and every flag are
+///   parsed and ignored, consuming nothing;
+/// - every supported conversion consumes exactly one operand.
+///
+/// `None` when the template would RAISE at runtime (trailing or dangling
+/// `%`, unknown conversion, fmt's `.*`, fmt's digit-after-`*` width,
+/// sprintf width/precision overflow): an invalid template can only fail,
+/// so it must not be used to claim a definite surplus operand.
+fn format_operand_count(dialect: FormatDialect, tmpl: &str) -> Option<usize> {
+    let b = tmpl.as_bytes();
+    let mut i = 0;
+    let mut count = 0;
+    while i < b.len() {
+        // Both formatters pass non-`%` text through untouched. `%` cannot
+        // occur inside a multi-byte UTF-8 sequence, so byte stepping is
+        // equivalent to the runtime's codepoint stepping for the count.
+        if b[i] != b'%' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if i >= b.len() {
+            return None; // trailing '%'
+        }
+        if b[i] == b'%' {
+            i += 1;
+            continue; // literal %%
+        }
+        // Flags, repeated in any order, before the width.
+        let flags: &[u8] = match dialect {
+            FormatDialect::Fmt => b"-0",
+            FormatDialect::Sprintf => b"-+ 0#",
+        };
+        while i < b.len() && flags.contains(&b[i]) {
+            i += 1;
+        }
+        // Width: literal digits, or `*` pulling the next operand.
+        if i < b.len() && b[i] == b'*' {
+            i += 1;
+            count += 1;
+            // "%*5s" — fmt names the mistake at runtime.
+            if matches!(dialect, FormatDialect::Fmt)
+                && i < b.len()
+                && b[i].is_ascii_digit()
+            {
+                return None;
+            }
+        } else {
+            // sprintf's checked accumulation raises "width is too large";
+            // fmt silently drops an overflowing width, so only sprintf
+            // bails here.
+            let mut width: usize = 0;
+            while i < b.len() && b[i].is_ascii_digit() {
+                if matches!(dialect, FormatDialect::Sprintf) {
+                    width = width
+                        .checked_mul(10)?
+                        .checked_add((b[i] - b'0') as usize)?;
+                }
+                i += 1;
+            }
+        }
+        // Precision.
+        if i < b.len() && b[i] == b'.' {
+            i += 1;
+            match dialect {
+                FormatDialect::Fmt => {
+                    // `.*` is rejected at runtime: "* is width-only".
+                    if i < b.len() && b[i] == b'*' {
+                        return None;
+                    }
+                    while i < b.len() && b[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                }
+                FormatDialect::Sprintf => {
+                    if i < b.len() && b[i] == b'*' {
+                        i += 1;
+                        count += 1;
+                    } else {
+                        let mut precision: usize = 0;
+                        while i < b.len() && b[i].is_ascii_digit() {
+                            precision = precision
+                                .checked_mul(10)?
+                                .checked_add((b[i] - b'0') as usize)?;
+                            i += 1;
+                        }
+                    }
+                }
+            }
+        }
+        // sprintf length modifiers: parsed and ignored, consume nothing.
+        if matches!(dialect, FormatDialect::Sprintf) {
+            while i < b.len()
+                && matches!(b[i], b'h' | b'l' | b'L' | b'q' | b'j' | b'z' | b't')
+            {
+                i += 1;
+            }
+        }
+        if i >= b.len() {
+            return None; // ends inside a conversion
+        }
+        let conv = b[i] as char;
+        i += 1;
+        let supported = match dialect {
+            FormatDialect::Fmt => matches!(conv, 's' | 'd' | 'f'),
+            FormatDialect::Sprintf => matches!(
+                conv,
+                'd' | 'i' | 'u' | 'o' | 'x' | 'X' | 'f' | 'F' | 'e' | 'E' | 'g' | 'G' | 's' | 'c'
+            ),
+        };
+        if !supported {
+            return None; // unknown conversion raises at runtime
+        }
+        count += 1;
+    }
+    Some(count)
+}
+
 /// Expression checks that need the scope universe: variable reads,
 /// callable resolution, arity.
 fn check_expr(
@@ -1585,7 +1751,16 @@ fn check_expr(
 ) {
     match expr {
         Expr::Heredoc(parts) => {
-            let remote_own = ctx.remote_body_names.get(&node_id(expr));
+            let origin = node_id(expr);
+            // The call's bindings/env are unknown: ANY free name could be
+            // a remote binding, so "did you mean `${name}`?" — which
+            // splices the LOCAL value into remote source — stands down
+            // entirely. Its advice is only safe when the name universe is
+            // known.
+            if ctx.remote_body_names.unknown.contains(&origin) {
+                return;
+            }
+            let remote_own = ctx.remote_body_names.own.get(&origin);
             for part in parts {
                 let StringPart::Literal(literal) = part else {
                     continue;
@@ -1609,11 +1784,10 @@ fn check_expr(
             }
         }
         Expr::Variable(name) => {
-            if !ctx.dynamic
-                && !is_positional(name)
-                && !names.contains(name)
-                && !ctx.known_callables.contains(name)
-            {
+            if is_positional(name) || names.contains(name) || ctx.known_callables.contains(name) {
+                return;
+            }
+            if !ctx.dynamic_vars {
                 a.diagnostics.push(diag(
                     ctx,
                     "MIX-E1101",
@@ -1641,7 +1815,43 @@ fn check_expr(
                         )
                     }),
                 ));
+            } else if ctx.remote_unknown_vars {
+                // MIX-D3017: the read cannot be proved undefined (dynamic
+                // bindings/env may supply it) — but when the name is within
+                // edit distance of something THIS body does bind, the typo
+                // is the likelier explanation, so record it instead of
+                // passing silently. A name with no near neighbour is an
+                // ordinary dynamic binding and stays silent. The
+                // runtime-injected names are excluded from the candidate
+                // pool: `$x` → "did you mean '$_'?" is noise, not advice.
+                let mut sorted: Vec<&String> = names
+                    .iter()
+                    .filter(|n| !INJECTED_VARS.contains(&n.as_str()))
+                    .collect();
+                sorted.sort();
+                let in_scope: Vec<String> = sorted.into_iter().cloned().collect();
+                if let Some(suffix) = undefined_variable_hint(name, &in_scope) {
+                    a.diagnostics.push(diag(
+                        ctx,
+                        "MIX-D3017",
+                        Severity::Note,
+                        line,
+                        format!(
+                            "'${name}' is bound nowhere in this remote body — dynamic \
+                             bindings/env may supply it at runtime, so it is not an \
+                             error{suffix}"
+                        ),
+                        Some(
+                            "if a value is meant to ship from here, pass it through the call's \
+                             bindings/env (and write opts as a map literal so lint can resolve \
+                             the names exactly); if it is a typo, fix it"
+                                .to_string(),
+                        ),
+                    ));
+                }
             }
+            // else: `dynamic` for another reason (source/include, an
+            // embedder's suppress_name_checks) — silent, as before.
         }
         Expr::FunctionCall { name, args } => {
             // Lambda passed to a HOF? Its body is checked by
@@ -1727,6 +1937,50 @@ fn check_expr(
                     ),
                     None,
                 ));
+            }
+            // MIX-W2311 (A5): fmt/sprintf are variadic, so the generic
+            // arity gate stops at the contract and cannot see surplus
+            // operands past the template — and both builtins SILENTLY
+            // IGNORE them at runtime. Only a direct, unshadowed call
+            // whose template is a string LITERAL that parses cleanly
+            // under the runtime grammar can prove a definite surplus.
+            // A deficit stays silent here: "not enough arguments" is the
+            // runtime's own error, not an unused-operand finding.
+            if matches!(name.as_str(), "fmt" | "sprintf")
+                && !ctx.dynamic
+                && !in_address
+                && !ctx.known_callables.contains(name)
+                && !names.contains(name)
+                && let Some(Expr::StringLiteral(tmpl) | Expr::EscapedQuoteStringLiteral(tmpl)) =
+                    args.first()
+                && let Some(expected) = format_operand_count(
+                    if name == "fmt" {
+                        FormatDialect::Fmt
+                    } else {
+                        FormatDialect::Sprintf
+                    },
+                    tmpl,
+                )
+            {
+                let provided = args.len() - 1;
+                if provided > expected {
+                    a.diagnostics.push(diag(
+                        ctx,
+                        "MIX-W2311",
+                        Severity::Warning,
+                        line,
+                        format!(
+                            "{name}() template consumes {expected} operand(s) but {provided} were \
+                             provided — the surplus {surplus} argument(s) are silently ignored",
+                            surplus = provided - expected
+                        ),
+                        Some(
+                            "remove the unused argument(s), or extend the template with more \
+                             format placeholders (%s, %d, %f)"
+                                .to_string(),
+                        ),
+                    ));
+                }
             }
         }
         Expr::FunctionLiteral { params, body, .. } => {
@@ -1977,7 +2231,10 @@ fn check_recurring_silent_bugs(stmts: &[Stmt], ctx: &FileContext, a: &mut Analys
 /// this rule makes the lint agree with the runtime instead of letting
 /// the script crash mid-run. Variables and expressions are left alone —
 /// only a literal PROVES the type. Nil is the documented omitted-arg
-/// sentinel and never a contradiction.
+/// sentinel, and a `nil` literal is tested against the declared shape
+/// like any other literal: it satisfies only a shape that admits nil
+/// (`Nil`, `Any`, or an `AnyOf` containing them), and against a
+/// concrete shape it is a contradiction and flagged.
 fn check_literal_type_contradictions(stmts: &[Stmt], ctx: &FileContext, a: &mut Analysis) {
     use crate::builtin_info::TypeShape;
     for stmt in stmts {
@@ -2163,8 +2420,9 @@ fn check_shell_command_statements(stmts: &[Stmt], ctx: &FileContext, a: &mut Ana
 /// on these builtins is a Python/JS/bash hand, so the E1201 hint names
 /// the Mix form at the exact call site. (The doc-shout rows — `range`
 /// inclusivity, `sort` comparator order, `filter` list-first — live in
-/// the manual; the get/set/find did-you-mean lives with the undefined-
-/// name suggester, whose targets must be real builtins.)
+/// the manual, linked not duplicated; the get/set/find did-you-mean lives
+/// with the shared suggester, whose targets may be FORMS as well as
+/// builtins — see [`COLLECTION_FORM_SUGGESTIONS`].)
 const REFLEX_SURPLUS_HINTS: &[(&str, usize, &str)] = &[
     (
         "remove",
@@ -2754,10 +3012,16 @@ fn check_release_transition_advisories(stmts: &[Stmt], ctx: &FileContext, a: &mu
 ///
 /// NAME RESOLUTION inside the body runs against the body itself, the
 /// builtins, and the names the call injects — its `bindings` keys and its
-/// `env` keys, both prepended to the shipped source as assignments. When
-/// those cannot be read statically (the opts argument is not a map literal)
-/// name checks are suppressed for that body instead, because a linter that
-/// cries wolf about remote bodies gets switched off.
+/// `env` keys, both prepended to the shipped source as assignments. Those
+/// are read statically from a map-literal opts argument, or from a
+/// variable bound exactly once to one (the opts twin of the body's
+/// `sole_string_definitions`). When they cannot be read (MIX-D3018), the
+/// boundary is split, not blanket: dynamic bindings/env may supply any
+/// free DATA variable, so undefined-VARIABLE checks stand down — but a
+/// function name cannot ride in through strict-data bindings, so
+/// undefined-FUNCTION checks keep running, and a variable read one edit
+/// away from a name the body binds is reported as a typo-suspect note
+/// (MIX-D3017) rather than skipped silently.
 ///
 /// Every `ssh_mix` call is found, at any depth — the loop-over-hosts shape
 /// puts the call inside a `for`, and the 0.69.0 pass searched only
@@ -2775,48 +3039,67 @@ fn check_ssh_mix_bodies(
     // one copy of every (code, line, message) they share.
     let mut analysed: HashSet<(usize, Option<Vec<String>>)> = HashSet::new();
     let mut reported = BodyDedupe::default();
-    let openers = cfg.source.as_deref().map(literal_openers).unwrap_or_default();
-    let mut ordinals: HashMap<(usize, bool, String), Vec<usize>> = HashMap::new();
+    // Exact opener lines keyed by body AST node, from the caller's source
+    // text; see [`source_literal_maps`] for how and why the pairing can
+    // refuse.
+    let mapped = cfg
+        .source
+        .as_deref()
+        .map(|source| source_literal_maps(source, stmts))
+        .unwrap_or_default();
     for site in collect_remote_sites(stmts) {
         match site.body {
             RemoteBody::Literal {
                 src,
                 first_line,
                 origin,
-                heredoc,
-                stmt_line,
             } => {
-                // The opener's REAL line, when the source text is at hand:
-                // `ssh_mix(` / `$h,` / `<<EOF` over three lines puts the body
-                // two lines below where the statement line alone would say.
-                // Identical literals in one statement are told apart by
-                // ORDER: sites arrive in source order within a statement, so
-                // the Nth distinct body with this text is the Nth opener.
-                let same = ordinals
-                    .entry((stmt_line, heredoc, src.clone()))
-                    .or_default();
-                let nth = same.iter().position(|o| *o == origin).unwrap_or_else(|| {
-                    same.push(origin);
-                    same.len() - 1
-                });
-                let first_line = openers
-                    .iter()
-                    .filter(|(line, is_heredoc, text)| {
-                        *is_heredoc == heredoc && *line >= stmt_line && *text == src
-                    })
-                    .nth(nth)
-                    .map_or(first_line, |(line, is_heredoc, _)| {
-                        if *is_heredoc { line + 1 } else { *line }
-                    });
+                // A once-bound body shipped several times reuses its one
+                // AST node's map. Without source text, keep the documented
+                // statement-line estimate.
+                let (first_line, lines) = mapped
+                    .get(&origin)
+                    .cloned()
+                    .unwrap_or((first_line, None));
                 let key = site.injected.as_ref().map(|names| {
                     let mut v: Vec<String> = names.iter().cloned().collect();
                     v.sort_unstable();
                     v
                 });
+                // MIX-D3018, per CALL SITE: the opts are what make the
+                // body's variable universe unknowable, and two calls of the
+                // same body can differ in them. A body that can read its
+                // opts (a literal map, or a variable bound exactly once to
+                // one) never gets this.
+                if site.injected.is_none() {
+                    a.diagnostics.push(diag(
+                        ctx,
+                        "MIX-D3018",
+                        Severity::Note,
+                        site.line,
+                        "ssh_mix opts are not a statically readable map — undefined-VARIABLE \
+                         checks are skipped for this body (its bindings/env may supply any data \
+                         name); undefined-FUNCTION checks still run"
+                            .to_string(),
+                        Some(
+                            "write the opts argument as a map literal — or bind it exactly once \
+                             to one — so lint can resolve the body's names exactly"
+                                .to_string(),
+                        ),
+                    ));
+                }
                 if analysed.insert((origin, key)) {
                     let injected = site.injected.as_ref();
                     reported.origin = origin;
-                    analyse_remote_body(&src, first_line, injected, ctx, a, cfg, &mut reported);
+                    analyse_remote_body(
+                        &src,
+                        (first_line, lines.as_deref()),
+                        injected,
+                        ctx,
+                        a,
+                        cfg,
+                        &mut reported,
+                    );
                 }
             }
             RemoteBody::Interpolated { locals, .. } => a.diagnostics.push(diag(
@@ -2884,13 +3167,12 @@ enum RemoteBody {
     /// once, and so MIX-W2402 can recognise it as a remote body.
     Literal {
         src: String,
-        /// Best line estimate from the AST alone (see [`literal_openers`]).
+        /// Best line estimate from the AST alone: the statement line, or
+        /// `+ 1` for a heredoc (see [`check_ssh_mix_bodies`], which
+        /// upgrades this to the opener's real line when the source text
+        /// is at hand).
         first_line: usize,
         origin: usize,
-        heredoc: bool,
-        /// Line of the statement holding the literal — its opener is on or
-        /// after this line.
-        stmt_line: usize,
     },
     /// A string or heredoc with local `${…}`/`$(…)`/`~` substitutions —
     /// `locals` names them, spelled as written.
@@ -2926,13 +3208,11 @@ fn body_shape(expr: &Expr, line: usize) -> Option<RemoteBody> {
                 src: src.clone(),
                 first_line: line,
                 origin,
-                heredoc: false,
-                stmt_line: line,
             });
         }
         // A heredoc's text starts on the line AFTER its `<<TAG` opener.
         // The statement's own line is the estimate; with the source text
-        // at hand, `literal_openers` supplies the real one.
+        // at hand, the opener's real line map upgrades it.
         Expr::Heredoc(parts) => (parts, line + 1),
         Expr::InterpolatedString(parts) => (parts, line),
         _ => return None,
@@ -2952,43 +3232,103 @@ fn body_shape(expr: &Expr, line: usize) -> Option<RemoteBody> {
             src,
             first_line,
             origin,
-            heredoc: matches!(expr, Expr::Heredoc(_)),
-            stmt_line: line,
         }
     } else {
         RemoteBody::Interpolated { locals, origin }
     })
 }
 
-/// Where each string and all-literal heredoc in `source` opens: (line of
-/// the opening quote or `<<TAG`, is-heredoc, text). The AST keeps only the
-/// statement line, which is exact for `$x = ssh_mix($h, '` and
-/// `$p = <<END` but not for an opener further down a multi-line call.
-/// Empty when the source does not lex — the statement-line estimate stands.
-fn literal_openers(source: &str) -> Vec<(usize, bool, String)> {
-    let Ok(tokens) = crate::lexer::Lexer::new(source).tokenize() else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for t in tokens {
-        match t.token {
-            crate::token::Token::String(s) => out.push((t.line, false, s)),
-            crate::token::Token::HeredocString(parts) => {
-                let mut text = String::new();
-                if parts.iter().all(|p| match p {
-                    StringPart::Literal(s) => {
-                        text.push_str(s);
-                        true
-                    }
-                    _ => false,
-                }) {
-                    out.push((t.line, true, text));
-                }
-            }
-            _ => {}
-        }
+/// One parser-recorded literal origin joined with the lexer's line map
+/// for that exact source token.
+struct RecordedOrigin {
+    kind: crate::parser::LiteralOriginKind,
+    /// The origin's decoded text — the pairing check compares it with
+    /// the tree node's own text.
+    text: String,
+    /// `None` for a literal the parser built from a bareword (a `send`
+    /// target, an external command word, an `include` path): the lexer
+    /// records no line map for those.
+    map: Option<crate::lexer::LiteralLineMap>,
+}
+
+/// Re-parse `source` with literal-origin recording on and join every
+/// recorded origin to the lexer's line map for its token offset. `None`
+/// when the source does not lex or parse. This is the recording half of
+/// [`source_literal_maps`]; the pairing half is the walk there.
+fn recorded_literal_origins(source: &str, stmts: &[Stmt]) -> Option<Vec<RecordedOrigin>> {
+    let (tokens, by_offset) = crate::lexer::Lexer::lex_with_literal_maps(source)?;
+    let mut parser = crate::parser::Parser::new_speculative(tokens, source)
+        .with_literal_origin_recording();
+    let parsed = parser.parse_program().ok()?;
+    // Literal text alone cannot prove correspondence: two different trees
+    // can contain the same sequence of strings. Require the whole source
+    // tree (including statement lines) before attaching physical origins.
+    if parsed != stmts {
+        return None;
     }
-    out
+    Some(
+        parser
+            .take_literal_origins()
+            .into_iter()
+            .map(|origin| RecordedOrigin {
+                kind: origin.kind,
+                map: by_offset.get(&origin.offset).cloned(),
+                text: origin.text,
+            })
+            .collect(),
+    )
+}
+
+/// Exact opener line and decoded-line → physical-line map for every
+/// literal remote body in `stmts`, keyed by the body's AST node identity
+/// ([`node_id`]). Built only when the caller supplies the file's source
+/// text, by re-parsing it with literal-origin recording enabled: the
+/// parser records, in construction order (its source order — it never
+/// backtracks), one entry per literal Expr it BUILDS. Bare and quoted
+/// map keys, `parse` delimiters and `on` names/doc-strings are never
+/// Exprs, so they are never recorded and cannot steal a body's entry; a
+/// bareword-built `StringLiteral` (a `send` target, an external command
+/// word, an `include` path) IS recorded, which keeps the two lists
+/// aligned.
+///
+/// The recorded list is paired POSITIONALLY with this tree's literal
+/// Exprs walked in source order, and every pair must agree on Expr
+/// variant and decoded text. The first disagreement, or a length
+/// mismatch, refuses the WHOLE mapping — the statement-line estimate
+/// then stands, exactly as if no source had been supplied — because a
+/// partial mapping could silently attach one body's lines to another.
+/// A mapping can be missing, but never misattached.
+fn source_literal_maps(source: &str, stmts: &[Stmt]) -> HashMap<usize, (usize, Option<Vec<usize>>)> {
+    let mut paired: HashMap<usize, (usize, Option<Vec<usize>>)> = HashMap::new();
+    let Some(origins) = recorded_literal_origins(source, stmts) else {
+        return paired;
+    };
+    let mut cursor = 0usize;
+    let mut refused = false;
+    walk_literal_sources(stmts, &mut |expr| {
+        let Some((kind, text)) = crate::parser::literal_expr_shape(expr) else {
+            return;
+        };
+        if refused {
+            return;
+        }
+        let Some(origin) = origins.get(cursor) else {
+            refused = true;
+            return;
+        };
+        cursor += 1;
+        if origin.kind != kind || origin.text != text {
+            refused = true;
+            return;
+        }
+        // A bareword-built literal has no physical opener; nothing to map.
+        let Some(map) = &origin.map else { return };
+        paired.insert(node_id(expr), (map.opener_line, Some(map.lines.clone())));
+    });
+    if refused || cursor != origins.len() {
+        return HashMap::new();
+    }
+    paired
 }
 
 /// Names an `ssh_mix` call injects into its remote program: the keys of
@@ -2997,8 +3337,11 @@ fn literal_openers(source: &str) -> Vec<(usize, bool, String)> {
 /// assignments in the program that actually runs, so both are bound names
 /// of the body.
 ///
-/// `None` when that set cannot be known statically — an opts argument that
-/// is not a map literal, or a `bindings`/`env` value that is not one.
+/// `None` when that set cannot be known statically — an opts argument
+/// that is not a map literal, or a `bindings`/`env` value that is not one.
+/// (A variable bound exactly once to a map literal is resolved by
+/// [`sole_map_definitions`] before this is consulted, so it does not take
+/// the `None` path.)
 fn remote_injected_names(opts: Option<&Expr>) -> Option<HashSet<String>> {
     let mut out = HashSet::new();
     let Some(opts) = opts else {
@@ -3016,6 +3359,94 @@ fn remote_injected_names(opts: Option<&Expr>) -> Option<HashSet<String>> {
         }
     }
     Some(out)
+}
+
+type LiteralVisitor<'a> = dyn FnMut(&Expr) + 'a;
+
+/// Visit literal-bearing positions in source order. The general scope
+/// walker visits all branch conditions before their bodies, which is
+/// NOT source order; this one interleaves conditions and bodies exactly
+/// as written, which is the order the parser constructs the literals in
+/// (it never backtracks). Map keys are deliberately NOT visited: they
+/// are plain strings in the AST, not Exprs, and an identical decoded key
+/// must not consume a body's origin.
+fn walk_literal_sources(stmts: &[Stmt], visit: &mut LiteralVisitor<'_>) {
+    for stmt in stmts {
+        match &stmt.kind {
+            StmtKind::If { condition, then_body, else_ifs, else_body } => {
+                walk_literal_expr(condition, visit);
+                walk_literal_sources(then_body, visit);
+                for (condition, body) in else_ifs {
+                    walk_literal_expr(condition, visit);
+                    walk_literal_sources(body, visit);
+                }
+                if let Some(body) = else_body { walk_literal_sources(body, visit); }
+            }
+            StmtKind::Select { value, cases, otherwise } => {
+                walk_literal_expr(value, visit);
+                for (value, body) in cases {
+                    walk_literal_expr(value, visit);
+                    walk_literal_sources(body, visit);
+                }
+                if let Some(body) = otherwise { walk_literal_sources(body, visit); }
+            }
+            StmtKind::FunctionDef { params, body, .. } => {
+                for param in params {
+                    if let Some(value) = &param.default { walk_literal_expr(value, visit); }
+                }
+                walk_literal_function(body, visit);
+            }
+            _ => {
+                walk_stmt_exprs(stmt, &mut |e| walk_literal_expr(e, visit));
+                for body in stmt_bodies(&stmt.kind) { walk_literal_sources(body, visit); }
+            }
+        }
+    }
+}
+
+fn walk_literal_function(body: &FunctionBody, visit: &mut LiteralVisitor<'_>) {
+    match body {
+        FunctionBody::Block(body) => walk_literal_sources(body, visit),
+        FunctionBody::Expression(expr) => walk_literal_expr(expr, visit),
+    }
+}
+
+fn walk_literal_expr(expr: &Expr, visit: &mut LiteralVisitor<'_>) {
+    visit(expr);
+    match expr {
+        Expr::MapLiteral(entries) => {
+            for (_, value) in entries {
+                walk_literal_expr(value, visit);
+            }
+        }
+        Expr::If(e) => {
+            walk_literal_expr(&e.condition, visit);
+            walk_literal_sources(&e.then_body, visit);
+            for (condition, body) in &e.else_ifs {
+                walk_literal_expr(condition, visit);
+                walk_literal_sources(body, visit);
+            }
+            if let Some(body) = &e.else_body { walk_literal_sources(body, visit); }
+        }
+        Expr::FunctionLiteral { params, body } => {
+            for param in params {
+                if let Some(value) = &param.default { walk_literal_expr(value, visit); }
+            }
+            walk_literal_function(body, visit);
+        }
+        // The general walker (`walk_expr_children`) skips a send's
+        // COMMAND expression (lint gap, TODO-mix 2026-09-24); this walk
+        // must not, or its visit order would drift from the parser's
+        // construction order (target, command, args).
+        Expr::Send { target, command, args, .. } => {
+            walk_literal_expr(target, visit);
+            walk_literal_expr(command, visit);
+            for (_, value) in args {
+                walk_literal_expr(value, visit);
+            }
+        }
+        _ => walk_expr_children(expr, &mut |e| walk_literal_expr(e, visit)),
+    }
 }
 
 /// One node reached by [`walk_frames`].
@@ -3228,6 +3659,7 @@ fn binding_visible(bound_in: usize, at: usize, parents: &HashMap<usize, (usize, 
 /// and its injected names.
 fn collect_remote_sites(stmts: &[Stmt]) -> Vec<RemoteSite> {
     let sole = sole_string_definitions(stmts);
+    let sole_maps = sole_map_definitions(stmts);
     let parents = frame_parents(stmts);
     let mut sites = Vec::new();
     walk_frames(stmts, TOP_FRAME, &mut |node, frame| {
@@ -3252,14 +3684,74 @@ fn collect_remote_sites(stmts: &[Stmt]) -> Vec<RemoteSite> {
                     .map_or(RemoteBody::Opaque, |(shape, _)| shape.clone()),
                 other => body_shape(other, line).unwrap_or(RemoteBody::Opaque),
             };
+            // The opts twin of the body resolution: a variable bound
+            // exactly once to a map literal (and visible here) supplies
+            // its keys statically, so the body gets full name checks —
+            // `$o = {bindings: {…}}` does not degrade them. Anything else
+            // (a call, a multi-bound name, an unreadable value) stays
+            // unknown and takes the MIX-D3018 boundary.
+            let injected = match args.get(2) {
+                Some(Expr::Variable(v)) => sole_maps
+                    .get(v)
+                    .filter(|(bound_in, _)| binding_visible(*bound_in, frame, &parents))
+                    .and_then(|(_, resolved)| resolved.clone()),
+                other => remote_injected_names(other),
+            };
             sites.push(RemoteSite {
                 line,
                 body,
-                injected: remote_injected_names(args.get(2)),
+                injected,
             });
         }
     });
     sites
+}
+
+/// Variables whose SOLE binding in the whole file is an assignment of a
+/// map LITERAL — the opts twin of [`sole_string_definitions`]: the
+/// manual's fleet idiom binds the remote program once (`$probe = <<END
+/// …`), and `$opts = {bindings: {…}}` bound once is the same guarantee
+/// for the injected names. The keys are RESOLVED here (owned), because
+/// `walk_frames`' visit closure is higher-ranked and cannot hand out a
+/// borrow into the tree. Same "sole" rule (a second binder, a loop
+/// variable or a parameter anywhere makes it unknowable), same
+/// visibility check (`binding_visible`), and a `source`/`include` in the
+/// file resolves nothing. `None` per name means "bound to a map literal
+/// whose `bindings`/`env` value is not a map literal" — the keys are
+/// still unknowable, exactly like an unreadable opts argument.
+fn sole_map_definitions(
+    stmts: &[Stmt],
+) -> HashMap<String, (usize, Option<HashSet<String>>)> {
+    let mut out = HashMap::new();
+    if has_dynamic_include(stmts).0 {
+        return out;
+    }
+    let binders = binder_frames(stmts);
+    walk_frames(stmts, TOP_FRAME, &mut |node, frame| {
+        if let FrameNode::Stmt(stmt) = node
+            && let StmtKind::Assignment { name, value } | StmtKind::Export { name, value } =
+                &stmt.kind
+            && binders.get(name).is_some_and(|f| f.len() == 1)
+            && matches!(value, Expr::MapLiteral(_))
+        {
+            out.insert(name.clone(), (frame, remote_injected_names(Some(value))));
+        }
+    });
+    out
+}
+
+/// W2402's view of the remote bodies in a file, keyed by string-node
+/// identity (see [`remote_body_names`]).
+struct RemoteBodyNames {
+    /// Names the remote program OWNS — a bare `$name` for one of these is
+    /// remote Mix code, correctly bare, so "did you mean `${name}`?" must
+    /// not fire.
+    own: HashMap<usize, HashSet<String>>,
+    /// Bodies whose injected names are UNKNOWN (a call with unreadable
+    /// opts): ANY free name could be a remote binding, so W2402 stands
+    /// down for the whole heredoc — its `${name}` advice would splice a
+    /// LOCAL value into a name the remote program owns.
+    unknown: HashSet<usize>,
 }
 
 /// For every string node that ships as an `ssh_mix` body: the names that
@@ -3270,8 +3762,11 @@ fn collect_remote_sites(stmts: &[Stmt]) -> Vec<RemoteSite> {
 /// code, correctly bare, so MIX-W2402 ("did you mean `${name}`?") must not
 /// fire for it: following that advice would splice the LOCAL value in, the
 /// classic bug. Names outside the set still warn.
-fn remote_body_names(stmts: &[Stmt]) -> HashMap<usize, HashSet<String>> {
-    let mut out: HashMap<usize, HashSet<String>> = HashMap::new();
+fn remote_body_names(stmts: &[Stmt]) -> RemoteBodyNames {
+    let mut out = RemoteBodyNames {
+        own: HashMap::new(),
+        unknown: HashSet::new(),
+    };
     for site in collect_remote_sites(stmts) {
         let (origin, own) = match &site.body {
             RemoteBody::Literal { src, origin, .. } => {
@@ -3292,51 +3787,85 @@ fn remote_body_names(stmts: &[Stmt]) -> HashMap<usize, HashSet<String>> {
             RemoteBody::Interpolated { origin, .. } => (*origin, HashSet::new()),
             RemoteBody::Opaque => continue,
         };
-        let entry = out.entry(origin).or_default();
+        let unknown_opts = site.injected.is_none();
+        let entry = out.own.entry(origin).or_default();
         entry.extend(own);
         entry.extend(site.injected.into_iter().flatten());
+        if unknown_opts {
+            out.unknown.insert(origin);
+        }
     }
     out
 }
 
 /// Parse + analyse one literal remote body and fold its diagnostics into
 /// the enclosing file's, with lines mapped: inner line N reports at
-/// `first_line + N - 1`.
+/// `map_inner_line(lines, first_line, N)`.
 ///
-/// `first_line` comes from the opener's own token when the caller supplied
-/// the source text (`mix lint` does), so a body opened further down a
-/// multi-line call maps exactly. Without the source it is the statement
-/// line estimate, exact for `$x = ssh_mix($HOST, '` and `$p = <<END`.
+/// `lines` is the body's decoded-line → physical-line map when the caller
+/// supplied the source text (`mix lint` does) — built by the lexer while
+/// decoding the literal, so a `\n`-escaped body reports every diagnostic
+/// on the ONE line it physically occupies, and a body opened further down
+/// a multi-line call maps exactly. Without it, `first_line` is the
+/// statement-line estimate (exact for `$x = ssh_mix($HOST, '` and
+/// `$p = <<END`) and the linear `first_line + N - 1` stands.
 ///
 /// `injected` is the call's static `bindings`/`env` key set; `None` (not
-/// knowable) suppresses the body's undefined-name checks instead.
+/// knowable) suppresses the body's undefined-VARIABLE checks while
+/// undefined-FUNCTION checks keep running — strict-data bindings cannot
+/// create a callable, so a function name the body does not define is
+/// undefined no matter what the opts hold.
 fn analyse_remote_body(
     src: &str,
-    first_line: usize,
+    location: (usize, Option<&[usize]>),
     injected: Option<&HashSet<String>>,
     ctx: &FileContext,
     a: &mut Analysis,
     cfg: &AnalyzerConfig,
     reported: &mut BodyDedupe,
 ) {
+    let (first_line, lines) = location;
     let mut lexer = crate::lexer::Lexer::new(src);
     let tokens = match lexer.tokenize() {
         Ok(t) => t,
         // A body that does not LEX is reported, not swallowed: the remote
         // would fail the same way, and silence here is the failure mode
         // this whole pass exists to remove.
-        Err(e) => return push_unparsable(a, ctx, first_line, &e.to_string(), reported),
+        Err(e) => {
+            let inner_line = error_line(&e);
+            return push_unparsable(
+                a,
+                ctx,
+                map_inner_line(lines, first_line, inner_line),
+                &e.to_string(),
+                reported,
+            );
+        }
     };
     let inner = match crate::parser::Parser::new(tokens, src).parse_program() {
         Ok(s) => s,
-        Err(e) => return push_unparsable(a, ctx, first_line, &e.to_string(), reported),
+        Err(e) => {
+            let inner_line = error_line(&e);
+            return push_unparsable(
+                a,
+                ctx,
+                map_inner_line(lines, first_line, inner_line),
+                &e.to_string(),
+                reported,
+            );
+        }
     };
     let mut allow_globals = cfg.allow_globals.clone();
     allow_globals.extend(injected.into_iter().flatten().cloned());
     let inner_cfg = AnalyzerConfig {
         allow_globals,
         allow_functions: cfg.allow_functions.clone(),
-        suppress_name_checks: injected.is_none(),
+        // Deliberately FALSE even when `injected` is `None`: the boundary
+        // below is finer than a blanket suppression. Unknown bindings/env
+        // may supply any free DATA variable (undefined-variable checks
+        // stand down), but a FUNCTION name cannot ride in through
+        // strict-data bindings, so callable checks keep running.
+        suppress_name_checks: false,
         // The BODY's own text, never the enclosing file's — the spelling
         // rules must read the source they are reporting lines against.
         // Lint is the only gate this remote program ever passes through.
@@ -3345,14 +3874,47 @@ fn analyse_remote_body(
         // linting its ssh_mix programs wants the same error strength there.
         agent: cfg.agent,
     };
-    let nested = analyze_at(&inner, None, &inner_cfg, true);
+    let nested = analyze_at(&inner, None, &inner_cfg, true, injected.is_none());
     for mut d in nested.diagnostics {
         d.file.clone_from(&ctx.file);
-        d.line = Some(first_line + d.line.unwrap_or(1).saturating_sub(1));
+        d.line = Some(map_inner_line(lines, first_line, d.line.unwrap_or(1)));
         d.message = format!("[inside ssh_mix body] {}", d.message);
         if reported.first(&d) {
             a.diagnostics.push(d);
         }
+    }
+}
+
+/// The inner-source line a lex/parse error is anchored to — used to map
+/// an unparsable body's finding onto the physical line of the failing
+/// token rather than the body's first line. 1 when the error carries no
+/// position at all.
+fn error_line(e: &crate::error::MixError) -> usize {
+    match e {
+        crate::error::MixError::LexerError { span, .. }
+        | crate::error::MixError::ParseError { span, .. }
+        | crate::error::MixError::IncompleteInput { span, .. }
+        | crate::error::MixError::AssignmentChainParseError { span, .. } => span.line,
+        crate::error::MixError::StrictDataViolation { line, .. } => *line,
+        _ => 1,
+    }
+}
+
+/// Map an inner-source line onto the enclosing file: through the
+/// literal's decoded-line → physical-line map when the caller supplied
+/// the source text, else by the documented linear estimate
+/// (`first_line + inner - 1`), which is exact for a physical multi-line
+/// literal or an escape-free heredoc and an explicit best effort for a
+/// `\n`-escaped body (whose extra decoded lines have no physical line of
+/// their own). An inner line past the map's end (a parse error at EOF)
+/// extends from the map's last line by the same linear rule.
+fn map_inner_line(lines: Option<&[usize]>, first_line: usize, inner: usize) -> usize {
+    match lines {
+        Some(ls) => ls
+            .get(inner.saturating_sub(1))
+            .copied()
+            .unwrap_or_else(|| ls.last().copied().unwrap_or(first_line) + inner.saturating_sub(ls.len())),
+        None => first_line + inner.saturating_sub(1),
     }
 }
 
@@ -3866,18 +4428,48 @@ pub(crate) const FOREIGN_FUNCTION_SYNONYMS: &[(&str, &str, &str)] = &[
     ("db_close", "sqlclose", " (the SQLite-file API)"),
 ];
 
+/// Foreign get/set/find → the Mix FORM that does the job.
+///
+/// Unlike [`FOREIGN_FUNCTION_SYNONYMS`] the target is a SYNTAX/form, not a
+/// builtin name — A5 (TODO-mix 2026-09-24) extends the shared
+/// runtime/lint suggestion seam ([`function_suggestion`]) so its targets
+/// no longer have to be callables. A user-defined `fn get/set/find` is a
+/// known callable and never reaches the suggester, so this table can
+/// never shadow one. The range/sort/filter semantics these forms carry
+/// are documented in `mix man collections` (range is inclusive of both
+/// ends; sort orders numbers numerically and everything else
+/// lexicographically; filter is list-first) — the hints point there
+/// rather than duplicate the manual.
+pub(crate) const COLLECTION_FORM_SUGGESTIONS: &[(&str, &str)] = &[
+    (
+        "get",
+        "Mix has no get() — read a map key directly: $m[key] (nil when absent), or get_or(map, key, default) / require_key(map, key) when the key must exist",
+    ),
+    (
+        "set",
+        "Mix has no set() — assign into a map: $m[key] = value (updates in place); for a copy: $m = merge($m, {key: value})",
+    ),
+    (
+        "find",
+        "Mix has no find() — index_of(seq, v) for a position (0-based, -1 when absent), filter(list, fn) to select the matching items, or contains(seq, v) for yes/no — see `mix man collections`",
+    ),
+];
+
 /// The "did you mean" for an undefined function, WITHOUT framing — shared by
 /// the runtime ([`undefined_function_hint`]) and lint's MIX-E1102 hint, so the
-/// two can never disagree about the same name. Three sources, in order:
+/// two can never disagree about the same name. Four sources, in order:
 ///
 ///   1. The shared deleted/renamed table (`DEPRECATED_REGEX_CALLS`, which also
 ///      drives lint D3001–D3005). A straggler that survives lint — an
 ///      extensionless shebang script, a string built at runtime — hits the
 ///      SAME rename pointer here, at the point it actually fails.
-///   2. [`FOREIGN_FUNCTION_SYNONYMS`] — the semantic answer, which beats a
+///   2. [`COLLECTION_FORM_SUGGESTIONS`] — the foreign get/set/find, where the
+///      answer is a Mix FORM (`$m[key]`, `get_or`/`require_key`, map
+///      assignment, `index_of`/`filter`), not a builtin name to swap in.
+///   3. [`FOREIGN_FUNCTION_SYNONYMS`] — the semantic answer, which beats a
 ///      closer lexical neighbour (`json_decode` → `json_parse`, not
 ///      `json_encode`).
-///   3. Nearest live name (builtin, HOF, or a caller-supplied user function)
+///   4. Nearest live name (builtin, HOF, or a caller-supplied user function)
 ///      within an edit distance that tightens for short names (≤1 for ≤4
 ///      chars, else ≤2), so `lenght`→`length` is caught but two unrelated
 ///      3-letter names are not.
@@ -3892,6 +4484,9 @@ pub(crate) fn function_suggestion<'a>(
         DEPRECATED_REGEX_CALLS.iter().find(|(n, _, _)| *n == name)
     {
         return Some(format!("deleted in mix 0.73.0; use {replacement}"));
+    }
+    if let Some((_, suggestion)) = COLLECTION_FORM_SUGGESTIONS.iter().find(|(n, _)| *n == name) {
+        return Some((*suggestion).to_string());
     }
     if let Some((_, target, caveat)) = FOREIGN_FUNCTION_SYNONYMS.iter().find(|(n, _, _)| *n == name)
     {
@@ -4337,6 +4932,86 @@ mod instructional_error_tests {
                 "{foreign} resolves already; its synonym row is dead"
             );
         }
+    }
+
+    #[test]
+    fn collection_form_names_suggest_mix_forms() {
+        // get/set/find are NOT builtins: the suggester's answer is a FORM
+        // (syntax target), not a name to swap in — the A5 extension of the
+        // shared runtime/lint seam.
+        let get = function_suggestion("get", std::iter::empty()).expect("get suggests");
+        assert!(
+            get.starts_with("Mix has no get()") && get.contains("$m[key]") && get.contains("get_or"),
+            "{get}"
+        );
+        let set = function_suggestion("set", std::iter::empty()).expect("set suggests");
+        assert!(
+            set.starts_with("Mix has no set()") && set.contains("$m[key] = value"),
+            "{set}"
+        );
+        let find = function_suggestion("find", std::iter::empty()).expect("find suggests");
+        assert!(
+            find.starts_with("Mix has no find()")
+                && find.contains("index_of")
+                && find.contains("filter"),
+            "{find}"
+        );
+    }
+
+    #[test]
+    fn every_collection_form_name_is_not_a_live_callable() {
+        // The form table is consulted only for an UNDEFINED name; a row
+        // whose name resolves somewhere would be dead and misleading.
+        for &(foreign, _) in COLLECTION_FORM_SUGGESTIONS {
+            assert!(
+                builtins::builtin_info_of(foreign).is_none()
+                    && !crate::builtins_hof::HOF_NAMES.contains(&foreign)
+                    && !INLINE_SPECIAL_FORMS.contains(&foreign)
+                    && !prelude_function_names().contains(foreign),
+                "{foreign} resolves already; its form row is dead"
+            );
+        }
+        // The builtins the forms name must stay live.
+        for live in ["get_or", "require_key", "index_of", "merge", "contains"] {
+            assert!(builtins::builtin_info_of(live).is_some(), "{live} is not a builtin");
+        }
+        assert!(
+            crate::builtins_hof::HOF_NAMES.contains(&"filter"),
+            "filter is no longer a HOF"
+        );
+    }
+
+    #[test]
+    fn lint_e1102_prints_the_form_suggestion_for_get_set_find() {
+        // The lint half of the shared seam: the E1102 hint leads with the
+        // same text the runtime appends to FUNCTION_UNDEFINED.
+        for (src, name) in [
+            ("print(get({a: 1}, \"a\"))\n", "get"),
+            ("set({a: 1}, \"a\", 2)\n", "set"),
+            ("print(find([1], 1))\n", "find"),
+        ] {
+            let runtime = undefined_function_hint(name, &fns(&[])).expect("runtime suggests");
+            let hint = e1102_hint(src).expect("E1102 fires with a hint");
+            let answer = runtime.trim_start_matches(" — ");
+            assert!(hint.starts_with(answer), "{name}: lint {hint:?} vs runtime {runtime:?}");
+            assert!(hint.contains("--allow-function"), "fallback advice kept: {hint}");
+        }
+    }
+
+    #[test]
+    fn user_defined_get_set_find_are_untouched() {
+        // A user's own get/set/find is a known callable: no E1102 and no
+        // form suggestion — the table only fires for an UNDEFINED name.
+        let src = "fn get($m, $k)\n  return $m[$k]\nend\nfn set($m, $k, $v)\n  $m[$k] = $v\n  return $m\nend\nfn find($l, $v)\n  return index_of($l, $v)\nend\nprint(get({a: 1}, \"a\"))\nprint(set({a: 1}, \"a\", 2))\nprint(find([1, 2], 1))\n";
+        let tokens = crate::lexer::Lexer::new(src).tokenize().unwrap();
+        let stmts = crate::parser::Parser::new(tokens, src)
+            .parse_program()
+            .unwrap();
+        let diags = analyze(&stmts, None, &AnalyzerConfig::default()).diagnostics;
+        assert!(
+            !diags.iter().any(|d| d.code == "MIX-E1102"),
+            "{diags:?}"
+        );
     }
 
     #[test]

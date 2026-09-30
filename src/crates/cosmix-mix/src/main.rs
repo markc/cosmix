@@ -1639,22 +1639,25 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
             // flag — share that flag so the evaluator-internal interrupt path
             // keeps working after any number of reloads.
             new_eval.set_interrupt_flag(eval.interrupt_flag());
+            // Mark the candidate so its init body can branch on
+            // `is_reload_candidate()` (passive preparation: no starts, no
+            // stopping old behaviour, no persisted writes). Cleared on
+            // success before the swap; a failed candidate is discarded
+            // with the flag set. The owner id scopes the legacy
+            // `die_with_parent` registry for generation-specific sweeps:
+            // the commit retires every OTHER owner's children (the old
+            // generation's), a revert retires exactly this candidate's.
+            new_eval.set_reload_candidate(true);
+            let candidate_owner = new_eval.native_owner_id();
 
-            // End the OLD generation's legacy die_with_parent children
-            // (without exit_event) BEFORE new init runs (review MINOR-6): an init that
-            // spawns its helper again would otherwise get a second one beside
-            // the old (the goose case — two servers, one port). The registry
-            // is process-wide, so sweeping after the commit would also end
-            // the helper the new init just started. Cost, documented: a
-            // reload that then REVERTS resumes the old script without them.
-            // Native managed children instead remain in the old evaluator's
-            // registry until its post-drain retirement; a failed candidate
-            // does not terminate them.
-            let swept = owned_spawns_sweep_count();
-            if swept > 0 {
-                tracing::info!(service = %service_name, swept,
-                    "serve: RELOAD ended the old generation's owned children");
-            }
+            // NOTE: the old generation's legacy die_with_parent children are
+            // deliberately NOT swept here (pre-init). A failed candidate
+            // reverts to the old evaluator with them intact; the committed
+            // swap sweeps them below, right before the commit hook starts
+            // the replacement's behaviour. Managed native children
+            // (exit_event) stay in the old evaluator's registry until its
+            // post-drain retirement either way — a failed candidate does
+            // not terminate them.
 
             // Execute the new init body RACED against shutdown: a new script
             // whose top-level sleeps/hangs must still yield to SIGTERM. A
@@ -1679,6 +1682,9 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
             };
             match exec_res {
                 Ok(_) => {
+                    // The candidate's init completed: it is a committed
+                    // generation from here, never a candidate again.
+                    new_eval.set_reload_candidate(false);
                     // Old evaluator's in-flight Class C work is drained with
                     // synth replies BEFORE it drops — the connection is live,
                     // so a stranded caller gets a terminal reply, not silence.
@@ -1697,6 +1703,28 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
                     // sees it advance exactly once per live swap, never on a
                     // refused or reverted reload.
                     identity.committed_reload();
+                    // Retire the old generation's legacy die_with_parent
+                    // children AFTER the swap committed and the old managed
+                    // children were reaped — and BEFORE the commit hook can
+                    // start the replacement's behaviour, so old and new
+                    // behaviour never overlap. Scoped: the candidate's own
+                    // init-time starts (owner == candidate_owner) survive.
+                    let swept = match owned_spawns_sweep_except(candidate_owner).await {
+                        Ok(swept) => swept,
+                        Err(error) => {
+                            tracing::error!(service = %service_name, %error,
+                                "serve: child retirement failed; stopping before commit hook");
+                            break ServeOutcome::Error;
+                        }
+                    };
+                    if swept > 0 {
+                        tracing::info!(service = %service_name, swept,
+                            "serve: RELOAD ended the old generation's owned children");
+                    }
+                    // Queue the local, native-only commit event. The pump
+                    // dispatches it on the next loop iteration, independent
+                    // of the broker connection; exactly one per generation.
+                    eval.queue_lifecycle_commit(identity.generation());
                     tracing::info!(
                         service = %service_name,
                         handler_count = eval.handler_count(),
@@ -1711,10 +1739,18 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
                     // the resumed old one.
                     let drained = new_eval.drain_class_c_for_shutdown(reload_drain, true).await;
                     new_eval.close_native_events();
-                    // The old generation's legacy owned children were swept before
-                    // this init ran, so the registry now holds ONLY what the
-                    // failed init spawned: sweeping here is exact (review R1).
-                    let swept = owned_spawns_sweep_count();
+                    // Sweep exactly what the failed candidate spawned: its
+                    // legacy die_with_parent starts would otherwise leak.
+                    // The old generation's registry entries are untouched —
+                    // it resumes with its children intact.
+                    let swept = match owned_spawns_sweep_by(candidate_owner).await {
+                        Ok(swept) => swept,
+                        Err(error) => {
+                            tracing::error!(service = %service_name, %error,
+                                "serve: candidate child retirement failed; stopping");
+                            break ServeOutcome::Error;
+                        }
+                    };
                     tracing::error!(service = %service_name, error = %format!("{e}"),
                         aborted = drained.aborted, synth_sent = drained.synth_sent, swept,
                         "serve: reload REVERTED — new init body failed; old script resumes with state intact");
@@ -2018,6 +2054,35 @@ pub(crate) fn owned_spawns_sweep_count() -> usize {
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn owned_spawns_sweep_count() -> usize {
     0
+}
+
+/// Generation-scoped retire for the hot-reload commit: end every legacy
+/// `die_with_parent` child except the replacement evaluator's own
+/// init-time starts, reporting how many groups were signalled.
+#[cfg(target_os = "linux")]
+pub(crate) async fn owned_spawns_sweep_except(owner: u64) -> Result<usize, tokio::task::JoinError> {
+    // Creation stays on the long-lived evaluation thread (PDEATHSIG's
+    // owner). Retirement owns only Send-safe pids; keep its bounded
+    // blocking grace off that thread while it remains alive awaiting us.
+    tokio::task::spawn_blocking(move || cosmix_mix::builtins::owned_spawns::sweep_owned_except(owner)).await
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) async fn owned_spawns_sweep_except(_owner: u64) -> Result<usize, tokio::task::JoinError> {
+    Ok(0)
+}
+
+/// Generation-scoped retire for a failed reload candidate: end exactly the
+/// legacy `die_with_parent` children the discarded candidate spawned,
+/// leaving the old generation's registrations running.
+#[cfg(target_os = "linux")]
+pub(crate) async fn owned_spawns_sweep_by(owner: u64) -> Result<usize, tokio::task::JoinError> {
+    tokio::task::spawn_blocking(move || cosmix_mix::builtins::owned_spawns::sweep_owned_by(owner)).await
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) async fn owned_spawns_sweep_by(_owner: u64) -> Result<usize, tokio::task::JoinError> {
+    Ok(0)
 }
 
 /// The evaluation thread's body: run, then end `spawn(argv, {die_with_parent:

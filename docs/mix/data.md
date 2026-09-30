@@ -601,7 +601,9 @@ end
 
 `csv_parse(string[, delim])` reads the **first line as a header** and returns a
 list of maps keyed by those headers. Fields are trimmed. The optional second
-argument is a one-character delimiter (default `,`).
+argument is a single-byte delimiter (default `,`); anything else —
+an empty or multi-byte string, a non-string, or `nil` — raises
+TYPE_MISMATCH instead of silently defaulting or truncating.
 
 ```mix
 $rows = csv_parse("name,port\nalpha,25\nbeta,143")
@@ -629,9 +631,10 @@ print($rows[0].b)
 
 Three sharp edges: the parser is a **naive split** — no RFC-4180 quote handling,
 so a quoted field containing the delimiter splits in two (`"x,y"` becomes the
-fields `"x` and `y"`); only the **first character** of the delimiter argument is
-used; and a row with more fields than headers keys the extras by 0-based field
-index (`col1`, `col2`, …). Blank lines are skipped.
+fields `"x` and `y"`); `delim` must be **exactly one ASCII byte** and not NUL,
+CR, LF or a double quote (anything else raises TYPE_MISMATCH); and a row with
+more fields than headers keys the extras by 0-based field index (`col1`,
+`col2`, …). Blank lines are skipped.
 
 `ini_parse(string)` reads `[section]` headers and `key = value` lines into a
 nested map. Lines starting `#` or `;` are comments. Keys before any section land

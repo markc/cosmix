@@ -581,11 +581,24 @@ the holder name in <code>scenes.list</code> and <code>scenes.changed</code>; it 
 name-release event without a timeout loop.
 Each name in a filesystem batch or rescan has its own error boundary,
 so one refused unload does not discard the rest of the batch.</p>
-<p>Loader <code>RELOAD</code> is refused during candidate initialisation, before filesystem
-or process side effects; the old evaluator continues serving. Restart the
-loader process to update its script. Native Mix currently has no post-commit
-hook for starting replacement children after the old registry retires.
-<code>scenes.reload {name}</code> still replaces an individual behaviour normally.</p>
+<p>Loader <code>RELOAD</code> is a genuine post-commit handover, not a refusal. The
+candidate branches on <code>is_reload_candidate()</code> and prepares passive state:
+it reads and validates the state file and every enabled scene's document,
+metadata and behaviour — local checks plus the host's read-only
+<code>shell.scene.validate</code> — and refuses the swap if any of them would not
+survive it. A refused candidate mounts nothing, starts nothing and writes
+nothing; the old evaluator continues serving with its children intact.
+On a successful swap the runtime reaps the old managed children and retires
+the old generation's legacy children BEFORE the commit hook runs, bumps
+<code>lifecycle.generation</code>, then queues <code>on lifecycle.commit</code> exactly once per
+committed generation: the loader reconciles durable desired state (a full
+rescan plus the service snapshot), mounting accepted content and starting
+each enabled behaviour exactly once, with fresh generation tags so a
+retired generation's <code>proc.exited</code> events cannot reach its successors.
+The hook is native-only — a wire-delivered <code>lifecycle.commit</code> is refused by
+the runtime — and a fault in it is a diagnostic the existing
+restart/reconnect reconciliation recovers. <code>scenes.reload {name}</code> still
+replaces an individual behaviour normally.</p>
 <p>Managed spawn uses <code>{die_with_parent:true,exit_event:true,tag:&lt;JSON string&gt;}</code>.
 The string encodes <code>{name,generation}</code>; <code>on proc.exited</code> receives
 <code>{pid,tag,exit_code,signal}</code> in <code>$event.args</code>. A crash leaves the scene mounted.

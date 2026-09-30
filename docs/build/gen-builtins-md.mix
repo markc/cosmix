@@ -1,5 +1,5 @@
 #!/usr/bin/env mix
--- version: 0.1.0
+-- version: 0.1.1
 -- gen-builtins-md.mix — regenerate docs/mix/builtins.md's category
 -- listings from the binary's own `mix builtins --json`.
 --
@@ -68,19 +68,11 @@ $known = {}
 for $s in $sections
   $known[$s.cat] = true
 end
-$by_cat = {}
 for $b in $all
   if $known[$b.category] == nil then
     die("unmapped builtin category '" .. $b.category .. "' (" .. $b.name ..
         ") — extend the sections map in gen-builtins-md.mix")
   end
-  if $by_cat[$b.category] == nil then
-    $by_cat[$b.category] = []
-  end
-  -- push() through an index mutates a temporary copy (MIX-E1501, and it
-  -- really did empty every section on this script's first run) — assign
-  -- the returned list back.
-  $by_cat[$b.category] = push($by_cat[$b.category], $b)
 end
 
 fn section_text($s, $entries)
@@ -118,8 +110,13 @@ $head = re_replace_must($head,
 
 $mid = ""
 for $s in $sections
-  $entries = $by_cat[$s.cat]
-  if $entries == nil then
+  -- push mutates a named list and returns nil. Group in a local binding
+  -- instead of assigning that nil into an indexed map slot.
+  $entries = []
+  for $b in $all
+    if $b.category == $s.cat then push($entries, $b) end
+  end
+  if len($entries) == 0 then
     die("category '" .. $s.cat .. "' in the sections map has no builtins — remove it or fix the map")
   end
   $mid = $mid .. section_text($s, $entries)

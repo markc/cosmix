@@ -855,6 +855,9 @@ files as styled HTML — <code>http_serve("docs/mix", {render_md: true})</code> 
 the raw manual <code>.md</code> files (but not the site's HTML shell, whose assets
 live at the site root — serve the whole <code>docs/</code> tree, not a subdirectory,
 if you want the interactive site).</p>
+<p>The boolean options (<code>listing</code>, <code>render_md</code>, <code>clean_urls</code>) take a real
+<code>bool</code> only — <code>"false"</code>, <code>1</code> or <code>nil</code> raise <code>TYPE_MISMATCH</code> before the
+listener binds, never a truthiness read.</p>
 <blockquote>
 <p><strong>Serving a subdirectory of a larger site?</strong> A page that references
 root-absolute assets (<code>/web/style.css</code>) 404s them when the served root

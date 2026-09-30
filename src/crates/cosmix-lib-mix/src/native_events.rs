@@ -586,7 +586,12 @@ pub(crate) fn json_value(v: serde_json::Value) -> Value {
     }
 }
 
-#[derive(Default)]
+/// Per-evaluator owner id for generation-scoped legacy child retirement
+/// (`builtins::owned_spawns`): a serve hot-reload retires legacy
+/// `die_with_parent` children by evaluator generation, and every evaluator —
+/// including reload candidates — gets a fresh id.
+static NEXT_OWNER_ID: AtomicU64 = AtomicU64::new(1);
+
 pub(crate) struct NativeEvents {
     pub queue: Arc<Queue>,
     pumping: Rc<Cell<bool>>,
@@ -597,9 +602,31 @@ pub(crate) struct NativeEvents {
     /// Subscribed sockets (ws_on/tcp_on), owned by this generation.
     #[cfg(feature = "ws")]
     pub(crate) sockets: BTreeMap<String, crate::builtins::socket_sources::SocketSource>,
+    owner_id: u64,
+}
+
+impl Default for NativeEvents {
+    fn default() -> Self {
+        NativeEvents {
+            queue: Arc::new(Queue::default()),
+            pumping: Rc::new(Cell::new(false)),
+            watches: BTreeSet::new(),
+            filesystem: None,
+            children: Vec::new(),
+            desktop: BTreeMap::new(),
+            #[cfg(feature = "ws")]
+            sockets: BTreeMap::new(),
+            owner_id: NEXT_OWNER_ID.fetch_add(1, Ordering::Relaxed),
+        }
+    }
 }
 
 impl NativeEvents {
+    /// This evaluator generation's owner id (see [`NEXT_OWNER_ID`]).
+    pub(crate) fn owner_id(&self) -> u64 {
+        self.owner_id
+    }
+
     pub fn enter_pump(&self) -> MixResult<PumpGuard> {
         if self.pumping.replace(true) {
             return Err(refusal(
@@ -1103,6 +1130,7 @@ mod tests {
             desktop: BTreeMap::new(),
             #[cfg(feature = "ws")]
             sockets: BTreeMap::new(),
+            owner_id: 0,
         };
         registry.remove_pending("test");
         q.change("test", Some(change("late".into())), true);

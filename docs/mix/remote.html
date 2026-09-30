@@ -637,13 +637,19 @@ above. This section supplies the remaining option and decoding contract.</p>
 lint parses it when it is a <strong>literal</strong> — a string, an inline heredoc, or a
 variable bound exactly once to either — and reports its diagnostics
 against your file, prefixed <code>[inside ssh_mix body]</code>, at mapped line numbers.
-Names in the body resolve against the body itself, the builtins, and the
-call's <code>bindings</code>/<code>env</code> keys, so an unbound <code>$name</code> or a helper that exists
-only in the calling file is reported. A body it cannot read — any other
-variable, a concatenation, an interpolated string, a <code>read_file</code>, or a
-literal that does not parse — is reported as <strong><code>MIX-D3012</code></strong> rather than
-passing silently. Prefer a literal and the <a href="/mix/remote#options-map"><code>bindings</code></a>
-option over interpolation: it is both safer (no injection through string
+A double-quoted body whose lines are <code>\n</code> escapes reports everything on
+the one physical line the literal occupies; a physically multi-line
+literal and a heredoc map line-for-line. Names in the body resolve
+against the body itself, the builtins, and the call's <code>bindings</code>/<code>env</code>
+keys — the opts argument is read statically when it is a map literal or
+a variable bound exactly once to one. When the opts cannot be read, only
+undefined-<strong>variable</strong> checks stand down (<code>MIX-D3018</code>): a function name
+cannot ride in through strict-data bindings, so undefined-function
+checks still run. A body lint cannot read — any other variable, a
+concatenation, an interpolated string, a <code>read_file</code>, or a literal that
+does not parse — is reported as <strong><code>MIX-D3012</code></strong> rather than passing
+silently. Prefer a literal and the <a href="/mix/remote#options-map"><code>bindings</code></a> option
+over interpolation: it is both safer (no injection through string
 building) and the only form lint can check. See
 <a href="/mix/lint#remote-bodies--lint-sees-inside-ssh_mix-0690">lint</a>.</p>
 </blockquote>
