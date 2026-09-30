@@ -1782,23 +1782,20 @@ dependencies = [
 
 [[package]]
 name = "cosmix-mcp"
-version = "0.7.0"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "cosmix-lib-buildinfo",
- "cosmix-lib-bus",
  "cosmix-lib-client",
  "cosmix-lib-config",
  "cosmix-lib-log",
  "cosmix-lib-mix",
  "cosmix-lib-skills",
  "glob",
- "libc",
  "rmcp",
  "schemars",
  "serde",
  "serde_json",
- "tempfile",
  "tokio",
  "tracing",
 ]
@@ -6228,7 +6225,6 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
- "tokio-stream",
  "tokio-util",
  "tracing",
  "uuid",
