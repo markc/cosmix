@@ -11078,23 +11078,29 @@ fn plan_ssh_mix(args: Vec<Value>) -> MixResult<(SshCall, Option<String>)> {
         },
     };
     // A1 step 1 (TODO-mix strict-arity sweep): strict_arity rides the
-    // remote argv as the `--strict-arity` flag. It must come BEFORE the
-    // `-` stdin marker — everything after `-` is a script argument, which
-    // is exactly the trailing-flag trap the main-binary warning now names.
-    let strict_arity = match opts_map.shift_remove("strict_arity") {
-        None | Some(Value::Nil) => false,
-        Some(Value::Bool(b)) => b,
+    // remote argv as an arity flag. It must come BEFORE the `-` stdin
+    // marker — everything after `-` is a script argument, which is
+    // exactly the trailing-flag trap the main-binary warning now names.
+    // Three states: absent → the remote DEFAULT applies (strict since
+    // 0.103.0); true → explicit --strict-arity (harmless under the flip);
+    // false → --compat-arity, the escape hatch — an explicit false that
+    // emitted the plain default would silently stay strict (gemini-pro
+    // 2026-09-30 consolidated review).
+    let mut strict_arity: Option<bool> = None;
+    match opts_map.shift_remove("strict_arity") {
+        None | Some(Value::Nil) => {}
+        Some(Value::Bool(b)) => strict_arity = Some(b),
         Some(other) => {
             return Err(MixError::RuntimeError {
                 span: None,
                 msg: format!("ssh_mix: strict_arity must be a bool, got {}", other.type_name()),
             });
         }
-    };
-    let remote_cmd = if strict_arity {
-        "/opt/cosmix/bin/mix --strict-arity -".to_string()
-    } else {
-        REMOTE_MIX_STDIN_CMD.to_string()
+    }
+    let remote_cmd = match strict_arity {
+        Some(true) => "/opt/cosmix/bin/mix --strict-arity -".to_string(),
+        Some(false) => "/opt/cosmix/bin/mix --compat-arity -".to_string(),
+        None => REMOTE_MIX_STDIN_CMD.to_string(),
     };
     opts_map.insert(
         "stdin".into(),
@@ -22894,15 +22900,26 @@ mod ssh_helpers_tests {
         .expect("plan");
         let remote = call.argv.last().expect("argv ends with the command");
         assert_eq!(remote, "/opt/cosmix/bin/mix --strict-arity -");
-        // Without the opt the command is unchanged.
+        // An EXPLICIT false is the escape hatch — the flipped remote
+        // default would otherwise stay strict (gemini-pro consolidated
+        // review, 2026-09-30).
         let (call2, _) = super::plan_ssh_mix(vec![
+            Value::String("h".into()),
+            Value::String("print(1)".into()),
+            m(&[("strict_arity", Value::Bool(false))]),
+        ])
+        .expect("plan");
+        let remote2 = call2.argv.last().expect("argv ends with the command");
+        assert_eq!(remote2, "/opt/cosmix/bin/mix --compat-arity -");
+        // Absent opt: the remote default applies.
+        let (call3, _) = super::plan_ssh_mix(vec![
             Value::String("h".into()),
             Value::String("print(1)".into()),
             m(&[]),
         ])
         .expect("plan");
-        let remote2 = call2.argv.last().expect("argv ends with the command");
-        assert_eq!(remote2, super::REMOTE_MIX_STDIN_CMD);
+        let remote3 = call3.argv.last().expect("argv ends with the command");
+        assert_eq!(remote3, super::REMOTE_MIX_STDIN_CMD);
     }
 
     #[test]
