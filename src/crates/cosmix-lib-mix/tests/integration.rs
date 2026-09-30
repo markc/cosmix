@@ -878,7 +878,7 @@ async fn is_reload_candidate_reflects_the_serve_driver_flag() {
         .unwrap();
 
     assert!(
-        matches!(eval.get_global("candidate"), None),
+        eval.get_global("candidate").is_none(),
         "no read before execution (plain scripts are never candidates)"
     );
     eval.set_reload_candidate(true);
