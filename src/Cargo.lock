@@ -1532,7 +1532,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-mix"
-version = "0.103.13"
+version = "0.103.14"
 dependencies = [
  "base64 0.22.1",
  "bcrypt",
@@ -1858,7 +1858,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-mix"
-version = "0.103.13"
+version = "0.103.14"
 dependencies = [
  "blake3",
  "chrono",
@@ -6428,7 +6428,7 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.13"
+version = "0.103.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
 dependencies = [
