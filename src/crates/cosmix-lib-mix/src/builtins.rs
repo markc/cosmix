@@ -12742,6 +12742,14 @@ fn builtin_tty_mode(args: Vec<Value>) -> MixResult<Option<Value>> {
     };
     #[cfg(unix)]
     {
+        // Validate the mode BEFORE any syscall — `tty_mode("bogus")` names
+        // the bad mode whether or not stdin is a terminal.
+        if mode != "raw" && mode != "cooked" {
+            return Err(MixError::RuntimeError {
+                span: None,
+                msg: format!("tty_mode(): unknown mode {mode:?} — use \"raw\" or \"cooked\""),
+            });
+        }
         if unsafe { libc::isatty(0) } != 1 {
             return Err(MixError::RuntimeError {
                 span: None,
@@ -12788,12 +12796,7 @@ fn builtin_tty_mode(args: Vec<Value>) -> MixResult<Option<Value>> {
                     });
                 }
             }
-            other => {
-                return Err(MixError::RuntimeError {
-                    span: None,
-                    msg: format!("tty_mode(): unknown mode {other:?} — use \"raw\" or \"cooked\""),
-                });
-            }
+            _ => unreachable!("mode validated above"),
         }
     }
     #[cfg(not(unix))]
