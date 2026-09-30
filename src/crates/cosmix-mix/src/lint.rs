@@ -424,6 +424,17 @@ fn lint_one(
             hint: None,
         })
     };
+    // AMP scene envelope (2026-09-26 entry): a `---` front-matter header
+    // (YAML scene metadata, opaque to Mix) followed by a ```mix-fenced
+    // map. The script lexer has no backtick token, so it E1003s on the
+    // fence; the fenced map is Mix strict data, so lint validates it as
+    // data instead of failing every scene file.
+    if let Some(body) = amp_strict_data(source) {
+        return match cosmix_mix::parse_data(&body) {
+            Ok(_) => Ok(LintOutcome::StrictData),
+            Err(e) => Err(Box::new(strict_data_diagnostic(e, file))),
+        };
+    }
     let tokens = match cosmix_mix::lexer::Lexer::new(source).tokenize() {
         Ok(t) => t,
         Err(MixError::LexerError { msg, span }) => {
@@ -495,6 +506,25 @@ fn strict_data_fallback(
         }
         Err(_) => Err(script_diag),
     }
+}
+
+/// Extract the strict-data body of an AMP scene envelope, or `None` when
+/// the source is not one. An envelope is a `---` front-matter header
+/// (YAML scene metadata, opaque to Mix) followed by a ````mix-fenced map;
+/// only the fenced map is Mix strict data, so lint validates that alone.
+fn amp_strict_data(source: &str) -> Option<String> {
+    let fence = "```mix";
+    let fence_at = source.find(fence)?;
+    // Fenced body: after the fence line's newline, up to the closing
+    // ``` line.
+    let rest = &source[fence_at + fence.len()..];
+    let body_start = rest.find('\n').map(|i| i + 1).unwrap_or(0);
+    let close_at = rest[body_start..].find("\n```")?;
+    let body = rest[body_start..body_start + close_at].trim();
+    if body.is_empty() {
+        return None;
+    }
+    Some(body.to_string())
 }
 
 /// A successful strict-data parse is decisive. When both grammars fail,

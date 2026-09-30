@@ -135,3 +135,25 @@ fn assignment_chain_json_carries_a_position_and_bare_prose() {
         "message must be the bare diagnostic, not the Display prefix:\n{stdout}"
     );
 }
+
+#[test]
+fn amp_scene_envelope_lints_as_strict_data() {
+    // 2026-09-26 entry: an AMP scene file (--- front matter, then a
+    // ```mix-fenced map) used to E1003 on the fence. It must validate as
+    // strict data instead.
+    let dir = TempDir::new();
+    let path = dir.write(
+        "panel-empty.scene.mix",
+        "---\nscene: 1\nname: panel\ncitizen: scene-fixture\nwindow: {\"chrome\": false}\n---\n```mix\nroot: {\"align\": \"center\"}\nclock: {\"text\": \"12:00 am\"}\n```\n",
+    );
+    let out = lint(&path);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("validated as strict data (not as a script)"),
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("0 error(s), 0 warning(s)"), "stdout:\n{stdout}");
+    assert!(!stdout.contains("MIX-E1003"), "stdout:\n{stdout}");
+    assert!(out.stderr.is_empty());
+}
