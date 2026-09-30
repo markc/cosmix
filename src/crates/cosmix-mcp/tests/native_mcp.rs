@@ -633,39 +633,43 @@ async fn native_mcp_acceptance() {
     );
 
     // Cancellation must kill the evaluator AND its inherited process group.
-    let started = fixture.dir.path().join("worker-started");
-    let escaped = fixture.dir.path().join("worker-escaped");
-    let nested = format!(
-        "write_file({},\"started\"); sleep(3); write_file({},\"escaped\")",
-        serde_json::to_string(&started).unwrap(),
-        serde_json::to_string(&escaped).unwrap()
-    );
-    let script = format!(
-        "run_stream([\"/opt/cosmix/bin/mix\",\"-c\",{}])",
-        serde_json::to_string(&nested).unwrap()
-    );
-    let params = CallToolRequestParams::new("mix_execute")
-        .with_arguments(json!({"script":script}).as_object().unwrap().clone());
-    let cancelled = fixture
-        .client
-        .send_request_with_option(
-            ClientRequest::CallToolRequest(CallToolRequest::new(params)),
-            PeerRequestOptions::with_timeout(Duration::from_secs(1)),
-        )
-        .await
-        .unwrap()
-        .await_response()
-        .await;
-    assert!(cancelled.is_err());
-    assert!(
-        started.is_file(),
-        "worker never started; cancellation assertion would be vacuous"
-    );
-    tokio::time::sleep(Duration::from_millis(3200)).await;
-    assert!(
-        !escaped.exists(),
-        "cancelled worker descendant continued executing"
-    );
+    // run_argv starts a separate child group: its native parent-death
+    // backstop must also work when the evaluator is terminated.
+    for runner in ["run_stream", "run_argv"] {
+        let started = fixture.dir.path().join(format!("{runner}-started"));
+        let escaped = fixture.dir.path().join(format!("{runner}-escaped"));
+        let nested = format!(
+            "write_file({},\"started\"); sleep(3); write_file({},\"escaped\")",
+            serde_json::to_string(&started).unwrap(),
+            serde_json::to_string(&escaped).unwrap()
+        );
+        let script = format!(
+            "{runner}([\"/opt/cosmix/bin/mix\",\"-c\",{}])",
+            serde_json::to_string(&nested).unwrap()
+        );
+        let params = CallToolRequestParams::new("mix_execute")
+            .with_arguments(json!({"script":script}).as_object().unwrap().clone());
+        let cancelled = fixture
+            .client
+            .send_request_with_option(
+                ClientRequest::CallToolRequest(CallToolRequest::new(params)),
+                PeerRequestOptions::with_timeout(Duration::from_secs(1)),
+            )
+            .await
+            .unwrap()
+            .await_response()
+            .await;
+        assert!(cancelled.is_err());
+        assert!(
+            started.is_file(),
+            "worker never started; cancellation assertion would be vacuous"
+        );
+        tokio::time::sleep(Duration::from_millis(3200)).await;
+        assert!(
+            !escaped.exists(),
+            "cancelled worker descendant continued executing"
+        );
+    }
 
     fixture.observer.0.lock().unwrap().clear();
     let handle = fixture
