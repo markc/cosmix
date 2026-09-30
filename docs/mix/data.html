@@ -888,7 +888,9 @@ silently-lossy text (where <code>json_encode</code> degrades functions/bytes to 
 <h2 id="csv--ini--text-tables-and-config">CSV &amp; INI — text tables and config</h2>
 <p><code>csv_parse(string[, delim])</code> reads the <strong>first line as a header</strong> and returns a
 list of maps keyed by those headers. Fields are trimmed. The optional second
-argument is a one-character delimiter (default <code>,</code>).</p>
+argument is a single-byte delimiter (default <code>,</code>); anything else —
+an empty or multi-byte string, a non-string, or <code>nil</code> — raises
+TYPE_MISMATCH instead of silently defaulting or truncating.</p>
 <pre><code class="language-mix">$rows = csv_parse("name,port\nalpha,25\nbeta,143")
 print($rows[0].name)
 print($rows[1].port)
@@ -907,9 +909,10 @@ print($rows[0].b)
 </code></pre>
 <p>Three sharp edges: the parser is a <strong>naive split</strong> — no RFC-4180 quote handling,
 so a quoted field containing the delimiter splits in two (<code>"x,y"</code> becomes the
-fields <code>"x</code> and <code>y"</code>); only the <strong>first character</strong> of the delimiter argument is
-used; and a row with more fields than headers keys the extras by 0-based field
-index (<code>col1</code>, <code>col2</code>, …). Blank lines are skipped.</p>
+fields <code>"x</code> and <code>y"</code>); <code>delim</code> must be <strong>exactly one ASCII byte</strong> and not NUL,
+CR, LF or a double quote (anything else raises TYPE_MISMATCH); and a row with
+more fields than headers keys the extras by 0-based field index (<code>col1</code>,
+<code>col2</code>, …). Blank lines are skipped.</p>
 <p><code>ini_parse(string)</code> reads <code>[section]</code> headers and <code>key = value</code> lines into a
 nested map. Lines starting <code>#</code> or <code>;</code> are comments. Keys before any section land
 under <code>_global</code>.</p>

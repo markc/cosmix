@@ -1567,6 +1567,7 @@ dependencies = [
  "quick-xml 0.41.0",
  "rand 0.9.5",
  "regex",
+ "ring",
  "rusqlite",
  "rustls",
  "rustls-pemfile",

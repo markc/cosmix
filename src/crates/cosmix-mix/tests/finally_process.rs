@@ -11,8 +11,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 fn run_args(args: &[&str], stdin: Option<&str>) -> Output {
+    // Exercise the entrypoint without sourcing the operator's own .mixrc.
+    let fixture_home = tempfile::tempdir().expect("temporary home");
     let mut child = Command::new(env!("CARGO_BIN_EXE_mix"))
         .args(args)
+        .env("HOME", fixture_home.path())
         .env("MIX_STATS", "off")
         .stdin(if stdin.is_some() {
             Stdio::piped()

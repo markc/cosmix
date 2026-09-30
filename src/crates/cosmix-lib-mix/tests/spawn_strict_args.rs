@@ -420,11 +420,14 @@ async fn every_non_string_cmd_type_raises() {
             "spawn({literal}) error must name the expected type, got: {msg}"
         );
     }
-    // nil is the omitted-arg sentinel: the contract gate lets it through,
-    // and spawn's own check names the string requirement.
+    // A6: nil is NOT an omitted-arg sentinel here — the cmd slot is a real
+    // string/list(string) position, and the contract gate (Process is a
+    // critical class, checked in every mode) refuses the nil with the same
+    // message shape as every other wrong type, so nil can never become a
+    // literal "nil" command or path.
     let err = run_err("spawn(nil)\n").await;
     assert!(
-        err.to_string().contains("cmd must be a string"),
+        err.to_string().contains("argument 1 (cmd) must be"),
         "spawn(nil) must raise, got: {err}"
     );
 }

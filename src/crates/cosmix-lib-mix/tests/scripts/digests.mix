@@ -70,8 +70,8 @@ catch $msg, $err
   print($msg)
 end
 -- `raw` selects the RETURN TYPE, so it is a STRICT bool: a truthy non-bool
--- is refused rather than guessed. (bytes_to_string's `lossy` takes is_truthy;
--- that flag only picks a decode mode, so it can afford to.)
+-- is refused rather than guessed. (bytes_to_string's `lossy` is a strict bool
+-- too, for the same reason — a wrong value raises instead of guessing.)
 try
   hash_sha256($abc, {raw: "false"})
 catch $msg, $err
@@ -115,5 +115,5 @@ end
 -- hash_sha1() expects at most 2 argument(s), got 3
 -- OPTION_INVALID
 -- string bytes
--- TYPE_MISMATCH hash_file(): argument 2 (algo) must be string, got map (see: mix man io)
+-- TYPE_MISMATCH hash_file(): argument 2 (algo) must be string | nil, got map (see: mix man system) — one of "md5", "sha1", "sha256" or "blake3"; a map here is the options map placed one position early — write hash_file(path, "sha256", {raw: true})
 -- hash_file: unknown algorithm 'sha512' (expected "md5", "sha1", "sha256" or "blake3")

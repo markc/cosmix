@@ -307,6 +307,7 @@ fn row_json(row: &EntryRow) -> serde_json::Value {
                 "required": a.required,
                 "variadic": a.variadic,
                 "kind": shape_json(&a.kind),
+                "hint": c.arg_hint(a.name),
             }))
             .collect::<Vec<_>>(),
         "returns": shape_json(&c.returns),
@@ -3580,6 +3581,10 @@ mod builtins_introspection_tests {
         assert_eq!(print["kind"], "statement");
         assert_eq!(print["capability"], "statement");
         assert_eq!(print["arity"]["max"], serde_json::Value::Null);
+        let write_file = arr.iter().find(|e| e["name"] == "write_file").unwrap();
+        assert_eq!(write_file["args"][1]["name"], "data");
+        assert!(write_file["args"][1]["hint"].as_str().unwrap().contains("encode it first"));
+        assert_eq!(substr["args"][0]["hint"], serde_json::Value::Null);
     }
 
     /// `--data` must be strict-data parseable and mirror the JSON count.
