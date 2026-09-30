@@ -3279,7 +3279,8 @@ struct RecordedOrigin {
 /// [`source_literal_maps`]; the pairing half is the walk there.
 fn recorded_literal_origins(source: &str, stmts: &[Stmt]) -> Option<Vec<RecordedOrigin>> {
     let (tokens, by_offset) = crate::lexer::Lexer::lex_with_literal_maps(source)?;
-    let mut parser = crate::parser::Parser::new(tokens, source).with_literal_origin_recording();
+    let mut parser = crate::parser::Parser::new_speculative(tokens, source)
+        .with_literal_origin_recording();
     let parsed = parser.parse_program().ok()?;
     // Literal text alone cannot prove correspondence: two different trees
     // can contain the same sequence of strings. Require the whole source
