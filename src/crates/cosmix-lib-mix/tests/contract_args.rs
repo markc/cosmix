@@ -41,12 +41,20 @@ async fn critical_class_types_gate_in_every_mode() {
 #[tokio::test]
 async fn pure_builtin_types_gate_only_under_strict_mode() {
     // len(v) — Pure — gates under strict mode only in this first
-    // release; the compatible mode keeps whatever len(3) used to do.
+    // release; in compatible mode the gate stays silent and the call
+    // falls through to len's own behavior (which refuses a number with
+    // ITS message, not the contract gate's).
     let err = run("print(len(3))", true)
         .await
         .expect_err("strict mode gates pure types");
     assert!(err.contains("must be string | list | map | bytes | buffer"), "got: {err}");
-    run("print(len(3))", false).await.expect("compat mode leaves pure types alone");
+    let err = run("print(len(3))", false)
+        .await
+        .expect_err("len(3) still fails — but on len's own terms");
+    assert!(
+        !err.contains("must be string | list | map | bytes | buffer"),
+        "the contract gate must not fire in compatible mode: {err}"
+    );
 }
 
 #[tokio::test]
