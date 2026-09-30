@@ -376,6 +376,7 @@ builtin_table! {
     ("http_get", CapabilityClass::Network,        "system",  "HTTP GET. http_get(url, [headers], [{timeout, ssl_verify, ca_file, ca_pem}] — timeout default 30, 0 disables; ssl_verify default true, false skips TLS cert/hostname checks like curl -k; ca_file/ca_pem ADD a private CA to the default roots — mutually exclusive with each other and with ssl_verify:false, 4 MiB cap, bad PEM raises HTTP_TLS, v0.29.0) → {status, body, bytes, headers, final_url, duration_ms, error_code, error} (headers lowercase-name→list; final_url after redirects; transport failure = status:0 + HTTP_* error_code; v0.30.0). `body` is the response decoded as UTF-8 (nil if not valid UTF-8); `bytes` is the raw byte buffer. Response bodies are capped at 64 MiB (over-cap → {status:0, error}).", contract!((url: string, headers?: map, opts?: map) -> map("http_response", {status: number, body: any, bytes: bytes, headers: map, final_url: string, duration_ms: number, error_code: any, error: any}); effects[must_use, blocking]; failure[returns_result]; cond_caps[ca_file: FsRead])),
     ("http_post", CapabilityClass::Network,       "system",  "HTTP POST. http_post(url, body, [headers], [{timeout, ssl_verify, ca_file, ca_pem}]) → {status, body, bytes, headers, final_url, duration_ms, error_code, error} (headers lowercase-name→list; final_url after redirects; transport failure = status:0 + HTTP_* error_code; v0.30.0). Opts (incl. ssl_verify: false → skip TLS verification like curl -k) and `body`/`bytes` semantics (incl. the 64 MiB body cap) match http_get.", contract!((url: string, body: any, headers?: map, opts?: map) -> map("http_response", {status: number, body: any, bytes: bytes, headers: map, final_url: string, duration_ms: number, error_code: any, error: any}); effects[must_use, blocking]; failure[returns_result]; cond_caps[ca_file: FsRead])),
     ("http_request", CapabilityClass::Network,    "system",  "HTTP any-verb. http_request(method, url, [body], [headers], [{timeout, ssl_verify, ca_file, ca_pem}]) → {status, body, bytes, headers, final_url, duration_ms, error_code, error} (headers lowercase-name→list; final_url after redirects; transport failure = status:0 + HTTP_* error_code; v0.30.0). Opts (incl. ssl_verify: false → skip TLS verification like curl -k) and `body`/`bytes` semantics (incl. the 64 MiB body cap) match http_get.", contract!((method: string, url: string, body?: any, headers?: map, opts?: map) -> map("http_response", {status: number, body: any, bytes: bytes, headers: map, final_url: string, duration_ms: number, error_code: any, error: any}); effects[must_use, blocking]; failure[returns_result]; cond_caps[ca_file: FsRead])),
+    ("http_post_multipart", CapabilityClass::Network, "system", "HTTP POST with a multipart/form-data body: http_post_multipart(url, fields, files, [headers], [opts]) → http_response map. `fields` is a map of string form fields; `files` is a map of field_name → {filename, content_type?, data: bytes|buffer} (raw binary payloads, the webhook/file-upload slot — v0.103.12). The boundary is generated, and the Content-Type header is set accordingly.", contract!((url: string, fields: map, files: map, headers?: map, opts?: map) -> map("http_response", {status: number, body: any, bytes: bytes, headers: map, final_url: string, duration_ms: number, error_code: any, error: any}); effects[must_use, blocking]; failure[returns_result]; cond_caps[ca_file: FsRead])),
     ("http_put_file", CapabilityClass::Network, "system", "Stream a regular file or inclusive range with exact Content-Length. Opts: method PUT/POST/PATCH (default PUT), range:{start,end}, headers, idle_timeout (seconds, default 30), deadline (seconds, default 0), ssl_verify, ca_file, ca_pem. Redirects disabled; 3xx returned. Deadline is cooperative and best-effort during blocking DNS/IO. Fixed 64 KiB transfer buffer; response capped at 64 MiB. Operational errors return status:0; invalid options raise. bytes_written counts source bytes consumed, size is window size, blake3 hashes that window (nil on failure). published is false (no local publication).", contract!((url: string, path: string, opts?: map("http_put_file_options", {method: string, range: map, headers: map, idle_timeout: number, deadline: number, ssl_verify: bool, ca_file: string, ca_pem: any})) -> map("http_file_response", {status: number, headers: map, bytes_written: number, size: number, blake3: any, body: any, bytes: bytes, final_url: string, duration_ms: number, error_code: any, error: any, published: bool}); effects[must_use, blocking]; failure[returns_result]; caps[FsRead])),
     ("http_get_file", CapabilityClass::Network, "system", "Stream GET through a unique temp sibling and publish atomically. Opts: overwrite (default false), append (default false; requires expect_blake3 and matching 206 Content-Range), expect_blake3 (64 lowercase hex), max_bytes (final size), headers, idle_timeout (seconds, default 30), deadline (seconds, default 0), ssl_verify, ca_file, ca_pem. 200/206 require identity framing and Content-Length; missing length or encoded responses return HTTP_IDENTITY_FRAMING. Append copies and hashes the existing prefix. Redirects returned; error bodies never installed. No-replace is atomic. Deadline is cooperative and best-effort during blocking DNS/IO. bytes_written counts downloaded bytes, size includes prefix, blake3 hashes the final file. published records publication even if directory fsync fails. Operational errors return status:0; invalid options raise.", contract!((url: string, path: string, opts?: map("http_get_file_options", {overwrite: bool, append: bool, expect_blake3: string, max_bytes: number, headers: map, idle_timeout: number, deadline: number, ssl_verify: bool, ca_file: string, ca_pem: any})) -> map("http_file_response", {status: number, headers: map, bytes_written: number, size: number, blake3: any, body: any, bytes: bytes, final_url: string, duration_ms: number, error_code: any, error: any, published: bool}); effects[must_use, blocking]; failure[returns_result]; caps[FsWrite]; cond_caps[append: FsRead, ca_file: FsRead])),
     ("bytes_len", CapabilityClass::Pure,       "system",  "Length of a Value::Bytes buffer in bytes (v0.3.1)", contract!((b: any_of(bytes, buffer)) -> number)),
@@ -832,6 +833,8 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
         "http_get_file" => http_files::get(args),
         #[cfg(feature = "http")]
         "http_post" => builtin_http_post(args),
+        #[cfg(feature = "http")]
+        "http_post_multipart" => builtin_http_post_multipart(args),
         #[cfg(feature = "http")]
         "http_request" => builtin_http_request(args),
         "bytes_len" => builtin_bytes_len(args),
@@ -20475,6 +20478,141 @@ fn builtin_http_post(args: Vec<Value>) -> MixResult<Option<Value>> {
         "POST",
         &url,
         body,
+        &headers,
+        opts.timeout_s,
+        opts.insecure,
+        opts.ca_agent.as_ref(),
+    )))
+}
+
+/// `http_post_multipart(url, fields, files, [headers], [opts])` — a POST
+/// whose body is `multipart/form-data`, built from string form fields and
+/// raw binary file parts (v0.103.12, the generic webhook/file-upload slot
+/// — no vendor coupling, per the "no vendor lock-in" principle).
+#[cfg(feature = "http")]
+fn builtin_http_post_multipart(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args_between("http_post_multipart", &args, 3, 5)?;
+    let url = args[0].to_mix_string();
+    let fields = match args.get(1) {
+        Some(Value::Map(m)) => m,
+        Some(other) => {
+            return Err(MixError::RuntimeError {
+                span: None,
+                msg: format!(
+                    "http_post_multipart(): fields must be a map, got {}",
+                    other.type_name()
+                ),
+            });
+        }
+        None => &indexmap::IndexMap::new(),
+    };
+    let files = match args.get(2) {
+        Some(Value::Map(m)) => m,
+        Some(other) => {
+            return Err(MixError::RuntimeError {
+                span: None,
+                msg: format!(
+                    "http_post_multipart(): files must be a map, got {}",
+                    other.type_name()
+                ),
+            });
+        }
+        None => &indexmap::IndexMap::new(),
+    };
+
+    // Boundary: unique enough per call without crypto randomness.
+    let boundary = format!(
+        "----cosmix-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+
+    let mut body: Vec<u8> = Vec::new();
+    let push = |body: &mut Vec<u8>, s: &str| body.extend_from_slice(s.as_bytes());
+
+    for (name, value) in fields {
+        push(
+            &mut body,
+            &format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{}\r\n",
+                value.to_mix_string()
+            ),
+        );
+    }
+    for (name, file) in files {
+        let Value::Map(f) = file else {
+            return Err(MixError::RuntimeError {
+                span: None,
+                msg: format!(
+                    "http_post_multipart(): file '{name}' must be a map {{filename, content_type?, data}}, got {}",
+                    file.type_name()
+                ),
+            });
+        };
+        let filename = match f.get("filename") {
+            Some(Value::String(s)) => s.clone(),
+            Some(other) => {
+                return Err(MixError::RuntimeError {
+                    span: None,
+                    msg: format!(
+                        "http_post_multipart(): file '{name}' filename must be a string, got {}",
+                        other.type_name()
+                    ),
+                });
+            }
+            None => name.clone(),
+        };
+        let content_type = match f.get("content_type") {
+            Some(Value::String(s)) => s.clone(),
+            Some(other) => {
+                return Err(MixError::RuntimeError {
+                    span: None,
+                    msg: format!(
+                        "http_post_multipart(): file '{name}' content_type must be a string, got {}",
+                        other.type_name()
+                    ),
+                });
+            }
+            None => "application/octet-stream".to_string(),
+        };
+        push(
+            &mut body,
+            &format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\nContent-Type: {content_type}\r\n\r\n"
+            ),
+        );
+        match f.get("data") {
+            Some(Value::Bytes(b)) => body.extend_from_slice(b),
+            Some(Value::Buffer(b)) => body.extend_from_slice(&b.borrow()),
+            Some(other) => {
+                return Err(MixError::RuntimeError {
+                    span: None,
+                    msg: format!(
+                        "http_post_multipart(): file '{name}' data must be bytes, got {}",
+                        other.type_name()
+                    ),
+                });
+            }
+            None => {}
+        }
+        push(&mut body, "\r\n");
+    }
+    push(&mut body, &format!("--{boundary}--\r\n"));
+
+    let mut headers = vec![(
+        "Content-Type".to_string(),
+        format!("multipart/form-data; boundary={boundary}"),
+    )];
+    let (extra_headers, opts) =
+        http_headers_and_timeout("http_post_multipart", args.get(3), args.get(4))?;
+    headers.extend(extra_headers);
+
+    Ok(Some(http_dispatch(
+        "POST",
+        &url,
+        Some(HttpBody::Bytes(&body)),
         &headers,
         opts.timeout_s,
         opts.insecure,
