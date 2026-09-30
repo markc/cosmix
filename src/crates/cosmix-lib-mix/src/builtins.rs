@@ -288,6 +288,8 @@ builtin_table! {
     ("readline", CapabilityClass::Env,        "io",      "Read a line from stdin (optional prompt argument)", contract!((prompt?: string) -> string; effects[blocking])),
     ("read_stdin", CapabilityClass::Env,      "io",      "Read all of stdin to EOF as a string (for pipe/hook input). STRICT UTF-8 — binary stdin raises; use read_stdin_bytes for that", contract!(() -> string; effects[blocking])),
     ("read_stdin_bytes", CapabilityClass::Env, "io",     "Read all of stdin to EOF as raw bytes — the binary twin of read_stdin, which refuses invalid UTF-8. Optional arg caps the read: read_stdin_bytes(8192) reads at most 8192 bytes, the same cap contract as read_file_bytes (v0.65.0)", contract!((max?: number) -> bytes; effects[blocking]; failure[raises])),
+    ("tty_mode", CapabilityClass::Env,          "io",      "Put the controlling terminal into raw or cooked mode: tty_mode(\"raw\") disables canonical buffering, echo and signal generation (a lone ESC arrives as one byte — the keystroke-recorder primitive), tty_mode(\"cooked\") restores the saved termios. The original termios is restored on process exit if the caller never returns to cooked (v0.103.9)", contract!((mode: string) -> nil; failure[raises])),
+    ("stdin_copy", CapabilityClass::Env,        "io",      "Copy stdin to a file, flushing every chunk, until EOF — the incremental twin of read_stdin_bytes, so a recorder killed mid-stream keeps the bytes it already read. Pair with tty_mode(\"raw\") to capture keystrokes (v0.103.9)", contract!((path: string) -> nil; effects[blocking]; failure[raises])),
     ("sqlopen", CapabilityClass::FsWrite,         "io",      "Open a SQLite database and return a handle", contract!((path: string, mode?: string) -> number; failure[raises])),
     ("sqlexec", CapabilityClass::FsWrite,         "io",      "Execute SQL on a SQLite handle, return result rows", contract!((handle: number, sql: string, params?: any) -> any_of(list, map); failure[raises])),
     ("sqlclose", CapabilityClass::FsWrite,        "io",      "Close a SQLite database handle", contract!((handle: number) -> nil; failure[raises])),
@@ -596,6 +598,8 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
         "tail" => builtin_tail(args),
         "read_file" => builtin_read_file(args),
         "read_file_bytes" => builtin_read_file_bytes(args),
+        "stdin_copy" => builtin_stdin_copy(args),
+        "tty_mode" => builtin_tty_mode(args),
         "read_lines" => builtin_read_lines(args),
         "load_data" => builtin_load_data(args),
         "write_file" => builtin_write_file(args),
@@ -12699,6 +12703,154 @@ pub(crate) fn read_stdin_bytes_impl(name: &str, args: &[Value]) -> MixResult<Val
         msg: format!("{name}: {e}"),
     })?;
     Ok(Value::bytes(bytes))
+}
+
+/// The saved termios from the first `tty_mode("raw")`, so `"cooked"` and
+/// the exit hook can restore exactly what the caller started from.
+#[cfg(unix)]
+static SAVED_TTY: std::sync::OnceLock<libc::termios> = std::sync::OnceLock::new();
+
+/// Best-effort restore registered once — a recorder that is killed after
+/// `tty_mode("raw")` without returning to `"cooked"` must not leave its
+/// terminal raw.
+#[cfg(unix)]
+extern "C" fn restore_tty_on_exit() {
+    if let Some(orig) = SAVED_TTY.get() {
+        // SAFETY: fd 0 is the controlling terminal captured by the raw
+        // call; the termios is a Copy snapshot, so no lifetime hazard.
+        unsafe {
+            libc::tcsetattr(0, libc::TCSANOW, orig);
+        }
+    }
+}
+
+/// `tty_mode("raw" | "cooked")` — the keystroke-recorder primitive
+/// (2026-09-26 entry): raw disables canonical buffering, echo and signal
+/// generation (a lone ESC arrives as one byte); cooked restores the saved
+/// termios. The original is restored on process exit if the caller never
+/// returns to cooked.
+fn builtin_tty_mode(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args("tty_mode", &args, 1)?;
+    let mode = match &args[0] {
+        Value::String(s) => s.as_str(),
+        other => {
+            return Err(MixError::RuntimeError {
+                span: None,
+                msg: format!("tty_mode(): mode must be a string, got {}", other.type_name()),
+            });
+        }
+    };
+    #[cfg(unix)]
+    {
+        // Validate the mode BEFORE any syscall — `tty_mode("bogus")` names
+        // the bad mode whether or not stdin is a terminal.
+        if mode != "raw" && mode != "cooked" {
+            return Err(MixError::RuntimeError {
+                span: None,
+                msg: format!("tty_mode(): unknown mode {mode:?} — use \"raw\" or \"cooked\""),
+            });
+        }
+        if unsafe { libc::isatty(0) } != 1 {
+            return Err(MixError::RuntimeError {
+                span: None,
+                msg: "tty_mode(): stdin is not a terminal".to_string(),
+            });
+        }
+        match mode {
+            "raw" => {
+                let mut slot = std::mem::MaybeUninit::<libc::termios>::uninit();
+                // SAFETY: tcgetattr writes a full termios into `slot`.
+                if unsafe { libc::tcgetattr(0, slot.as_mut_ptr()) } != 0 {
+                    return Err(MixError::RuntimeError {
+                        span: None,
+                        msg: "tty_mode(): tcgetattr failed".to_string(),
+                    });
+                }
+                let orig = unsafe { slot.assume_init() };
+                // Save the FIRST original and arm the exit hook exactly once.
+                SAVED_TTY.get_or_init(|| {
+                    unsafe {
+                        libc::atexit(restore_tty_on_exit);
+                    }
+                    orig
+                });
+                let mut raw = orig;
+                // SAFETY: cfmakeraw fills the termios in place.
+                unsafe {
+                    libc::cfmakeraw(&mut raw);
+                }
+                if unsafe { libc::tcsetattr(0, libc::TCSANOW, &raw) } != 0 {
+                    return Err(MixError::RuntimeError {
+                        span: None,
+                        msg: "tty_mode(): tcsetattr failed".to_string(),
+                    });
+                }
+            }
+            "cooked" => {
+                if let Some(orig) = SAVED_TTY.get()
+                    && unsafe { libc::tcsetattr(0, libc::TCSANOW, orig) } != 0
+                {
+                    return Err(MixError::RuntimeError {
+                        span: None,
+                        msg: "tty_mode(): tcsetattr failed restoring cooked mode".to_string(),
+                    });
+                }
+            }
+            _ => unreachable!("mode validated above"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = mode;
+        return Err(MixError::RuntimeError {
+            span: None,
+            msg: "tty_mode(): only available on Unix".to_string(),
+        });
+    }
+    Ok(Some(Value::Nil))
+}
+
+/// `stdin_copy(path)` — copy stdin to a file, flushing every chunk, until
+/// EOF (2026-09-26 entry). The incremental twin of `read_stdin_bytes`: a
+/// recorder killed mid-stream keeps the bytes it already read. Pairs with
+/// `tty_mode("raw")` for raw keystroke capture.
+fn builtin_stdin_copy(args: Vec<Value>) -> MixResult<Option<Value>> {
+    use std::io::{Read as _, Write as _};
+    expect_args("stdin_copy", &args, 1)?;
+    let path = match &args[0] {
+        Value::String(s) => s.clone(),
+        other => {
+            return Err(MixError::RuntimeError {
+                span: None,
+                msg: format!("stdin_copy(): path must be a string, got {}", other.type_name()),
+            });
+        }
+    };
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let mut file = std::fs::File::create(&path).map_err(|e| MixError::RuntimeError {
+        span: None,
+        msg: format!("stdin_copy(): cannot create {path}: {e}"),
+    })?;
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = input
+            .read(&mut buf)
+            .map_err(|e| MixError::RuntimeError {
+                span: None,
+                msg: format!("stdin_copy(): read failed: {e}"),
+            })?;
+        if n == 0 {
+            break;
+        }
+        file.write_all(&buf[..n])
+            .and_then(|_| file.flush())
+            .map_err(|e| MixError::RuntimeError {
+                span: None,
+                msg: format!("stdin_copy(): write failed: {e}"),
+            })?;
+    }
+    Ok(Some(Value::Nil))
 }
 
 /// Append one `write_stdout`/`write_stderr` argument to the output buffer.
