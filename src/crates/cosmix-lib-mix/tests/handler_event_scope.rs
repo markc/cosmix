@@ -56,6 +56,34 @@ async fn setup(source: &str) -> Setup {
 // ---------- $event dynamic extent ----------
 
 #[tokio::test]
+async fn rc_result_reply_are_isolated_per_handler_invocation() {
+    // 2026-09-25 entry: $rc/$result/$reply used to ride the shared global,
+    // so an interleaved handler overwrote them. They are now saved per
+    // invocation and restored after (like $event) — the handler reads its
+    // OWN $rc, and the outer $rc survives.
+    let source = r#"
+$rc = 42
+$observed = ""
+on first.evt
+  $rc = 7
+  $observed = $rc
+end
+"#;
+    let mut s = setup(source).await;
+    s.eval
+        .dispatch_event(mk_event("first.evt", "", &[]))
+        .await
+        .unwrap();
+    // The handler read its own value during execution...
+    assert_eq!(
+        s.eval.get_global("observed").unwrap().to_mix_string(),
+        "7"
+    );
+    // ...and the outer value was restored afterwards, not clobbered.
+    assert_eq!(s.eval.get_global("rc").unwrap().to_mix_string(), "42");
+}
+
+#[tokio::test]
 async fn fn_called_from_handler_sees_event() {
     // The exact pre-fix failure: record() reads $event and used to raise
     // NAME_UNDEFINED (function frames fall through to globals only).

@@ -5641,6 +5641,22 @@ impl Evaluator {
             // handler-within-handler dispatch.
             let saved_global_event: Option<Value> = self.scope.get_global_only("event");
             self.scope.set_global("event", event_value.clone());
+            // 0.103.10 (2026-09-25 entry): $rc/$result/$reply are the SAME
+            // saved-global shape as $event. They used to ride the shared
+            // global (update_or_set with no frame binding), so handler A
+            // sending and then yielding let handler B's send overwrite the
+            // value A would read on resume. Saving them per invocation and
+            // restoring after — exactly as $event does — isolates each
+            // handler's reply; a send inside a fn called from the handler
+            // still lands in the global (functions fall through to globals),
+            // so this keeps the dynamic-extent behaviour that the
+            // frame-only binding would have broken.
+            let saved_global_rc: Option<Value> = self.scope.get_global_only("rc");
+            let saved_global_result: Option<Value> = self.scope.get_global_only("result");
+            let saved_global_reply: Option<Value> = self.scope.get_global_only("reply");
+            self.scope.set_global("rc", Value::Nil);
+            self.scope.set_global("result", Value::Nil);
+            self.scope.set_global("reply", Value::Nil);
 
             // `AssertUnwindSafe`: the `execute` future borrows `&mut
             // self`, which is `!UnwindSafe`. The assertion is sound here
@@ -5737,6 +5753,13 @@ impl Evaluator {
             // including panic — the rewind above does not know about it).
             self.scope
                 .set_global("event", saved_global_event.unwrap_or(Value::Nil));
+            // Same restore for the per-invocation $rc/$result/$reply.
+            self.scope
+                .set_global("rc", saved_global_rc.unwrap_or(Value::Nil));
+            self.scope
+                .set_global("result", saved_global_result.unwrap_or(Value::Nil));
+            self.scope
+                .set_global("reply", saved_global_reply.unwrap_or(Value::Nil));
 
             // End-of-iteration permit release.
             // - Writer: RAII via drop(entry_permit) — releases the

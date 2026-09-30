@@ -868,12 +868,14 @@ async fn test_dispatch_alias_copy_is_mutable() {
     // $event is read-only, but copying into a local should be freely mutable.
     // Verifies the "copy-by-value, no aliasing attack" property — the
     // $alias map is independent from $event after the assignment.
+    // Observation rides $alias_result (NOT $result, which is now isolated
+    // per handler invocation and restored after — 2026-09-25 entry).
     let source = r#"
-$result = ""
+$alias_result = ""
 on test.msg
     $copy = $event
     $copy.body = "mutated"
-    $result = $copy.body
+    $alias_result = $copy.body .. "|" .. $event.body
 done
 "#;
     let mut eval = Evaluator::new();
@@ -887,8 +889,8 @@ done
         .await
         .unwrap();
     assert_eq!(
-        eval.get_global("result").unwrap().to_mix_string(),
-        "mutated"
+        eval.get_global("alias_result").unwrap().to_mix_string(),
+        "mutated|original"
     );
 }
 
