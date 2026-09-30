@@ -1651,8 +1651,8 @@ fn format_operand_count(dialect: FormatDialect, tmpl: &str) -> Option<usize> {
         }
         // Flags, repeated in any order, before the width.
         let flags: &[u8] = match dialect {
-            FormatDialect::Fmt => &[b'-', b'0'],
-            FormatDialect::Sprintf => &[b'-', b'+', b' ', b'0', b'#'],
+            FormatDialect::Fmt => b"-0",
+            FormatDialect::Sprintf => b"-+ 0#",
         };
         while i < b.len() && flags.contains(&b[i]) {
             i += 1;
@@ -3053,9 +3053,6 @@ fn check_ssh_mix_bodies(
                 src,
                 first_line,
                 origin,
-                heredoc: _,
-                stmt_line: _,
-                lines: _,
             } => {
                 // A once-bound body shipped several times reuses its one
                 // AST node's map. Without source text, keep the documented
@@ -3096,8 +3093,7 @@ fn check_ssh_mix_bodies(
                     reported.origin = origin;
                     analyse_remote_body(
                         &src,
-                        first_line,
-                        lines.as_deref(),
+                        (first_line, lines.as_deref()),
                         injected,
                         ctx,
                         a,
@@ -3177,18 +3173,6 @@ enum RemoteBody {
         /// is at hand).
         first_line: usize,
         origin: usize,
-        heredoc: bool,
-        /// Line of the statement holding the literal — its opener is on or
-        /// after this line.
-        stmt_line: usize,
-        /// Exact decoded-line → physical-line map when the caller supplied
-        /// the source text; `None` otherwise, and the linear estimate
-        /// `first_line + N - 1` stands (documented, not invented
-        /// accuracy: it is exact for a physical multi-line literal or an
-        /// escape-free heredoc, and an explicit best effort for a
-        /// `\n`-escaped body whose extra lines have no physical line to
-        /// point at).
-        lines: Option<Vec<usize>>,
     },
     /// A string or heredoc with local `${…}`/`$(…)`/`~` substitutions —
     /// `locals` names them, spelled as written.
@@ -3224,9 +3208,6 @@ fn body_shape(expr: &Expr, line: usize) -> Option<RemoteBody> {
                 src: src.clone(),
                 first_line: line,
                 origin,
-                heredoc: false,
-                stmt_line: line,
-                lines: None,
             });
         }
         // A heredoc's text starts on the line AFTER its `<<TAG` opener.
@@ -3251,9 +3232,6 @@ fn body_shape(expr: &Expr, line: usize) -> Option<RemoteBody> {
             src,
             first_line,
             origin,
-            heredoc: matches!(expr, Expr::Heredoc(_)),
-            stmt_line: line,
-            lines: None,
         }
     } else {
         RemoteBody::Interpolated { locals, origin }
@@ -3839,14 +3817,14 @@ fn remote_body_names(stmts: &[Stmt]) -> RemoteBodyNames {
 /// undefined no matter what the opts hold.
 fn analyse_remote_body(
     src: &str,
-    first_line: usize,
-    lines: Option<&[usize]>,
+    location: (usize, Option<&[usize]>),
     injected: Option<&HashSet<String>>,
     ctx: &FileContext,
     a: &mut Analysis,
     cfg: &AnalyzerConfig,
     reported: &mut BodyDedupe,
 ) {
+    let (first_line, lines) = location;
     let mut lexer = crate::lexer::Lexer::new(src);
     let tokens = match lexer.tokenize() {
         Ok(t) => t,

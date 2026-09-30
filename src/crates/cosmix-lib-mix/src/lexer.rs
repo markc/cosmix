@@ -1281,8 +1281,8 @@ impl Lexer {
         }
         let cp =
             u32::from_str_radix(&hex, 16).map_err(|_| err(format!("invalid \\u{{{hex}}} hex")))?;
-        Ok(char::from_u32(cp)
-            .ok_or_else(|| err(format!("\\u{{{hex}}} is not a valid unicode codepoint")))?)
+        char::from_u32(cp)
+            .ok_or_else(|| err(format!("\\u{{{hex}}} is not a valid unicode codepoint")))
     }
 
     /// The value of the four hex digits starting `offset` chars ahead, if
