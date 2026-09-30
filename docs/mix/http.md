@@ -533,6 +533,10 @@ the raw manual `.md` files (but not the site's HTML shell, whose assets
 live at the site root — serve the whole `docs/` tree, not a subdirectory,
 if you want the interactive site).
 
+The boolean options (`listing`, `render_md`, `clean_urls`) take a real
+`bool` only — `"false"`, `1` or `nil` raise `TYPE_MISMATCH` before the
+listener binds, never a truthiness read.
+
 > **Serving a subdirectory of a larger site?** A page that references
 > root-absolute assets (`/web/style.css`) 404s them when the served root
 > is a subdirectory — the assets are above it. Serve the **site root**, or

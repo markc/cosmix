@@ -158,6 +158,12 @@ pub struct BuiltinContract {
     pub effects: EffectFlags,
     pub failure: OperationalFailure,
     pub cond_caps: &'static [CondCap],
+    /// Per-argument guidance the contract gate appends to its
+    /// TYPE_MISMATCH message, keyed by argument NAME (declared with the
+    /// `hints[...]` clause). Keeps the instructional clauses
+    /// (encode-first, no-coercion) that a narrowed argument contract
+    /// would otherwise intercept before the builtin's own message fires.
+    pub arg_hints: &'static [(&'static str, &'static str)],
     /// Additional unconditional authority, alongside the entry's base class.
     pub required_caps: &'static [crate::builtins::CapabilityClass],
     /// For builtins whose valid arities are NOT a contiguous range
@@ -190,6 +196,16 @@ impl BuiltinContract {
             return set.contains(&n);
         }
         n >= self.arity_min() && self.arity_max().is_none_or(|max| n <= max)
+    }
+
+    /// The `hints[...]` guidance for the argument named `arg_name`, if the
+    /// contract declares any — appended by the evaluator's contract gate
+    /// to its TYPE_MISMATCH message.
+    pub fn arg_hint(&self, arg_name: &str) -> Option<&'static str> {
+        self.arg_hints
+            .iter()
+            .find(|(n, _)| *n == arg_name)
+            .map(|(_, h)| *h)
     }
 }
 
@@ -434,6 +450,17 @@ macro_rules! cond_caps {
     };
 }
 
+#[doc(hidden)]
+#[macro_export]
+macro_rules! arg_hints {
+    () => {
+        &[]
+    };
+    ($($arg:ident : $hint:literal),+ $(,)?) => {
+        &[ $( (stringify!($arg), $hint) ),+ ]
+    };
+}
+
 /// Argument-list tt-muncher for [`contract!`]. Grammar per argument:
 /// `name: TYPE` (required) · `name?: TYPE` (optional) ·
 /// `name: ...TYPE` (variadic, must be last). Argument names must be
@@ -505,7 +532,8 @@ macro_rules! contract_args {
 /// arity like `random`'s 0-or-2), then `effects[...]`, then
 /// `failure[...]` (default `not_applicable`), then `caps[...]` (additional
 /// unconditional capabilities, beyond the builtin's primary class), then
-/// `cond_caps[option: CapabilityClass, ...]`.
+/// `cond_caps[option: CapabilityClass, ...]`, then `hints[arg: "text"]`
+/// (per-argument gate guidance, keyed by argument name).
 #[macro_export]
 macro_rules! contract {
     (
@@ -515,6 +543,7 @@ macro_rules! contract {
         $(; failure[$f:ident] )?
         $(; caps[$($cap:ident),* $(,)?] )?
         $(; cond_caps[$($cn:ident : $cc:ident),* $(,)?] )?
+        $(; hints[$($hn:ident : $hh:literal),* $(,)?] )?
     ) => {
         $crate::builtin_info::BuiltinContract {
             args: $crate::contract_args!($($args)*),
@@ -524,6 +553,7 @@ macro_rules! contract {
             cond_caps: $crate::cond_caps!($( $($cn : $cc),* )?),
             required_caps: &[$($( $crate::builtins::CapabilityClass::$cap ),*)?],
             exact_arities: $crate::exact_arities!($( $($ar),+ )?),
+            arg_hints: $crate::arg_hints!($( $($hn : $hh),* )?),
         }
     };
 }

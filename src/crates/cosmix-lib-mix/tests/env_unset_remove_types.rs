@@ -22,13 +22,13 @@ async fn run(src: &str) -> Result<String, String> {
 async fn nil_env_value_removes_the_variable() {
     // `env` prints the child environment; DISPLAY=:5 must be GONE.
     let out = run(
-        "$r = run_argv([\"/usr/bin/env\"], {env: {DISPLAY: \":5\"}})\nprint(contains($r.stdout, \"DISPLAY=:5\"))\n",
+        "$r = run_argv([\"/usr/bin/env\"], {env: {DISPLAY: \":5\"}})\nprint(contains(\"\\n\" .. $r.stdout, \"\\nDISPLAY=:5\"))\n",
     )
     .await
     .expect("set runs");
     assert!(out.contains("true"), "set env: {out}");
     let out = run(
-        "$r = run_argv([\"/usr/bin/env\"], {env: {DISPLAY: nil}})\nprint(contains($r.stdout, \"DISPLAY=\"))\n",
+        "$r = run_argv([\"/usr/bin/env\"], {env: {DISPLAY: nil}})\nprint(contains(\"\\n\" .. $r.stdout, \"\\nDISPLAY=\"))\n",
     )
     .await
     .expect("unset runs");

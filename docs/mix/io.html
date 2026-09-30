@@ -462,7 +462,7 @@ re-parse.</p>
 <li><strong>Errors raise, they don't return a sentinel.</strong> A failed <code>read_file</code> / <code>ls</code> / <code>mkdir</code> raises a catchable runtime error (the message names the call and path). Wrap a must-succeed step in <code>try/catch</code>, or pre-check with <code>exists</code> / <code>access</code> / <code>is_file</code> / <code>is_dir</code>. The exceptions are the predicates themselves (<code>exists</code>/<code>access</code>/<code>is_dir</code>/<code>is_file</code> return a <code>bool</code> for ordinary absence or denial) and <code>glob</code>, which returns an empty list for "no match", never an error.</li>
 <li><strong>Mode arguments take the VALUE, not the digits.</strong> <code>chmod</code>/<code>write_new</code> want an octal <em>literal</em> — <code>0o755</code> (= 493), <code>0o600</code> (= 384) — or an octal <em>string</em> (<code>"0755"</code>). A bare <code>755</code> is the decimal number 755, not the mode (see <a href="/mix/numbers">numbers</a> for why <code>0755</code> is a lex error and <code>0o755</code> is the value). That lex error is a Mix-<em>expression</em> hazard only — <code>0755</code> inside a command string handed to <code>run</code> (<code>run("install -m 0755 a b")</code>) is plain text for <code>/bin/sh</code> and works fine.</li>
 <li><strong><code>stat</code>'s <code>ino</code>/<code>dev</code> are STRINGS.</strong> They are <code>u64</code> and Mix numbers are f64, which loses precision above 2^53 — so they come back as text, ready to use verbatim as a dedupe key. Don't <code>to_number()</code> them.</li>
-<li><strong>Bytes vs strings.</strong> <code>read_file</code>/<code>read_lines</code> require valid UTF-8 (they error on a bad byte); <code>read_file_bytes</code> carries the raw buffer through <code>Value::Bytes</code>. <code>write_file</code>/<code>append_file</code>/<code>write_new</code> write a <code>Value::Bytes</code> argument verbatim and stringify anything else.</li>
+<li><strong>Bytes vs strings.</strong> <code>read_file</code>/<code>read_lines</code> require valid UTF-8 (they error on a bad byte); <code>read_file_bytes</code> carries the raw buffer through <code>Value::Bytes</code>. <code>write_file</code>/<code>append_file</code>/<code>write_new</code> accept exactly a string, <code>bytes</code> or <code>buffer</code> — a <code>bytes</code>/<code>buffer</code> argument is written verbatim, a string as UTF-8, and <strong>nothing else is coerced</strong>: a map, list, function, number, bool or nil raises <code>TYPE_MISMATCH</code> <em>before</em> the file is opened, so encode first with <code>json_encode</code>/<code>data_encode</code>/<code>to_string</code>.</li>
 </ul>
 <h2 id="native-filesystem-events">Native filesystem events</h2>
 <pre><code class="language-mix">$watch = fs_watch("/srv/scenes", {
@@ -621,6 +621,8 @@ append_file(path, content)           create-if-missing, then append
 write_new(path, content, mode)       atomically create; FAILS if path exists
 write_atomic(path, data[, opts])     replace all-or-nothing: old OR new, never partial
 </code></pre>
+<p><code>content</code> is a string, <code>bytes</code> or <code>buffer</code> — nothing else is coerced (a wrong
+type raises <code>TYPE_MISMATCH</code> before the file is touched).</p>
 <pre><code class="language-mix">write_file("/tmp/io/log.txt", "first\n")
 append_file("/tmp/io/log.txt", "second\n")
 print(read_file("/tmp/io/log.txt"))
@@ -910,6 +912,9 @@ the options map flips the defaults:</p>
 <li><code>include_dirs</code> (bool, default <code>false</code>) — include directory entries too.</li>
 <li><code>follow_symlinks</code> (bool, default <code>false</code>) — follow symlink dirs (loop-safe; the walker tracks visited inodes).</li>
 </ul>
+<p>The two boolean options take a real <code>bool</code> only — <code>"false"</code>, <code>0</code>, <code>nil</code> and the
+like raise <code>TYPE_MISMATCH</code> before traversal starts rather than being read as a
+truthiness.</p>
 <p><code>max_depth</code> accepts a number or numeric string. If the option is present but
 cannot be parsed as a number, <code>walk</code> raises <code>TYPE_MISMATCH</code>; it never silently
 discards the limit and performs an unlimited traversal.</p>
@@ -1458,7 +1463,9 @@ bytes_to_string(b, {lossy: true})   from_utf8_lossy decode (bad bytes -&gt; U+FF
 </code></pre>
 <p>All three are <strong>strict about their argument type</strong> — <code>string_to_bytes</code> rejects a
 non-string, <code>bytes_to_string</code>/<code>bytes_len</code> reject a non-bytes — so a <code>to_mix_string</code>
-placeholder like <code>&lt;bytes:N&gt;</code> can never silently leak in.</p>
+placeholder like <code>&lt;bytes:N&gt;</code> can never silently leak in. The <code>lossy</code> option is a
+strict bool too: <code>{lossy: "true"}</code> or <code>{lossy: 1}</code> raises <code>TYPE_MISMATCH</code> rather
+than being read as a truthiness.</p>
 <pre><code class="language-mix">$b = string_to_bytes("héllo")
 print("byte length: " .. bytes_len($b))     -- 6 (é is 2 UTF-8 bytes)
 print("round-trip:  " .. bytes_to_string($b))

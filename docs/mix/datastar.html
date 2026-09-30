@@ -493,7 +493,7 @@ data: elements &lt;div id="clock"&gt;12:34&lt;/div&gt;
 <table><thead><tr><th>Key</th><th>Values</th><th>Default</th></tr></thead><tbody>
 <tr><td><code>selector</code></td><td>a CSS selector string</td><td>none (Datastar uses the element's <code>id</code>)</td></tr>
 <tr><td><code>mode</code></td><td><code>outer</code> <code>inner</code> <code>remove</code> <code>replace</code> <code>prepend</code> <code>append</code> <code>before</code> <code>after</code></td><td><code>outer</code></td></tr>
-<tr><td><code>view_transition</code></td><td>truthy → emit <code>useViewTransition true</code>; falsy → same as absent</td><td>off</td></tr>
+<tr><td><code>view_transition</code></td><td>a bool: <code>true</code> → emit <code>useViewTransition true</code>; <code>false</code>/absent → off</td><td>off</td></tr>
 </tbody></table>
 <p>Two option-map behaviours to know: a <code>nil</code>-valued <code>selector</code>/<code>mode</code> is treated as
 absent, and <strong>unknown keys are silently ignored</strong> — there is no strict allowlist
@@ -587,7 +587,9 @@ data: signals {"open":true}
 
 </code></pre>
 <p><code>only_if_missing</code> makes the patch a default — it only sets signals the client
-does not already have (good for initial values that must not clobber user edits):</p>
+does not already have (good for initial values that must not clobber user edits).
+Like <code>view_transition</code>, it is a strict bool: <code>"false"</code>/<code>0</code>/<code>nil</code> raise
+<code>TYPE_MISMATCH</code> rather than being read as a truthiness.</p>
 <pre><code class="language-mix">$ev = ds_patch_signals({theme: "dark"}, {only_if_missing: true})
 print($ev)
 </code></pre>
