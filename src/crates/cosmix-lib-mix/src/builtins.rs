@@ -15747,14 +15747,16 @@ fn builtin_project_info(args: Vec<Value>) -> MixResult<Option<Value>> {
         .unwrap_or_else(|| ".".to_string());
     let src = std::path::Path::new(&root).join("src");
 
-    let toml_err = |what: &str, e: impl std::fmt::Display| MixError::RuntimeError {
+    let ws_text = std::fs::read_to_string(src.join("Cargo.toml")).map_err(|e| {
+        MixError::RuntimeError {
+            span: None,
+            msg: format!("project_info(): cannot read src/Cargo.toml: {e}"),
+        }
+    })?;
+    let ws: toml::Value = ws_text.parse().map_err(|e| MixError::RuntimeError {
         span: None,
-        msg: format!("project_info(): {what}: {e}"),
-    };
-
-    let ws_text = std::fs::read_to_string(src.join("Cargo.toml"))
-        .map_err(|e| toml_err("cannot read src/Cargo.toml", e))?;
-    let ws: toml::Value = ws_text.parse().map_err(|e| toml_err("bad src/Cargo.toml", e))?;
+        msg: format!("project_info(): bad src/Cargo.toml: {e}"),
+    })?;
 
     let toml_strings = |table: &toml::Value, key: &str| -> Vec<String> {
         table
