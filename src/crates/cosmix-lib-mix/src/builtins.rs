@@ -6700,6 +6700,7 @@ fn proc_spec_from<'a>(argv: &'a [String], opts: &'a RunArgvOpts, caller: &'a str
         cwd: opts.cwd.as_deref(),
         env: &opts.env,
         clear_env: opts.clear_env,
+        env_unset: &opts.env_unset,
         max_output: opts.max_output,
         stream: opts.stream,
     }
@@ -8336,6 +8337,8 @@ struct ProcSpec<'a> {
     /// (or on an empty one when `clear_env`).
     env: &'a [(String, String)],
     clear_env: bool,
+    /// Removed after explicit sets; clear_env is applied before both.
+    env_unset: &'a [String],
     /// Per-stream output cap in bytes; `None` = unbounded. Excess is
     /// drained and DISCARDED (the child is not killed, the pipe never
     /// backs up) with the outcome's truncation flag set.
@@ -9389,6 +9392,9 @@ fn run_pipeline_processes(
             for (key, value) in &stage.opts.env {
                 command.env(key, value);
             }
+            for key in &stage.opts.env_unset {
+                command.env_remove(key);
+            }
             if let Some(cwd) = &stage.opts.cwd {
                 command.current_dir(cwd);
             }
@@ -10176,6 +10182,7 @@ fn run_process(spec: &ProcSpec<'_>) -> MixResult<ProcOutcome> {
         cwd,
         env,
         clear_env,
+        env_unset,
         max_output,
         stream,
     } = spec;
@@ -10302,6 +10309,9 @@ fn run_process(spec: &ProcSpec<'_>) -> MixResult<ProcOutcome> {
     }
     for (k, v) in env.iter() {
         cmd.env(k, v);
+    }
+    for k in env_unset.iter() {
+        cmd.env_remove(k);
     }
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
@@ -10737,6 +10747,7 @@ fn run_ssh_process(
         cwd: None,
         env: &[],
         clear_env: false,
+        env_unset: &[],
         max_output,
         stream: false,
     })?;
