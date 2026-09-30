@@ -42,7 +42,7 @@ fn project_info_reports_members_excludes_and_toolchain() {
     assert_eq!(names, vec!["alpha", "beta"], "got: {stdout}");
     assert_eq!(json["main"]["toolchain"].as_str().unwrap(), "1.85.0");
     assert_eq!(json["main"]["exclude"][0].as_str().unwrap(), "crates/foreman");
-    assert_eq!(json["desktop"].as_bool().unwrap(), false);
+    assert!(!json["desktop"].as_bool().unwrap());
 
     std::fs::remove_dir_all(&root).ok();
 }
