@@ -935,6 +935,15 @@ stopped, but the wait status is. The outcome names the POLICY that ended the
 task (`timeout`, `cancelled`) with the signal beside it as `escalated_to`, so a
 deliberate deadline is never presented as an indistinguishable external kill.
 
+If the bounded termination ladder cannot obtain a final wait status, the
+report says `unknown`; it never claims a successful exit from sending SIGKILL.
+Since Mix 0.109.0, that report is published before waiting for eventual kernel
+cleanup. The original supervisor keeps the child registered and retains its
+native concurrency slot until reaping completes. Four pending supervisors
+still exhaust the four-slot limit and further submissions receive
+`RESOURCE_LIMIT`, even if their reports have already settled. Reaping retries
+interrupted waits, and registry removal is synchronised with shutdown sweeping.
+
 Between a cancel being accepted and `wait()` settling, `shell.task.result`
 reports `state: "cancelling"` — a real state, so a caller that asked for
 cancellation and reads `running` is not left wondering whether its request

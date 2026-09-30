@@ -842,6 +842,10 @@ does <strong>not</strong> appear in the args delivered to the peer.</p>
 <h2 id="port_existsname--is-a-service-registered"><code>port_exists(name)</code> — is a service registered?</h2>
 <p>A builtin (not a keyword) that asks the broker whether a named service is in its
 registry. Useful as a guard before an RPC.</p>
+<p>In <code>--serve</code>, a failed registry request raises a catchable mesh-unavailable
+error (Mix 0.109.0). Only a successful registry response can establish that a
+service is absent. <code>emit</code> retains its fire-and-forget, non-fatal language
+contract during a transport failure; it supplies no delivery acknowledgement.</p>
 <pre><code class="language-mix">print("statecache: " .. ("" .. port_exists("statecache")))
 print("ghost:      " .. ("" .. port_exists("ghostservice")))
 </code></pre>

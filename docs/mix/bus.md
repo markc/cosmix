@@ -511,6 +511,11 @@ does **not** appear in the args delivered to the peer.
 A builtin (not a keyword) that asks the broker whether a named service is in its
 registry. Useful as a guard before an RPC.
 
+In `--serve`, a failed registry request raises a catchable mesh-unavailable
+error (Mix 0.109.0). Only a successful registry response can establish that a
+service is absent. `emit` retains its fire-and-forget, non-fatal language
+contract during a transport failure; it supplies no delivery acknowledgement.
+
 ```mix
 print("statecache: " .. ("" .. port_exists("statecache")))
 print("ghost:      " .. ("" .. port_exists("ghostservice")))

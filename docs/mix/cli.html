@@ -1179,6 +1179,14 @@ fact that a signal was sent — a cancel request is still not proof a process
 stopped, but the wait status is. The outcome names the POLICY that ended the
 task (<code>timeout</code>, <code>cancelled</code>) with the signal beside it as <code>escalated_to</code>, so a
 deliberate deadline is never presented as an indistinguishable external kill.</p>
+<p>If the bounded termination ladder cannot obtain a final wait status, the
+report says <code>unknown</code>; it never claims a successful exit from sending SIGKILL.
+Since Mix 0.109.0, that report is published before waiting for eventual kernel
+cleanup. The original supervisor keeps the child registered and retains its
+native concurrency slot until reaping completes. Four pending supervisors
+still exhaust the four-slot limit and further submissions receive
+<code>RESOURCE_LIMIT</code>, even if their reports have already settled. Reaping retries
+interrupted waits, and registry removal is synchronised with shutdown sweeping.</p>
 <p>Between a cancel being accepted and <code>wait()</code> settling, <code>shell.task.result</code>
 reports <code>state: "cancelling"</code> — a real state, so a caller that asked for
 cancellation and reads <code>running</code> is not left wondering whether its request
