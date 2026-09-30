@@ -18,6 +18,7 @@ fn coverage_ignores_strings_and_comments_and_fails_closed() {
     )
     .unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_mix"))
+        .env_remove("MIX_STATS")
         .env("XDG_STATE_HOME", &state)
         .args(["stats", "coverage"])
         .arg(&dir)
@@ -31,6 +32,7 @@ fn coverage_ignores_strings_and_comments_and_fails_closed() {
 
     std::fs::write(dir.join("bad.mix"), "if true then\n").unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_mix"))
+        .env_remove("MIX_STATS")
         .env("XDG_STATE_HOME", &state)
         .args(["stats", "coverage"])
         .arg(&dir)
@@ -58,6 +60,7 @@ fn coverage_follows_the_user_named_root_symlink_only() {
     symlink(&real, &link).unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_mix"))
+        .env_remove("MIX_STATS")
         .env("XDG_STATE_HOME", &state)
         .args(["stats", "coverage"])
         .arg(&link)

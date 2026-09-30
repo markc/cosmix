@@ -1120,7 +1120,8 @@ fn task_submit(bound: &SessionRecord, actor: &BrokerPrincipal, body: &str) -> (u
     }
 }
 
-/// Published by the supervisor thread once `wait()` has spoken.
+/// Published by the supervisor once an outcome is known. An Unknown outcome
+/// can precede kernel cleanup; the supervisor retains native ownership then.
 fn task_settled(operation: u64, report: crate::session_task::TaskReport) {
     {
         let mut store = store().lock().unwrap_or_else(|e| e.into_inner());

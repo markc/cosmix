@@ -1331,22 +1331,32 @@ impl BusHandler for MixServeHandler {
         args: &'a Value,
     ) -> Pin<Box<dyn Future<Output = MixResult<()>> + 'a>> {
         Box::pin(async move {
-            // Fire-and-forget: a disconnected supervised link drops the
-            // emit (the typed error is swallowed, matching the
-            // transient handler's broker-unavailable behaviour). `emit`
-            // promises no delivery guarantee; a citizen that needs one
-            // uses `send`/`call` and inspects the rc.
+            // Fire-and-forget refers to the peer reply, not to error
+            // honesty: `emit` promises no delivery guarantee, but a
+            // supervised transport failure still raises
+            // mesh_unavailable — exactly like the transient handler's
+            // broker link. A citizen that needs delivery uses
+            // `send`/`call` and inspects the rc.
             if let Value::Map(map) = args {
                 let (headers, body) = split_headers_body(map)?;
-                let _ = self
+                return match self
                     .supervised
                     .send_with_headers(target, command, &headers, &body)
-                    .await;
-                return Ok(());
+                    .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(e) => Err(mesh_unavailable(&format!(
+                        "serve emit send_with_headers({target}, {command}) transport failure: {e}"
+                    ))),
+                };
             }
             let json_args = value_to_json(args);
-            let _ = self.supervised.send(target, command, json_args).await;
-            Ok(())
+            match self.supervised.send(target, command, json_args).await {
+                Ok(()) => Ok(()),
+                Err(e) => Err(mesh_unavailable(&format!(
+                    "serve emit send({target}, {command}) transport failure: {e}"
+                ))),
+            }
         })
     }
 
@@ -1357,11 +1367,13 @@ impl BusHandler for MixServeHandler {
         Box::pin(async move {
             match self.supervised.list_services().await {
                 Ok(services) => Ok(services.iter().any(|s| s == target)),
-                // Disconnected / transport error: report "not
-                // reachable" rather than a hard script error — the
-                // citizen cannot vouch for a service it cannot ask
-                // about. Mirrors the transient handler.
-                Err(_) => Ok(false),
+                // Only a successfully retrieved service list missing the
+                // target answers `false`. A transport/gate failure raises:
+                // the citizen cannot vouch for a service it cannot ask
+                // about (the transient handler raises too).
+                Err(e) => Err(mesh_unavailable(&format!(
+                    "serve port_exists({target}) list_services failure: {e}"
+                ))),
             }
         })
     }

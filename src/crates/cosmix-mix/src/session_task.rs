@@ -50,6 +50,25 @@ use std::time::{Duration, Instant};
 /// Concurrent tasks per shell. Beyond this, RESOURCE_LIMIT — a real limit
 /// (processes and supervisor threads), not a bookkeeping one.
 pub(crate) const TASKS: usize = 4;
+
+/// Settled Unknown reports can precede kernel cleanup. Keep native resources
+/// bounded independently of the result store until their creator thread exits.
+static SUPERVISORS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+struct SupervisorPermit;
+impl SupervisorPermit {
+    fn reserve() -> Result<Self, SpawnFailed> {
+        use std::sync::atomic::Ordering;
+        SUPERVISORS.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+            |active| (active < TASKS).then_some(active + 1))
+            .map(|_| Self)
+            .map_err(|_| SpawnFailed::resources("native task cleanup slots are occupied".into()))
+    }
+}
+impl Drop for SupervisorPermit {
+    fn drop(&mut self) {
+        SUPERVISORS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
 /// Per-stream capture cap. With the 64 KiB result cap this keeps a full settled
 /// record inside one Term reply under the 256 KiB envelope, with headroom —
 /// which is what lets v1 ship without chunking machinery.
@@ -433,11 +452,13 @@ impl Handle {
 }
 
 /// Spawn and supervise. Returns the handle immediately; `settled` is called on
-/// the supervisor thread once `wait()` has spoken.
+/// the supervisor thread once the outcome is known. Unknown may be published
+/// before uninterruptible kernel cleanup; its native slot remains occupied.
 pub(crate) fn spawn(
     spec: Spec,
     settled: impl FnOnce(TaskReport) + Send + 'static,
 ) -> Result<Handle, SpawnFailed> {
+    let permit = SupervisorPermit::reserve()?;
     let started = Instant::now();
     let (tx, rx) = mpsc::channel();
     let cancel = tx.clone();
@@ -453,7 +474,10 @@ pub(crate) fn spawn(
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), SpawnFailed>>(1);
     std::thread::Builder::new()
         .name("mix-task".into())
-        .spawn(move || supervise_task(spec, started, tx, rx, supervised, ready_tx, settled))
+        .spawn(move || {
+            let _permit = permit;
+            supervise_task(spec, started, tx, rx, supervised, ready_tx, settled)
+        })
         .map_err(|error| SpawnFailed::resources(error.to_string()))?;
     ready_rx
         .recv()
@@ -664,13 +688,7 @@ fn supervise_task(
     // deregistered, which is also what makes every killpg in this file
     // recycle-safe: the pid it names cannot be reissued while we hold it.
     signal_group(pid, libc::SIGKILL);
-    // SAFETY: reaping a child of this process, once, after the final signal.
-    unsafe {
-        let mut ignored: libc::c_int = 0;
-        libc::waitpid(pid, &mut ignored, 0);
-    }
-    groups().retain(|live| *live != pid);
-    settled(TaskReport {
+    let report = TaskReport {
         version: 1,
         outcome,
         stdout,
@@ -679,7 +697,52 @@ fn supervise_task(
         duration_ms: cosmix_lib_bus::native_session::DecimalU64(
             started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
         ),
-    });
+    };
+    publish_and_reap(report, settled, || reap_registered(pid));
+}
+
+fn publish_and_reap(report: TaskReport, settled: impl FnOnce(TaskReport), reap: impl FnOnce()) {
+    if matches!(report.outcome, Outcome::Unknown { .. }) {
+        // A bounded ladder must be able to answer even if the kernel cannot
+        // yet complete SIGKILL. The original creator retains ownership and
+        // its native permit during cleanup, preserving PDEATHSIG and limits.
+        settled(report);
+        reap();
+    } else {
+        reap();
+        settled(report);
+    }
+}
+
+fn reap_registered(pid: libc::pid_t) {
+    loop {
+        // Wait without consuming the status or holding the registry lock.
+        // This can remain blocked in D-state after an Unknown is published.
+        let observation = observe(pid);
+        let mut live = groups();
+        let result = loop {
+            let mut status = 0;
+            // SAFETY: this supervisor owns the child. Nonblocking reap while
+            // holding the registry lock prevents sweep seeing a recycled PID
+            // between kernel reaping and registration removal.
+            let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if result < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break result;
+        };
+        if result == pid || (result < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)) {
+            live.retain(|tracked| *tracked != pid);
+            return;
+        }
+        drop(live);
+        if let Event::WaitFailed(detail) = observation {
+            tracing::warn!(pid, %detail, "native task cleanup remains pending");
+        }
+        // Unexpected wait failures must not abandon ownership or release the
+        // native slot. Normal cleanup takes no timer path.
+        std::thread::sleep(Duration::from_secs(1));
+    }
 }
 
 /// Which `mix` evaluates a source task.
@@ -1219,6 +1282,60 @@ fn pipe() -> Result<(std::fs::File, std::fs::File), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_report_precedes_kernel_cleanup_and_retains_native_capacity() {
+        // Model the ladder's Unknown with a real live, test-owned child held
+        // on a pipe. This proves publication/cleanup ordering without trying
+        // to manufacture an unkillable kernel D-state.
+        let mut pipe = [0; 2];
+        // SAFETY: live two-element descriptor output; only libc calls run in
+        // the forked child, so no inherited Rust lock is acquired there.
+        assert_eq!(unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            unsafe {
+                libc::close(pipe[1]);
+                if libc::setsid() < 0 { libc::_exit(125); }
+                let mut byte = 0u8;
+                libc::read(pipe[0], (&mut byte as *mut u8).cast(), 1);
+                libc::_exit(7);
+            }
+        }
+        unsafe { libc::close(pipe[0]); }
+        // SAFETY: parent uniquely owns this fresh pipe descriptor.
+        let release = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+        groups().push(pid);
+        let permit = SupervisorPermit::reserve().unwrap_or_else(|_| panic!("native slot"));
+        let (published, report_rx) = mpsc::channel();
+        let supervisor = std::thread::spawn(move || {
+            let _permit = permit;
+            let report = TaskReport {
+                version: 1,
+                outcome: Outcome::Unknown { detail: "controlled pending cleanup".into() },
+                stdout: empty_stream(), stderr: empty_stream(),
+                result: TaskResult::NotApplicable,
+                duration_ms: cosmix_lib_bus::native_session::DecimalU64(0),
+            };
+            publish_and_reap(report, |report| { published.send(report).unwrap(); }, || reap_registered(pid));
+        });
+        let report = report_rx.recv_timeout(Duration::from_secs(1)).expect("Unknown must be published before cleanup");
+        assert!(matches!(report.outcome, Outcome::Unknown { .. }));
+        assert_eq!(unsafe { libc::kill(pid, 0) }, 0, "child is still live");
+        assert!(groups().contains(&pid), "cleanup remains owned");
+        let other_slots: Vec<_> = (1..TASKS).map(|_| SupervisorPermit::reserve().unwrap_or_else(|_| panic!("remaining slot"))).collect();
+        assert_eq!(SupervisorPermit::reserve().err().unwrap().code, "RESOURCE_LIMIT");
+        drop(other_slots);
+        // Closing the held pipe releases the real child and permits reaping.
+        drop(release);
+        supervisor.join().unwrap();
+        assert!(!groups().contains(&pid));
+        assert_eq!(SUPERVISORS.load(std::sync::atomic::Ordering::Acquire), 0);
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) }, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
+    }
 
     #[test]
     fn the_mode_union_admits_exactly_one_side() {
