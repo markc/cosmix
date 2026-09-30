@@ -727,6 +727,15 @@ sprintf(fmt, ...args) -> string
   than truncating. Unknown conversions and missing arguments raise too,
   and POSIX positional arguments (`%1$d`) are not supported — the `$`
   surfaces as an unknown-conversion error.
+- **Lint MIX-W2311** covers the surplus side, which the runtime accepts:
+  a direct `fmt()`/`sprintf()` call whose template is a string literal
+  that parses cleanly, but whose argument list is longer than the
+  template consumes, warns — `fmt("%s", 1, 2)` provides two operands for
+  one placeholder and the extra is silently ignored. `%%` consumes
+  nothing; a `*` width (and a `.*` precision here) consumes one operand
+  each, so `sprintf("%*.*f", 4, 2, 1.5)` is exact. Invalid or dynamic
+  templates, deficits, and calls a user function, variable or `address`
+  block could shadow stay silent.
 
 Two documented divergences, both about Unicode: `%s` pads by **codepoints**
 (C pads by bytes — identical for the ASCII output of numeric conversions,

@@ -1,6 +1,6 @@
 use crate::token::StringPart;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     NumberLiteral(f64),
     StringLiteral(String),
@@ -128,20 +128,20 @@ pub enum BinOp {
     Pipe,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum UnaryOp {
     Neg,
     Not,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Param {
     pub name: String,
     pub default: Option<Expr>,
 }
 
 /// The `catch` clause of a `try` statement.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CatchClause {
     /// First binding: the message string (pre-0.29 contract).
     pub var: String,
@@ -150,7 +150,7 @@ pub struct CatchClause {
     pub body: Vec<Stmt>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum FunctionBody {
     Block(Vec<Stmt>),
     Expression(Expr),
@@ -160,7 +160,7 @@ pub enum FunctionBody {
 /// `StmtKind::If` exactly so the evaluator can run it through the same
 /// block-execution path; kept as a separate boxed struct purely so
 /// `Expr` stays small (every `Box<Expr>` allocation pays `size_of::<Expr>`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct IfExpr {
     pub condition: Expr,
     pub then_body: Vec<Stmt>,
@@ -169,7 +169,7 @@ pub struct IfExpr {
 }
 
 /// Operator for statement chaining (`&&` / `||`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ChainOp {
     /// `&&` — execute right only if `$rc == 0` after left
     And,
@@ -179,14 +179,14 @@ pub enum ChainOp {
 
 /// A component of a PARSE template: either a variable to capture into
 /// or a literal delimiter to match and skip.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ParsePart {
     Variable(String),
     Delimiter(String),
 }
 
 /// A statement with source line number for error reporting.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Stmt {
     pub kind: StmtKind,
     pub line: usize,
@@ -202,13 +202,13 @@ impl Stmt {
 ///
 /// `.k` and `["k"]` are deliberately NOT interchangeable here: they are
 /// distinct segment kinds so structural comparisons stay honest.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PathSeg {
     Field(String),
     Index(Expr),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum StmtKind {
     Expression(Expr),
     Assignment {

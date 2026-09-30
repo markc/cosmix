@@ -31,6 +31,30 @@ fn codes(source: &str) -> Vec<String> {
 }
 
 #[test]
+fn compound_address_clones_preserve_later_body_physical_mapping() {
+    let src = "address \"target-prefix-\" .. \"1\"\n  command\n  other\nend\n$r = ssh_mix(\n  \"target\",\n  \"missing()\\n\"\n)\n";
+    let found = diags_with_source(src);
+    let body = found.iter().find(|(code, _, _, message)| {
+        code == "MIX-E1102" && message.contains("inside ssh_mix body")
+    }).expect("undefined call in remote body");
+    assert_eq!(body.2, Some(7), "compound address must not lose later mapping: {found:?}");
+}
+
+#[test]
+fn unrelated_tree_with_identical_literal_sequence_refuses_physical_origins() {
+    let original = "$r = ssh_mix(\"target\", \"missing()\\n\")\n";
+    let unrelated = "$other = ssh_mix(\n  \"target\",\n  \"missing()\\n\"\n)\n";
+    let tokens = Lexer::new(original).tokenize().expect("lex");
+    let stmts = Parser::new(tokens, original).parse_program().expect("parse");
+    let cfg = AnalyzerConfig { source: Some(unrelated.to_string()), ..Default::default() };
+    let result = analyze(&stmts, None, &cfg);
+    let hit = result.diagnostics.iter().find(|d| {
+        d.code == "MIX-E1102" && d.message.contains("inside ssh_mix body")
+    }).expect("remote undefined call");
+    assert_eq!(hit.line, Some(1), "source/tree mismatch must retain statement-line estimate");
+}
+
+#[test]
 fn a_legacy_call_inside_a_remote_body_is_reported() {
     // Without this pass the file is clean: the whole program is one string.
     let src = "$h = \"alpha\"\n$r = ssh_mix($h, '\nprint(regex_match(\"^a\", \"abc\"))\n')\n";
@@ -315,11 +339,74 @@ fn env_keys_are_bound_inside_the_body_too() {
 }
 
 #[test]
-fn an_opaque_opts_argument_suppresses_body_name_checks() {
-    // With the bindings unreadable the body's universe is unknowable, so
-    // naming checks stand down rather than cry wolf.
+fn an_opts_variable_bound_once_to_a_map_literal_resolves() {
+    // The opts twin of the body's sole-string resolution: `$o` assigned
+    // ONCE to a map literal supplies its bindings keys statically, so the
+    // body gets full name checks — no uncertainty note (MIX-D3018), and a
+    // genuinely undefined name is still caught.
     let src = "$o = {bindings: {x: 1}}\n$r = ssh_mix(\"a\", '\nprint($x)\n', $o)\n";
     assert!(codes(src).is_empty(), "{:?}", codes(src));
+    let src = "$o = {bindings: {x: 1}}\n$r = ssh_mix(\"a\", '\nprint($x .. $y)\n', $o)\n";
+    let c = codes(src);
+    assert!(c.iter().any(|x| x == "MIX-E1101"), "full checks must run: {c:?}");
+}
+
+#[test]
+fn unreadable_opts_skip_variable_checks_but_keep_callable_checks() {
+    // The boundary: opts is a CALL, so the injected names are unknown.
+    // `$x` could be supplied by dynamic bindings (no E1101), but
+    // `missing_fn()` cannot ride in through strict-data bindings (E1102
+    // fires) and the body's own arity mistake fires too (E1202). The skip
+    // is reported, not silent (MIX-D3018).
+    let src = "$o = read_file(\"opts.mix\")\n$r = ssh_mix(\"a\", '\nprint($x)\nmissing_fn()\nfn helper($n)\n  return $n\nend\nprint(helper())\n', $o)\n";
+    let c = codes(src);
+    assert!(!c.iter().any(|x| x == "MIX-E1101"), "{c:?}");
+    assert!(c.iter().any(|x| x == "MIX-E1102"), "{c:?}");
+    assert!(c.iter().any(|x| x == "MIX-E1202"), "{c:?}");
+    assert!(c.iter().any(|x| x == "MIX-D3018"), "{c:?}");
+}
+
+#[test]
+fn a_typo_suspect_in_an_unknown_opts_body_gets_a_note() {
+    // MIX-D3017: `$pott` cannot be proved undefined (dynamic bindings may
+    // supply it), but it is one edit from the body's own parameter
+    // `$port` — the typo is the likelier explanation, so lint records it
+    // instead of passing silently. One edit is one edit: an adjacent
+    // TRANSPOSITION (`$prot`) is TWO edits under plain Levenshtein, and
+    // the short-name threshold is deliberately one, so it stays silent —
+    // broadening it would flood every 4-character dynamic binding with
+    // invented neighbours. A name with no near neighbour (a plain
+    // dynamic binding) stays silent.
+    let src = "$o = read_file(\"opts.mix\")\n$r = ssh_mix(\"a\", '\nfn connect($port)\n  return $pott\nend\nprint(connect(22))\n', $o)\n";
+    let d = diags(src);
+    let note = d
+        .iter()
+        .find(|(c, ..)| c == "MIX-D3017")
+        .expect("typo-suspect note");
+    assert!(note.3.contains("$pott"), "{}", note.3);
+    assert!(note.3.contains("did you mean '$port'"), "{}", note.3);
+    assert!(!d.iter().any(|(c, ..)| c == "MIX-E1101"), "{d:?}");
+    // `$x` alone has nothing near it in the body: silent, no invented
+    // finding.
+    let src = "$o = read_file(\"opts.mix\")\n$r = ssh_mix(\"a\", '\nprint($x)\n', $o)\n";
+    assert!(!codes(src).iter().any(|c| c == "MIX-D3017"), "{:?}", codes(src));
+}
+
+#[test]
+fn w2402_stands_down_when_the_bodys_opts_are_unreadable() {
+    // "did you mean `${target}`?" splices the LOCAL value into remote
+    // source — only safe when the name universe is known. With unreadable
+    // opts any free name could be a remote binding, so the whole heredoc
+    // stands down; the unreadable opts are reported as MIX-D3018 instead.
+    let src = "$target = \"x\"\n$probe = <<END\nprint($target)\nEND\n$o = read_file(\"o.mix\")\n$r = ssh_mix(\"a\", $probe, $o)\n";
+    let c = codes(src);
+    assert!(!c.iter().any(|x| x == "MIX-W2402"), "{c:?}");
+    assert!(!c.iter().any(|x| x == "MIX-E1101"), "{c:?}");
+    assert!(c.iter().any(|x| x == "MIX-D3018"), "{c:?}");
+    // The control: readable opts keep the warning for a name that is NOT
+    // injected.
+    let src = "$target = \"x\"\n$probe = <<END\nprint($target)\nEND\n$r = ssh_mix(\"a\", $probe, {bindings: {other: 1}})\n";
+    assert!(codes(src).iter().any(|c| c == "MIX-W2402"), "{:?}", codes(src));
 }
 
 #[test]
@@ -537,4 +624,221 @@ fn an_ssh_mix_many_body_is_analysed_like_an_ssh_mix_body() {
     // And an unreadable body is reported, not silently clean.
     let c = codes("$r = ssh_mix_many([\"a\"], $a .. $b)\n");
     assert!(c.iter().any(|x| x == "MIX-D3012"), "{c:?}");
+}
+
+// ── decoded-line → physical-line mapping (TODO-mix 2026-09-25 residual) ─
+
+#[test]
+fn a_double_quoted_escaped_body_reports_on_its_one_physical_line() {
+    // THE bug this closes: `\n` escapes decode to inner lines that have
+    // no physical line of their own — every diagnostic must report on the
+    // literal's single physical line (1 here), not spread across
+    // invented lines.
+    let src = "$r = ssh_mix(\"a\", \"print(1)\\nprint($typo)\")\n";
+    assert_eq!(src.lines().count(), 1);
+    let d = diags_with_source(src);
+    let e1101: Vec<_> = d.iter().filter(|(c, ..)| c == "MIX-E1101").collect();
+    assert_eq!(e1101.len(), 1, "{d:?}");
+    assert_eq!(e1101[0].2, Some(1), "{d:?}");
+}
+
+#[test]
+fn a_physically_multiline_double_quoted_body_still_maps_one_to_one() {
+    // Real newlines are real lines — the map must not collapse them.
+    let src = "$r = ssh_mix(\"a\", \"print(1)\nprint($typo)\")\n";
+    assert_eq!(src.lines().count(), 2);
+    let d = diags_with_source(src);
+    let hit = d.iter().find(|(c, ..)| c == "MIX-E1101").expect("reported");
+    assert_eq!(hit.2, Some(2), "{d:?}");
+}
+
+#[test]
+fn a_heredoc_escape_reports_on_the_escapes_physical_line() {
+    // `\n` inside a heredoc body adds a decoded line with no physical
+    // one: the decoded line-2 finding lands on the heredoc line the
+    // escape was written on (line 2), not on an invented line 3.
+    let src = "$probe = <<END\nprint(1)\\nprint($typo)\nEND\n$r = ssh_mix(\"a\", $probe)\n";
+    assert_eq!(src.lines().nth(1).unwrap(), "print(1)\\nprint($typo)");
+    let d = diags_with_source(src);
+    let hit = d.iter().find(|(c, ..)| c == "MIX-E1101").expect("reported");
+    assert_eq!(hit.2, Some(2), "{d:?}");
+}
+
+#[test]
+fn a_unicode_escape_newline_stays_on_its_physical_line() {
+    // `\u{000A}` decodes to a newline with no physical line of its own —
+    // the same rule as `\n`, through a different escape arm.
+    let src = "$r = ssh_mix(\"a\", \"print(1)\\u{000A}print($typo)\")\n";
+    let d = diags_with_source(src);
+    let hit = d.iter().find(|(c, ..)| c == "MIX-E1101").expect("reported");
+    assert_eq!(hit.2, Some(1), "{d:?}");
+}
+
+#[test]
+fn a_parse_error_in_an_escaped_body_maps_to_the_physical_line() {
+    // The unparsable-body finding carries the error's OWN inner line,
+    // mapped like any other diagnostic — not the body's first line.
+    let src = "$r = ssh_mix(\"a\", \"if 1 == 1 or\\n  2 == 2 then\\nend\")\n";
+    let d = diags_with_source(src);
+    let hit = d
+        .iter()
+        .find(|(c, ..)| c == "MIX-D3012")
+        .expect("an unparsable body must be reported");
+    assert!(hit.3.contains("did not parse"), "{}", hit.3);
+    assert_eq!(hit.2, Some(1), "{d:?}");
+}
+
+#[test]
+fn a_lexer_error_in_an_escaped_body_maps_to_the_physical_line() {
+    // An unterminated single-quoted string on the body's second decoded
+    // line: the finding lands on the ONE physical line the body occupies.
+    let src = "$r = ssh_mix(\"a\", \"print(1)\\n$s = 'oops\")\n";
+    let d = diags_with_source(src);
+    let hit = d
+        .iter()
+        .find(|(c, ..)| c == "MIX-D3012")
+        .expect("an unlexable body must be reported");
+    assert!(hit.3.contains("did not parse"), "{}", hit.3);
+    assert_eq!(hit.2, Some(1), "{d:?}");
+}
+
+#[test]
+fn identical_escaped_bodies_in_one_statement_keep_a_finding_each() {
+    // Two identical escaped literals in one statement: one finding per
+    // body, both on the single physical line they share.
+    let src = "$r = [ssh_mix(\"a\", \"missing()\\n\"), ssh_mix(\"b\", \"missing()\\n\")]\nprint($r)\n";
+    let d = diags_with_source(src);
+    let lines: Vec<_> = d
+        .iter()
+        .filter(|(c, ..)| c == "MIX-E1102")
+        .map(|x| x.2)
+        .collect();
+    assert_eq!(lines, vec![Some(1), Some(1)], "{d:?}");
+}
+
+#[test]
+fn identical_escaped_bodies_on_distinct_lines_map_to_their_own_lines() {
+    // Three identical escaped bodies on three distinct physical lines,
+    // plus an UNRELATED ordinary string of the same content on the line
+    // above them: each body must claim its own opener. A per-text
+    // ordinal over the pre-filtered opener list used to overshoot once
+    // the statement-line filter thinned it (the second body borrowed the
+    // third's opener, the third fell back to the estimate), and the
+    // ordinary string must not be claimed by any of them.
+    let src = "$plain = \"missing()\\n\"\n$r = ssh_mix(\"a\", \"missing()\\n\")\n$s = ssh_mix(\"b\", \"missing()\\n\")\n$t = ssh_mix(\"c\", \"missing()\\n\")\nprint($r)\n";
+    assert_eq!(src.lines().count(), 5);
+    let d = diags_with_source(src);
+    let lines: Vec<_> = d
+        .iter()
+        .filter(|(c, ..)| c == "MIX-E1102")
+        .map(|x| x.2)
+        .collect();
+    assert_eq!(lines, vec![Some(2), Some(3), Some(4)], "{d:?}");
+}
+
+#[test]
+fn a_once_bound_body_shipped_with_different_opts_keeps_one_source_map() {
+    // The same variable-bound literal shipped twice with DIFFERENT
+    // bindings is ONE body, analysed twice (the findings differ: each
+    // binding covers one of the two reads) — but it has ONE physical
+    // source, the assignment's literal on line 1, so both findings
+    // report there. The second call must not claim another opener (there
+    // is none) and must not fall back to its own call line.
+    let src = "$body = \"print($x .. $y)\\n\"\n$r = ssh_mix(\"a\", $body, {bindings: {x: 1}})\n$s = ssh_mix(\"b\", $body, {bindings: {y: 2}})\n";
+    let d = diags_with_source(src);
+    let e1101: Vec<_> = d.iter().filter(|(c, ..)| c == "MIX-E1101").collect();
+    assert_eq!(e1101.len(), 2, "{d:?}");
+    assert_eq!(e1101[0].2, Some(1), "{d:?}");
+    assert_eq!(e1101[1].2, Some(1), "{d:?}");
+    assert!(e1101.iter().any(|x| x.3.contains("$x")), "{e1101:?}");
+    assert!(e1101.iter().any(|x| x.3.contains("$y")), "{e1101:?}");
+}
+
+#[test]
+fn without_source_text_the_linear_estimate_is_pinned() {
+    // `analyze()` without `AnalyzerConfig::source` cannot tell an escape
+    // from a physical newline. The documented estimate
+    // `first_line + inner - 1` stands — exact for a physical multi-line
+    // literal, best effort for an escaped one. Pinned so changing the
+    // convention is a conscious diff, not drift.
+    let src = "$h = \"a\"\n$r = ssh_mix($h, \"print(1)\\nprint($typo)\")\n";
+    let d = diags(src); // default config: no source text
+    let hit = d.iter().find(|(c, ..)| c == "MIX-E1101").expect("reported");
+    assert_eq!(hit.2, Some(3), "{d:?}"); // stmt line 2 + inner line 2 - 1
+}
+
+#[test]
+fn ordinary_literal_before_identical_remote_body_in_one_statement_does_not_steal_map() {
+    let src = "$r = [\"missing()\n\", ssh_mix(\"a\", \"missing()\\n\")]\n";
+    let d = diags_with_source(src);
+    let lines: Vec<_> = d.iter().filter(|(c, ..)| c == "MIX-E1102").map(|x| x.2).collect();
+    assert_eq!(lines, vec![Some(2)], "{d:?}");
+}
+
+#[test]
+fn identical_quoted_map_key_before_remote_value_does_not_steal_map() {
+    let src = "$r = {\"missing()\n\": ssh_mix(\"a\", \"missing()\\n\")}\n";
+    let d = diags_with_source(src);
+    let lines: Vec<_> = d.iter().filter(|(c, ..)| c == "MIX-E1102").map(|x| x.2).collect();
+    assert_eq!(lines, vec![Some(2)], "{d:?}");
+}
+
+#[test]
+fn branch_body_literals_claim_maps_before_later_branch_conditions() {
+    let src = "if true then\n  $plain = \"missing()\n\"\nelse if ssh_mix(\"a\", \"missing()\\n\") then\n  print(1)\nend\n";
+    let d = diags_with_source(src);
+    let lines: Vec<_> = d.iter().filter(|(c, ..)| c == "MIX-E1102").map(|x| x.2).collect();
+    assert_eq!(lines, vec![Some(4)], "{d:?}");
+}
+
+// ── literal-origin pairing: non-expression strings cannot steal a map ──
+
+#[test]
+fn a_bare_keyword_map_key_does_not_steal_an_identical_bodys_map() {
+    // The blocker this pairing closes: a bare map key (`if` — keywords
+    // are legal bare keys) is a KEY, not an expression literal. It must
+    // not consume the opener of the identical remote body written later
+    // in the same statement, or the body's parse error would fall back
+    // to the enclosing statement line (1) instead of the quoted body's
+    // own physical line (2).
+    let src = "$r = {\n  if: ssh_mix(\"a\", \"if\")\n}\nprint($r)\n";
+    assert_eq!(src.lines().nth(1).unwrap(), "  if: ssh_mix(\"a\", \"if\")");
+    let d = diags_with_source(src);
+    let hit = d.iter().find(|(c, ..)| c == "MIX-D3012").expect("`if` alone is not Mix");
+    assert!(hit.3.contains("did not parse"), "{}", hit.3);
+    assert_eq!(hit.2, Some(2), "{d:?}");
+}
+
+#[test]
+fn identical_text_in_condition_and_body_map_to_their_own_lines() {
+    // The same decoded text in a branch CONDITION and inside the branch's
+    // BODY: each literal keeps its own opener in source order —
+    // conditions are walked before their bodies, bodies before later
+    // conditions (the general scope walker would swap these).
+    let src = "if ssh_mix(\"a\", \"missing()\\n\") then\n  ssh_mix(\"b\", \"missing()\\n\")\nend\nprint(1)\n";
+    let d = diags_with_source(src);
+    let lines: Vec<_> = d.iter().filter(|(c, ..)| c == "MIX-E1102").map(|x| x.2).collect();
+    assert_eq!(lines, vec![Some(1), Some(2)], "{d:?}");
+}
+
+#[test]
+fn a_quoted_parse_delimiter_does_not_claim_a_body_map() {
+    // A quoted `parse … with "<delim>"` text is a parse PART, not an
+    // expression literal: identical decoded text must not steal the
+    // opener of the remote body on the next line.
+    let src = "parse $s with \"missing()\\n\" to $y\n$r = ssh_mix(\"a\", \"missing()\\n\")\nprint($r)\n";
+    let d = diags_with_source(src);
+    let lines: Vec<_> = d.iter().filter(|(c, ..)| c == "MIX-E1102").map(|x| x.2).collect();
+    assert_eq!(lines, vec![Some(2)], "{d:?}");
+}
+
+#[test]
+fn an_on_doc_string_does_not_claim_a_body_map() {
+    // The `on … desc "<doc>"` string is handler metadata, not an
+    // expression literal: identical text must not steal the opener of
+    // the remote body below it.
+    let src = "on foo desc \"missing()\\n\"\n  print(1)\nend\n$r = ssh_mix(\"a\", \"missing()\\n\")\nprint($r)\n";
+    let d = diags_with_source(src);
+    let lines: Vec<_> = d.iter().filter(|(c, ..)| c == "MIX-E1102").map(|x| x.2).collect();
+    assert_eq!(lines, vec![Some(4)], "{d:?}");
 }
