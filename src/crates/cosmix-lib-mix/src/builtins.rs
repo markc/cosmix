@@ -370,6 +370,7 @@ builtin_table! {
     ("password_hash", CapabilityClass::Pure,   "system",  "Hash a password: password_hash(plaintext[, cost]) → bcrypt $2b$… string (cost 4-31, default 12; input over 72 bytes raises), or password_hash(plaintext, {scheme: \"sha512-crypt\"[, rounds]}) → $6$… for Dovecot/NS passdbs (rounds 1000-999999999, default 5000). Client-side hashing before writing maild.accounts.password over the Bus — a raw props.set stores the field verbatim (requires crypto feature; v0.71.0, sha512-crypt v0.102.6)", contract!((plaintext: string, opts?: any_of(number, map, nil)) -> string; failure[raises])),
     ("password_verify", CapabilityClass::Pure, "system",  "Check a plaintext password against a hash: bcrypt (any $2a$/$2b$/$2y$ form) or SHA-crypt ($6$/$5$, incl. the Dovecot {SHA512-CRYPT} prefix) → bool. A malformed hash RAISES rather than answering false — a corrupt stored hash is a config fault, not a wrong password (requires crypto feature; v0.71.0, sha-crypt v0.102.6)", contract!((plaintext: string, hash: string) -> bool; failure[raises])),
     ("constant_time_eq", CapabilityClass::Pure, "system",  "Timing-safe equality for secrets/MACs: compares full length with no early exit (plain == leaks a timing oracle). Use for webhook signature comparison. Accepts string/bytes/buffer", contract!((a: any_of(string, bytes, buffer), b: any_of(string, bytes, buffer)) -> bool)),
+    ("jwt_rs256_sign", CapabilityClass::Pure, "system", "Sign JSON object claims with a PEM RSA private key using RS256; optional JSON object headers, alg pinned to RS256. Returns a compact JWT; crypto feature. No token exchange or expiry/audience policy", contract!((claims_json: string, private_pem: string, header_json?: any_of(string, nil)) -> string; failure[raises])),
     ("hash_file", CapabilityClass::FsRead,     "system",  "Streaming digest of a file, fixed 64 KiB working set whatever the size: hash_file(path[, \"md5\"|\"sha1\"|\"sha256\"|\"blake3\"|nil][, {raw:true}]) → lowercase hex, or bytes with {raw:true}. md5/sha1 added v0.66.0 and are BROKEN hashes for legacy interop only (v0.24.0)", contract!((path: string, algo?: any_of(string, nil), opts?: any_of(map, nil)) -> any_of(string, bytes); failure[raises]; hints[algo: "one of \"md5\", \"sha1\", \"sha256\" or \"blake3\"; a map here is the options map placed one position early — write hash_file(path, \"sha256\", {raw: true})"])),
     ("uuid", CapabilityClass::Pure,            "system",  "Generate a new random UUID v4 string", contract!(() -> string)),
     ("dkim_keygen", CapabilityClass::Pure,     "system",  "Generate a DKIM keypair. dkim_keygen(\"rsa\", [bits=2048]) or dkim_keygen(\"ed25519\") → {algorithm, private_pem, public_b64, dns_txt_record}", contract!((algo: string, bits?: number) -> map("dkim_keypair", {algorithm: string, private_pem: string, public_b64: string, dns_txt_record: string}))),
@@ -817,6 +818,7 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
         }),
         #[cfg(feature = "crypto")]
         "constant_time_eq" => builtin_constant_time_eq(args),
+        "jwt_rs256_sign" => builtin_jwt_rs256_sign(args),
         #[cfg(not(feature = "crypto"))]
         "constant_time_eq" => Err(MixError::RuntimeError {
             span: None,
@@ -6723,6 +6725,7 @@ fn proc_spec_from<'a>(argv: &'a [String], opts: &'a RunArgvOpts, caller: &'a str
         cwd: opts.cwd.as_deref(),
         env: &opts.env,
         clear_env: opts.clear_env,
+        env_unset: &opts.env_unset,
         max_output: opts.max_output,
         stream: opts.stream,
     }
@@ -8359,6 +8362,8 @@ struct ProcSpec<'a> {
     /// (or on an empty one when `clear_env`).
     env: &'a [(String, String)],
     clear_env: bool,
+    /// Removed after explicit sets; clear_env is applied before both.
+    env_unset: &'a [String],
     /// Per-stream output cap in bytes; `None` = unbounded. Excess is
     /// drained and DISCARDED (the child is not killed, the pipe never
     /// backs up) with the outcome's truncation flag set.
@@ -9412,6 +9417,9 @@ fn run_pipeline_processes(
             for (key, value) in &stage.opts.env {
                 command.env(key, value);
             }
+            for key in &stage.opts.env_unset {
+                command.env_remove(key);
+            }
             if let Some(cwd) = &stage.opts.cwd {
                 command.current_dir(cwd);
             }
@@ -10199,6 +10207,7 @@ fn run_process(spec: &ProcSpec<'_>) -> MixResult<ProcOutcome> {
         cwd,
         env,
         clear_env,
+        env_unset,
         max_output,
         stream,
     } = spec;
@@ -10325,6 +10334,9 @@ fn run_process(spec: &ProcSpec<'_>) -> MixResult<ProcOutcome> {
     }
     for (k, v) in env.iter() {
         cmd.env(k, v);
+    }
+    for k in env_unset.iter() {
+        cmd.env_remove(k);
     }
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
@@ -10760,6 +10772,7 @@ fn run_ssh_process(
         cwd: None,
         env: &[],
         clear_env: false,
+        env_unset: &[],
         max_output,
         stream: false,
     })?;
@@ -19765,6 +19778,30 @@ fn builtin_hmac_sha256(args: Vec<Value>) -> MixResult<Option<Value>> {
     // caller can `constant_time_eq` them against a decoded signature without
     // a hex round trip in between.
     hash_output("hmac_sha256", outer.finalize().to_vec(), args.get(2))
+}
+
+/// Generic compact JWT signing; the feature-disabled entry stays callable.
+fn builtin_jwt_rs256_sign(args: Vec<Value>) -> MixResult<Option<Value>> {
+    if !(2..=3).contains(&args.len()) {
+        return Err(MixError::structured("ARITY_MISMATCH", "jwt_rs256_sign expects 2 or 3 arguments"));
+    }
+    #[cfg(feature = "crypto")]
+    {
+        let Value::String(claims) = &args[0] else {
+            return Err(MixError::structured("TYPE_MISMATCH", "jwt_rs256_sign: claims_json must be a string; use json_encode first"));
+        };
+        let Value::String(pem) = &args[1] else {
+            return Err(MixError::structured("TYPE_MISMATCH", "jwt_rs256_sign: private_pem must be a string"));
+        };
+        let header = match args.get(2) {
+            None | Some(Value::Nil) => None,
+            Some(Value::String(s)) => Some(s.as_str()),
+            Some(_) => return Err(MixError::structured("TYPE_MISMATCH", "jwt_rs256_sign: header_json must be a string or nil")),
+        };
+        Ok(Some(Value::String(crate::jwt::sign_rs256(claims, pem, header)?)))
+    }
+    #[cfg(not(feature = "crypto"))]
+    Err(MixError::structured("FEATURE_DISABLED", "jwt_rs256_sign requires the crypto feature"))
 }
 
 /// `constant_time_eq(a, b)` — length-checked, full-scan equality with no
@@ -31044,6 +31081,7 @@ mod char_aware_tests {
             "sort",
             "split",
             "sprintf",
+            "jwt_rs256_sign",
             "sql_quote",
             "starts_with",
             "string_to_bytes",
