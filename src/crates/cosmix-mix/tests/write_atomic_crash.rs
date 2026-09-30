@@ -24,6 +24,26 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const SIZE: usize = 16 * 1024 * 1024;
 const ROUNDS: u64 = 5;
 
+// Even a failed assertion must retire the infinite producer.
+struct Writer(std::process::Child);
+impl std::ops::Deref for Writer {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for Writer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+impl Drop for Writer {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 fn inode(path: &Path) -> Option<u64> {
     std::fs::metadata(path).ok().map(|m| m.ino())
 }
@@ -82,14 +102,14 @@ fn sigkill_mid_rewrite_leaves_a_complete_old_or_new_file() {
             }
         }
         let before = inode(&target);
-        let mut child = Command::new(env!("CARGO_BIN_EXE_mix"))
+        let mut child = Writer(Command::new(env!("CARGO_BIN_EXE_mix"))
             .arg(&script)
             .env("MIX_STATS", "off")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()
-            .expect("mix binary must run");
+            .expect("mix binary must run"));
 
         // Progress: a new write must land this round.
         let deadline = Instant::now() + Duration::from_secs(30);
