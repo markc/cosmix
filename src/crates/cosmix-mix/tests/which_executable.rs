@@ -147,7 +147,8 @@ fn non_string_argument_raises_rather_than_being_coerced() {
         .expect("mix binary must run");
     assert!(!out.status.success(), "which(list) must fail");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("cmd must be a string"), "stderr={stderr}");
+    // The A2 contract gate (0.103.1) raises before which's own check.
+    assert!(stderr.contains("argument 1 (cmd) must be string"), "stderr={stderr}");
 }
 
 /// The probe must agree with reality: whatever `which` returns has to be
