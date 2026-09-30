@@ -655,7 +655,7 @@ fn supervise_task(
         return;
     }
 
-    groups().push(pid);
+    register_group(pid);
     let _ = ready.send(Ok(()));
 
     let outcome = supervise(&rx, pid, spec.timeout, &cancelling);
@@ -701,6 +701,14 @@ fn supervise_task(
     publish_and_reap(report, settled, || reap_registered(pid));
 }
 
+fn register_group(pid: libc::pid_t) {
+    // Published task ownership must also reach the library liveness probe:
+    // its unmanaged-child fast path must never consume this wait status.
+    let mut live = groups();
+    cosmix_mix::builtins::register_managed_pid(pid);
+    live.push(pid);
+}
+
 fn publish_and_reap(report: TaskReport, settled: impl FnOnce(TaskReport), reap: impl FnOnce()) {
     if matches!(report.outcome, Outcome::Unknown { .. }) {
         // A bounded ladder must be able to answer even if the kernel cannot
@@ -733,6 +741,7 @@ fn reap_registered(pid: libc::pid_t) {
         };
         if result == pid || (result < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)) {
             live.retain(|tracked| *tracked != pid);
+            cosmix_mix::builtins::unregister_managed_pid(pid);
             return;
         }
         drop(live);
@@ -1284,6 +1293,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn process_alive_preserves_registered_task_wait_status() {
+        // Exercise the real library liveness builtin against a real zombie
+        // registered through the same path as an admitted native task.
+        // Only libc runs after fork; no inherited Rust mutex is acquired.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            unsafe {
+                if libc::setsid() < 0 { libc::_exit(125); }
+                libc::_exit(7);
+            }
+        }
+        register_group(pid);
+        struct ReapOnDrop(libc::pid_t);
+        impl Drop for ReapOnDrop {
+            fn drop(&mut self) { reap_registered(self.0); }
+        }
+        let owned = ReapOnDrop(pid);
+        assert!(matches!(observe(pid), Event::Exited(status) if status.code() == Some(7)));
+        let alive = cosmix_mix::builtins::call_builtin(
+            "process_alive", vec![cosmix_mix::value::Value::Number(f64::from(pid))],
+        ).unwrap();
+        let retained = observe(pid);
+        // Cleanup precedes assertions so the fail-first run also retires its
+        // test-owned registration even when the builtin stole the status.
+        drop(owned);
+        assert!(matches!(alive, Some(cosmix_mix::value::Value::Bool(true))), "liveness probe must leave the owned zombie for its supervisor");
+        assert!(matches!(retained, Event::Exited(status) if status.code() == Some(7)), "supervisor must retain the actual exit status");
+    }
+
+    #[test]
     fn unknown_report_precedes_kernel_cleanup_and_retains_native_capacity() {
         // Model the ladder's Unknown with a real live, test-owned child held
         // on a pipe. This proves publication/cleanup ordering without trying
@@ -1306,7 +1346,7 @@ mod tests {
         unsafe { libc::close(pipe[0]); }
         // SAFETY: parent uniquely owns this fresh pipe descriptor.
         let release = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
-        groups().push(pid);
+        register_group(pid);
         let permit = SupervisorPermit::reserve().unwrap_or_else(|_| panic!("native slot"));
         let (published, report_rx) = mpsc::channel();
         let supervisor = std::thread::spawn(move || {
