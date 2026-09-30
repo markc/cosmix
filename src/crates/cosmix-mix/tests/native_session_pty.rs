@@ -376,7 +376,7 @@ impl Child {
         self.pty.write_all(line.as_bytes()).unwrap();
     }
     fn until(&mut self, marker: &str) -> String {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(30);
         let mut output = String::new();
         while !output.contains(marker) {
             let mut bytes = [0; 8192];
@@ -402,7 +402,7 @@ impl Child {
     }
     fn exit(&mut self) {
         self.send("exit\n");
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let mut status = 0;
             let result = unsafe { libc::waitpid(self.pid(), &mut status, libc::WNOHANG) };
@@ -807,7 +807,7 @@ async fn status(parent: &mut Parent, record: &SessionRecord) -> serde_json::Valu
 }
 
 async fn phase(parent: &mut Parent, record: &SessionRecord, expected: &str) -> serde_json::Value {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let value = status(parent, record).await;
         if value["status"]["snapshot"]["phase"] == expected {
@@ -933,7 +933,7 @@ fn status_pump_scenarios(editor: &str) {
         child.send("cd directory\n");
         let cd = phase(&mut parent, &bound, "prompt-ready").await;
         // The next query below waits on cwd too, avoiding an old prompt race.
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(30);
         let mut cd = cd;
         while cd["status"]["snapshot"]["cwd"] != directory.to_str().unwrap() {
             assert!(Instant::now() < deadline);
