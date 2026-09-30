@@ -32902,7 +32902,7 @@ mod strict_write_and_bool_option_tests {
     #[test]
     fn nullable_option_maps_keep_their_named_fields() {
         use crate::builtin_info::TypeShape;
-        fn fields_of<'a>(kind: &'a TypeShape) -> &'a [crate::builtin_info::FieldInfo] {
+        fn fields_of(kind: &TypeShape) -> &[crate::builtin_info::FieldInfo] {
             match kind {
                 TypeShape::AnyOf(shapes) => {
                     let maps: Vec<&[crate::builtin_info::FieldInfo]> = shapes
