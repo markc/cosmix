@@ -3084,7 +3084,11 @@ struct ExprDepthGuard(*mut usize);
 
 impl ExprDepthGuard {
     unsafe fn enter(depth: *mut usize) -> Self {
-        *depth += 1;
+        // SAFETY: the caller passes a pointer into `self.ctx.expr_depth`,
+        // which outlives the guard.
+        unsafe {
+            *depth += 1;
+        }
         ExprDepthGuard(depth)
     }
 }
