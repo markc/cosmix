@@ -447,7 +447,6 @@ fn lint_one(
     // invariant (semicolon_process.rs) depends on this.
     let stmts =
         match cosmix_mix::parser::Parser::new_speculative(tokens, source).parse_program() {
-    let stmts = match cosmix_mix::parser::Parser::new(tokens, source).parse_program() {
         Ok(s) => s,
         Err(MixError::ParseError { msg, span }) | Err(MixError::IncompleteInput { msg, span }) => {
             let diag = to_diag(
