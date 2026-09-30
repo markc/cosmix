@@ -68,7 +68,7 @@ fn multipart_body_reaches_the_server_well_formed() {
         "request line: {req}"
     );
     assert!(
-        req.contains("content-type: multipart/form-data; boundary="),
+        req.contains("Content-Type: multipart/form-data; boundary="),
         "content-type header: {req}"
     );
     assert!(
