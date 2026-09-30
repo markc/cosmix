@@ -140,14 +140,14 @@ async fn watcher(root: &Path, recursive: bool) -> Evaluator {
 async fn delivered(e: &mut Evaluator, path: &Path, kind: &str) -> Value {
     e.set_global("wanted_path", Value::String(path.to_str().unwrap().into()));
     e.set_global("wanted_kind", Value::String(kind.into()));
-    // 60 s: the pump waits for an inotify delivery that a busy cbc worker
-    // under a parallel test battery can miss past 30 s (observed 2026-09-29,
-    // classifier battery, 30.03 s wall on the Elapsed arm; the same test
-    // passed in isolation at both 5 s and 30 s bounds). The timeout is a
-    // fail-fast guard, not the thing under test — a generous total keeps
-    // the gate load-independent while a genuine regression still fails in
-    // bounded time.
-    tokio::time::timeout(Duration::from_secs(60), e.run_event_pump())
+    // 120 s: the pump waits for an inotify delivery that a busy cbc worker
+    // under a parallel test battery can miss past 60 s (observed
+    // 2026-09-30, overnight stretch, 60 s Elapsed arm repeatedly under
+    // sustained battery load; the same test passes in isolation at 5 s).
+    // The timeout is a fail-fast guard, not the thing under test — a
+    // generous total keeps the gate load-independent while a genuine
+    // regression still fails in bounded time.
+    tokio::time::timeout(Duration::from_secs(120), e.run_event_pump())
         .await
         .expect("native event deadline")
         .unwrap();
