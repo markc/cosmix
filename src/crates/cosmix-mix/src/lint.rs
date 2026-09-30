@@ -424,6 +424,17 @@ fn lint_one(
             hint: None,
         })
     };
+    // AMP scene envelope (2026-09-26 entry): a `---` front-matter header
+    // followed by a ```mix-fenced map. The script lexer has no backtick
+    // token, so it E1003s on the fence; both halves are data-shaped
+    // (`key: value`), so lint validates the extracted body as strict data
+    // instead of failing every scene file.
+    if let Some(body) = amp_strict_data(source) {
+        return match cosmix_mix::parse_data(&body) {
+            Ok(_) => Ok(LintOutcome::StrictData),
+            Err(e) => Err(Box::new(strict_data_diagnostic(e, file))),
+        };
+    }
     let tokens = match cosmix_mix::lexer::Lexer::new(source).tokenize() {
         Ok(t) => t,
         Err(MixError::LexerError { msg, span }) => {
@@ -495,6 +506,34 @@ fn strict_data_fallback(
         }
         Err(_) => Err(script_diag),
     }
+}
+
+/// Extract the strict-data body of an AMP scene envelope, or `None` when
+/// the source is not one. An envelope is a `---`-delimited front-matter
+/// header followed by a ````mix-fenced map; both halves are `key: value`
+/// data, so lint validates them as a single data document. The header
+/// lines between the two `---` markers and the fenced body are
+/// concatenated with the markers and fences removed.
+fn amp_strict_data(source: &str) -> Option<String> {
+    let fence = "```mix";
+    let fence_at = source.find(fence)?;
+    // Fenced body: after the fence line's newline, up to the closing
+    // ``` line.
+    let rest = &source[fence_at + fence.len()..];
+    let body_start = rest.find('\n').map(|i| i + 1).unwrap_or(0);
+    let close_at = rest[body_start..].find("\n```")?;
+    let body = rest[body_start..body_start + close_at].trim();
+    // Header: strip the two `---` markers around the front matter.
+    let head = source[..fence_at].trim();
+    let header = head
+        .strip_prefix("---")
+        .and_then(|inner| inner.strip_suffix("---"))
+        .map(str::trim)
+        .unwrap_or(head);
+    if header.is_empty() && body.is_empty() {
+        return None;
+    }
+    Some(format!("{header}\n{body}"))
 }
 
 /// A successful strict-data parse is decisive. When both grammars fail,
