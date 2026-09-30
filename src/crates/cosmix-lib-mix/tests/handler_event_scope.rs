@@ -63,6 +63,7 @@ async fn rc_result_reply_are_isolated_per_handler_invocation() {
     // OWN $rc, and the outer $rc survives.
     let source = r#"
 $rc = 42
+$observed = ""
 on first.evt
   $rc = 7
   $observed = $rc
