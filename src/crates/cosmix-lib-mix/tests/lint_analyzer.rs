@@ -1136,6 +1136,9 @@ fn chain_operand_blocks_and_send_commands_are_walked() {
     assert!(out.contains(&"MIX-E1101".to_string()), "got: {out:?}");
     let out = codes("ssh_mix(\"h\", \"print(1)\")\nif true then\n  ssh_mix(\"h\", \"print(undefinedfn(1))\")\nend && print(2)\n");
     assert!(out.contains(&"MIX-E1102".to_string()), "got: {out:?}");
+    // `$f(1)` in the command position: $f is an undefined VARIABLE, so
+    // the walk produces E1101 — the point is that the command expr is
+    // visited at all (it produced nothing before the fix).
     let out = codes("send \"svc\" $f(1)\n");
-    assert!(out.contains(&"MIX-E1102".to_string()), "got: {out:?}");
+    assert!(out.contains(&"MIX-E1101".to_string()), "got: {out:?}");
 }
