@@ -1200,6 +1200,11 @@ pub fn conditional_cap_engaged(name: &str, args: &[Value], option: &str) -> bool
     args.iter().any(|v| map_has(Some(v)))
 }
 
+/// Iterate every metadata entry (builtins + HOFs) — the registry the
+/// A7-generated arity test and the discovery surfaces draw from.
+pub fn builtin_entries() -> impl Iterator<Item = &'static crate::builtin_info::BuiltinInfo> {
+    BUILTINS.iter().chain(crate::builtins_hof::HOFS.iter())
+}
 /// O(1) lookup of a builtin's full metadata entry (builtins + HOFs) —
 /// the machine side of the discovery surface, used by the strict-arity
 /// gate, conditional capabilities, and `mix lint`'s arity checker.
