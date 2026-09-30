@@ -144,9 +144,19 @@ hello world
 hello mix
 ```
 
-A missing argument with no default binds nil. Extra arguments are silently ignored (`f(1, 2, 3)` against `function f($a)` just binds `$a = 1`).
+A missing argument with no default binds nil. Extra arguments are silently ignored for *user-defined* functions (`f(1, 2, 3)` against `function f($a)` just binds `$a = 1`); metadata builtins warn on a surplus since 0.102.8 (below), and the always-strict families (`task_start`, the `fs_watch`/`fs_unwatch`/`fs_wait` set, the `net_watch`/`audio_watch`/`*_state` set) raise on any mismatch in every mode.
 
 Since 0.29.0 that tolerance is a **mode**: `mix --strict-arity script.mix` (or an embedder's `ArityMode::Strict`) raises a catchable `ARITY_MISMATCH` structured error instead — before the function body runs — whenever a call's argument count falls outside `min..=max` (min = parameters without defaults). Strict mode also enforces every builtin's contract arity from the machine metadata, so `run_stream(["true"], {}, 5)`'s silently-ignored surplus argument becomes an error. (That example read `run_stream(argv, {timeout: 5})` until 0.51.0, when run_stream gained an options map and began refusing `timeout` **by name** as `OPTION_INVALID` — in every mode, not just this one.) The compatible binding stays the default; exact arity would only ever become the language default at an announced major compatibility boundary, after explicit variadic syntax lands. `mix lint` flags statically provable mismatches in either mode.
+
+Since 0.102.8, the compatible mode stops being *silent* about the builtin
+surplus: a metadata-builtin call with an extra argument prints one stderr
+warning per (builtin, count) per process — `mix: warning: pop() called with
+2 argument(s), contract is pop(list) -> any — the surplus is ignored for now
+and will become an error in the next minor release`. A missing argument
+binds nil as ever, and the always-strict families (above) keep raising in
+every mode. Operator-facing equivalents of the flag are `MIX_STRICT_ARITY=1`,
+`$strict_arity = true` in `~/.mixrc`, and `ssh_mix(host, src, {strict_arity:
+true})` (0.102.7 — see [invocation](invocation.md)).
 
 > **A keyword can't be a function name.** `function step(...)` and `fn to(...)` are parse errors (`expected identifier, got Step`) — and that includes non-obvious [reserved words](keywords.md) like `step`, `to`, `label`. Pick `phase`, `say_step`, etc. `$`-sigil *variable* and *parameter* names are unaffected — the sigil disambiguates, so `$step = 1` and `function f($to)` both work.
 

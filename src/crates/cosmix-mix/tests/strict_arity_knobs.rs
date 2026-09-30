@@ -76,3 +76,51 @@ fn trailing_mix_flag_is_warned_not_silently_ignored() {
         "trailing flag must warn: {stderr}"
     );
 }
+
+#[test]
+fn surplus_builtin_args_warn_once_in_compat_mode() {
+    // A1 step 2: the compatible mode warns — once per (builtin, count) per
+    // process — instead of silently ignoring a surplus argument.
+    let out = mix_bin()
+        .env_remove("MIX_STRICT_ARITY")
+        .args(["-c", "pop([1, 2], 0)\npop([1, 2], 0)"])
+        .output()
+        .expect("run mix");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "compat mode keeps running: {stderr}");
+    let count = stderr.matches("surplus is ignored").count();
+    assert_eq!(count, 1, "exactly one warning per (builtin, count): {stderr}");
+    assert!(stderr.contains("pop() called with 2 argument(s)"), "got: {stderr}");
+}
+
+#[test]
+fn contract_clean_builtin_calls_do_not_warn() {
+    let out = mix_bin()
+        .env_remove("MIX_STRICT_ARITY")
+        .args(["-c", "print(pop([1, 2]))"])
+        .output()
+        .expect("run mix");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "clean call runs: {stderr}");
+    assert!(
+        !stderr.contains("surplus is ignored"),
+        "contract-clean calls must not warn: {stderr}"
+    );
+}
+
+#[test]
+fn missing_args_are_not_mislabeled_as_surplus() {
+    // A missing argument is the compatible nil binding — NOT an ignored
+    // surplus — so a 0-arg pop() must not print the surplus warning,
+    // whatever the call itself then does.
+    let out = mix_bin()
+        .env_remove("MIX_STRICT_ARITY")
+        .args(["-c", "print(pop())"])
+        .output()
+        .expect("run mix");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("surplus is ignored"),
+        "missing is not surplus: {stderr}"
+    );
+}

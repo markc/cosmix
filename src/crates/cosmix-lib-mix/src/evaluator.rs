@@ -11377,6 +11377,12 @@ impl Evaluator {
                     // single indexed probe; only under strict mode.
                     if self.ctx.arity_strict {
                         self.check_builtin_arity(name, args.len())?;
+                    } else {
+                        // A1 step 2 (TODO-mix strict-arity sweep): the
+                        // compatible mode ignores a surplus argument — say
+                        // so, once per (builtin, count) per process, ahead
+                        // of the default flip.
+                        self.warn_surplus_arity(name, args.len());
                     }
                     self.track_builtin_attempt(name);
 
@@ -13920,6 +13926,42 @@ impl Evaluator {
             ));
         }
         Ok(())
+    }
+
+    /// A1 step 2 (TODO-mix strict-arity sweep): in compatible mode a
+    /// surplus argument is silently ignored. Warn — once per (builtin,
+    /// count) per process, so a loop does not flood — naming the contract
+    /// and that the surplus becomes an error when the default flips.
+    ///
+    /// SURPLUS only: `n` above the contract max. A MISSING argument
+    /// (`n < min`) is the compatible nil binding, not an ignored surplus —
+    /// flagging it here would mislabel the mode's own documented behavior.
+    /// Variadic builtins have no max and can never warn.
+    fn warn_surplus_arity(&self, name: &str, n: usize) {
+        use std::collections::HashSet;
+        use std::sync::{Mutex, OnceLock};
+        let Some(info) = builtins::builtin_info_of(name) else {
+            return;
+        };
+        if !info.contract.arity_max().is_some_and(|max| n > max) {
+            return;
+        }
+        static SEEN: OnceLock<Mutex<HashSet<(String, usize)>>> = OnceLock::new();
+        let set = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        let mut seen = set.lock().unwrap_or_else(|p| p.into_inner());
+        // Allocation-free repeat check: the set stays tiny (one entry per
+        // (builtin, count) ever warned), so a linear scan beats hashing a
+        // freshly-allocated key on the hot loop path.
+        if seen.iter().any(|(s, c)| s == name && *c == n) {
+            return;
+        }
+        seen.insert((name.to_string(), n));
+        drop(seen);
+        eprintln!(
+            "mix: warning: {name}() called with {n} argument(s), contract is {} — the \
+             surplus is ignored for now and will become an error in the next minor release",
+            info.signature()
+        );
     }
 
     /// Whether a callee's definition file matches the currently
