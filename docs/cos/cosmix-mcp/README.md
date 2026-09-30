@@ -80,7 +80,7 @@ Feedback tools update retrieval scoring for document, journal, and memory chunks
 
 The worker isolates process cwd and inherited stdio from the MCP transport. Results include readable text and typed `stdout`, `stderr` and `exit_code`. Scripts are limited to 256 KiB; captured output and each worker pipe are bounded to 1 MiB. Limit failures report that effects may already have occurred.
 
-An optional working directory may be supplied. A leading `~/` is expanded from `HOME`. Directory changes affect only that worker. Completion or cancellation terminates its owned process group, including descendants; persistent application lifetimes belong to their native service. This is process ownership, not a security sandbox.
+An optional working directory may be supplied. A leading `~/` is expanded from `HOME`. Directory changes affect only that worker. Completion or cancellation terminates its owned process group; Mix's native process runner also protects direct children with parent-death handling. Detached processes that create independent sessions/groups are outside this ownership. Persistent application lifetimes belong to their native service. This is process ownership, not a security sandbox.
 
 ## Configuration
 
