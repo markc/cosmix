@@ -77,6 +77,45 @@ fn keyword_lexeme(tok: &Token) -> Option<&'static str> {
     })
 }
 
+/// Where one literal Expr a parse CONSTRUCTED came from. Recorded only
+/// when the caller opts in ([`Parser::with_literal_origin_recording`]);
+/// ordinary parsing allocates none of this.
+///
+/// The list is in construction order — the parser never backtracks, so
+/// that is the literal Exprs' source order, and it pairs 1:1 with the
+/// same tree's literal Exprs walked in source order. A consumer that
+/// re-parses a source and wants to attach these origins to a DIFFERENT
+/// tree of the same text pairs them positionally and must verify each
+/// pair's `kind` and `text` before trusting it.
+#[derive(Clone)]
+pub struct LiteralOrigin {
+    /// Byte offset of the source token the literal was built from. The
+    /// lexer records its per-literal line maps keyed by the same offsets
+    /// (`Lexer::lex_with_literal_maps`), so an origin joins its
+    /// decoded-line → physical-line map without any text guessing.
+    pub offset: usize,
+    /// Decoded text the literal contributes: the full string for quoted
+    /// literals; for heredocs and interpolated strings, the
+    /// concatenation of their literal parts.
+    pub text: String,
+    /// The Expr variant the literal was built as.
+    pub kind: LiteralOriginKind,
+}
+
+/// The literal Expr variant a [`LiteralOrigin`] describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiteralOriginKind {
+    /// `Expr::StringLiteral` — a quoted string or a bareword.
+    Quoted,
+    /// `Expr::EscapedQuoteStringLiteral` — a double-quoted string whose
+    /// source holds `\"`.
+    EscapedQuote,
+    /// `Expr::InterpolatedString`.
+    Interpolated,
+    /// `Expr::Heredoc`.
+    Heredoc,
+}
+
 pub struct Parser {
     tokens: Vec<SpannedToken>,
     source: Vec<char>,
@@ -95,6 +134,15 @@ pub struct Parser {
     /// attempt — flushes them with `take_deprecations` once it knows the
     /// statements will actually run.
     deprecations: Vec<String>,
+    /// Opt-in literal-origin recording (see
+    /// [`Parser::with_literal_origin_recording`]): push one
+    /// [`LiteralOrigin`] per literal Expr this parse constructs. Off by
+    /// default — ordinary parses push nothing.
+    literal_origin_recording: bool,
+    /// Literal origins in construction order (source order — the parser
+    /// never backtracks). Populated only while `literal_origin_recording`
+    /// is on.
+    literal_origins: Vec<LiteralOrigin>,
 }
 
 impl Parser {
@@ -106,6 +154,8 @@ impl Parser {
             depth: 0,
             speculative: false,
             deprecations: Vec::new(),
+            literal_origin_recording: false,
+            literal_origins: Vec::new(),
         }
     }
 
@@ -126,6 +176,43 @@ impl Parser {
     /// for a parse whose result is discarded.
     pub fn take_deprecations(&mut self) -> Vec<String> {
         std::mem::take(&mut self.deprecations)
+    }
+
+    /// Enable [`LiteralOrigin`] recording for this parse. The origins are
+    /// pushed in construction order — which is the literals' source
+    /// order, because this parser never backtracks — and read afterwards
+    /// with [`Parser::take_literal_origins`]. The `address` statement's
+    /// per-body target CLONES are recorded too, so the list stays aligned
+    /// with the AST the parse returns.
+    pub fn with_literal_origin_recording(mut self) -> Self {
+        self.literal_origin_recording = true;
+        self
+    }
+
+    /// Take the literal origins a recording parse collected (see
+    /// [`Parser::with_literal_origin_recording`]).
+    pub fn take_literal_origins(&mut self) -> Vec<LiteralOrigin> {
+        std::mem::take(&mut self.literal_origins)
+    }
+
+    /// Record one literal origin, only while recording is on.
+    fn record_literal_origin(&mut self, offset: usize, text: &str, kind: LiteralOriginKind) {
+        if self.literal_origin_recording {
+            self.literal_origins.push(LiteralOrigin {
+                offset,
+                text: text.to_string(),
+                kind,
+            });
+        }
+    }
+
+    /// Byte offset of the current token — the source position a literal
+    /// built from that token came from.
+    fn current_offset(&self) -> usize {
+        self.tokens
+            .get(self.pos)
+            .map(|t| t.offset)
+            .unwrap_or(self.source.len())
     }
 
     /// Guarded entry to a recursive parse cycle. Callers that get
@@ -1319,15 +1406,22 @@ impl Parser {
     /// `send target a.b key=val` syntax is unchanged; the key=val lookahead
     /// in `parse_send_args` only fires after this returns.
     fn parse_command_expr(&mut self) -> MixResult<Expr> {
+        let offset = self.current_offset();
         match self.peek() {
             Token::Variable(_)
             | Token::LParen
             | Token::InterpString(_)
             | Token::HeredocString(_)
             | Token::CommandSub(_) => self.parse_expression(),
-            Token::String(_) => Ok(Expr::StringLiteral(self.parse_bus_dotted_name()?)),
+            Token::String(_) => {
+                let name = self.parse_bus_dotted_name()?;
+                self.record_literal_origin(offset, &name, LiteralOriginKind::Quoted);
+                Ok(Expr::StringLiteral(name))
+            }
             _ if self.at_keyword_led_dotted_name() => {
-                Ok(Expr::StringLiteral(self.parse_bus_dotted_name()?))
+                let name = self.parse_bus_dotted_name()?;
+                self.record_literal_origin(offset, &name, LiteralOriginKind::Quoted);
+                Ok(Expr::StringLiteral(name))
             }
             _ => {
                 let span = self.peek_span();
@@ -1479,7 +1573,9 @@ impl Parser {
         // while its quoted form worked. A dotted name WITHOUT a hyphen
         // fails the scan's shape test and falls through to the branch
         // below exactly as before.
+        let hyphen_offset = self.current_offset();
         if let Some(name) = self.take_hyphenated_service_word() {
+            self.record_literal_origin(hyphen_offset, &name, LiteralOriginKind::Quoted);
             return Ok(Expr::StringLiteral(name));
         }
         if (matches!(self.peek(), Token::String(_)) && self.peek_ahead(1) == &Token::Dot)
@@ -1639,7 +1735,12 @@ impl Parser {
     /// Parse: `address "target" ... end`
     fn parse_address(&mut self) -> MixResult<StmtKind> {
         self.advance(); // skip 'address'
+        let target_origin_start = self.literal_origins.len();
         let target = self.parse_send_target()?;
+        // Retain every leaf's actual token offset for each desugared clone.
+        // A compound target has more than one literal and cannot be recorded
+        // from only its top-level Expr shape.
+        let target_origins = self.literal_origins[target_origin_start..].to_vec();
         self.expect_end_of_statement()?;
 
         // Parse body: each line is `command arg1 key=value ...`
@@ -1667,6 +1768,10 @@ impl Parser {
                     span,
                 });
             }
+            // The target Expr is cloned into every body send. Record
+            // each clone BEFORE the body's own command/args so a
+            // literal-origin recording stays in the AST's order.
+            self.literal_origins.extend(target_origins.iter().cloned());
             let (command, args) = self.parse_send_args()?;
             body.push(Stmt::new(
                 StmtKind::Send {
@@ -1897,18 +2002,22 @@ impl Parser {
         // `~` or `~/...` → leading-HOME expansion. Mid-string `~` stays
         // literal (matches `lex_double_string` semantics; preserves DNS
         // tokens like `~bus` that show up in path-adjacent code).
-        if path_text == "~" {
-            Ok(Expr::InterpolatedString(vec![
-                crate::token::StringPart::EnvVar("HOME".to_string()),
-            ]))
+        let parts = if path_text == "~" {
+            vec![crate::token::StringPart::EnvVar("HOME".to_string())]
         } else if let Some(rest) = path_text.strip_prefix("~/") {
-            Ok(Expr::InterpolatedString(vec![
+            vec![
                 crate::token::StringPart::EnvVar("HOME".to_string()),
                 crate::token::StringPart::Literal(format!("/{}", rest)),
-            ]))
+            ]
         } else {
-            Ok(Expr::StringLiteral(path_text))
+            self.record_literal_origin(start, &path_text, LiteralOriginKind::Quoted);
+            return Ok(Expr::StringLiteral(path_text));
+        };
+        if self.literal_origin_recording {
+            let text = literal_core(&parts);
+            self.record_literal_origin(start, &text, LiteralOriginKind::Interpolated);
         }
+        Ok(Expr::InterpolatedString(parts))
     }
 
     /// Parse: `sh <expr>` (statement form — streams to stdout)
@@ -2075,6 +2184,7 @@ impl Parser {
                 Expr::NumberLiteral(n)
             }
             Token::String(s) => {
+                let offset = self.current_offset();
                 let has_escaped_quote = self.current_string_has_escaped_quote();
                 self.advance();
                 // Check if this is a function call: identifier followed by (
@@ -2082,17 +2192,29 @@ impl Parser {
                     return self.parse_function_call(s);
                 }
                 if has_escaped_quote {
+                    self.record_literal_origin(offset, &s, LiteralOriginKind::EscapedQuote);
                     Expr::EscapedQuoteStringLiteral(s)
                 } else {
+                    self.record_literal_origin(offset, &s, LiteralOriginKind::Quoted);
                     Expr::StringLiteral(s)
                 }
             }
             Token::InterpString(parts) => {
+                let offset = self.current_offset();
                 self.advance();
+                if self.literal_origin_recording {
+                    let text = literal_core(&parts);
+                    self.record_literal_origin(offset, &text, LiteralOriginKind::Interpolated);
+                }
                 Expr::InterpolatedString(parts)
             }
             Token::HeredocString(parts) => {
+                let offset = self.current_offset();
                 self.advance();
+                if self.literal_origin_recording {
+                    let text = literal_core(&parts);
+                    self.record_literal_origin(offset, &text, LiteralOriginKind::Heredoc);
+                }
                 Expr::Heredoc(parts)
             }
             Token::CommandSub(cmd) => {
@@ -2708,4 +2830,32 @@ fn method_desugars_to_ufcs(name: &str) -> bool {
     crate::builtins::is_builtin(name)
         || crate::builtins_hof::lookup(name).is_some()
         || crate::evaluator::INLINE_SPECIAL_FORMS.contains(&name)
+}
+
+/// The concatenation of a parts list' LITERAL parts — the decoded text a
+/// heredoc/interpolated string contributes, interpolated parts aside.
+fn literal_core(parts: &[StringPart]) -> String {
+    let mut text = String::new();
+    for part in parts {
+        if let StringPart::Literal(s) = part {
+            text.push_str(s);
+        }
+    }
+    text
+}
+
+/// The recorded shape of an already-built literal Expr: its kind and
+/// decoded text, exactly as [`Parser::record_literal_origin`] stores
+/// them. The analyzer reuses this to verify origin-to-tree pairings;
+/// `parse_address` reuses it to record its per-body target clones.
+pub(crate) fn literal_expr_shape(expr: &Expr) -> Option<(LiteralOriginKind, String)> {
+    match expr {
+        Expr::StringLiteral(s) => Some((LiteralOriginKind::Quoted, s.clone())),
+        Expr::EscapedQuoteStringLiteral(s) => Some((LiteralOriginKind::EscapedQuote, s.clone())),
+        Expr::InterpolatedString(parts) => {
+            Some((LiteralOriginKind::Interpolated, literal_core(parts)))
+        }
+        Expr::Heredoc(parts) => Some((LiteralOriginKind::Heredoc, literal_core(parts))),
+        _ => None,
+    }
 }

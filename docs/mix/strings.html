@@ -993,6 +993,15 @@ as a full u64 is unreachable above that); anything else raises rather
 than truncating. Unknown conversions and missing arguments raise too,
 and POSIX positional arguments (<code>%1$d</code>) are not supported — the <code>$</code>
 surfaces as an unknown-conversion error.</li>
+<li><strong>Lint MIX-W2311</strong> covers the surplus side, which the runtime accepts:
+a direct <code>fmt()</code>/<code>sprintf()</code> call whose template is a string literal
+that parses cleanly, but whose argument list is longer than the
+template consumes, warns — <code>fmt("%s", 1, 2)</code> provides two operands for
+one placeholder and the extra is silently ignored. <code>%%</code> consumes
+nothing; a <code>*</code> width (and a <code>.*</code> precision here) consumes one operand
+each, so <code>sprintf("%*.*f", 4, 2, 1.5)</code> is exact. Invalid or dynamic
+templates, deficits, and calls a user function, variable or <code>address</code>
+block could shadow stay silent.</li>
 </ul>
 <p>Two documented divergences, both about Unicode: <code>%s</code> pads by <strong>codepoints</strong>
 (C pads by bytes — identical for the ASCII output of numeric conversions,

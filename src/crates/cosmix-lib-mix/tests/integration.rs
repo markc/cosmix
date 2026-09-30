@@ -107,6 +107,33 @@ async fn test_strings() {
     run_test_script("strings.mix").await;
 }
 
+/// A5 runtime half (TODO-mix 2026-09-24): the runtime's FUNCTION_UNDEFINED
+/// for a foreign get/set/find names the Mix FORM, not a builtin to swap
+/// in — the same text lint's MIX-E1102 hint leads with (one shared
+/// suggester), and a user-defined get/set/find is untouched.
+#[tokio::test]
+async fn test_undefined_get_set_find_point_at_mix_forms() {
+    for (call, form) in [
+        ("get({a: 1}, \"a\")", "Mix has no get()"),
+        ("set({a: 1}, \"a\", 2)", "Mix has no set()"),
+        ("find([1], 1)", "Mix has no find()"),
+    ] {
+        let source = format!("print({call})\n");
+        let err = run_mix_capturing(&source)
+            .await
+            .expect_err("undefined function must error");
+        assert!(err.contains("undefined function"), "{call}: got {err}");
+        assert!(err.contains(form), "{call}: form hint missing in {err}");
+    }
+    // A user-defined one still runs and says nothing.
+    let ok = run_mix_capturing(
+        "fn get($m, $k)\n  return $m[$k]\nend\nprint(get({a: 1}, \"a\"))\n",
+    )
+    .await
+    .expect("user get() must run");
+    assert_eq!(ok.trim(), "1");
+}
+
 #[tokio::test]
 async fn test_command_sub_removed() {
     run_test_script("command_sub_removed.mix").await;

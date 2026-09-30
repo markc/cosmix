@@ -485,6 +485,8 @@ in their own summary field, and <strong>never</strong> gating. Current D-codes:<
 <tr><td><code>MIX-D3014</code></td><td><strong><code>write_file()</code> of an unchecked <code>replace()</code> result</strong> (0.90.0) — the edit-a-file idiom with nothing anywhere in the file that could have noticed the needle was absent. <code>replace()</code> returns the subject unchanged when it misses, so the input is written straight back and the run reports success. Use <code>replace_must()</code>/<code>re_replace_must()</code>, which raise <code>NEEDLE_ABSENT</code> (and assert the site count with <code>{count: n}</code>). Conservative: only a <code>write_file</code> whose written value is a replace call or a variable the same straight-line block assigned from one, and any guard spelling anywhere in the file (<code>contains</code>, <code>pos</code>, <code>index_of</code>, <code>count_of</code>, <code>re_match</code>, a <code>_must</code> twin) silences it for the whole file</td></tr>
 <tr><td><code>MIX-D3013</code></td><td>a <strong>hand-rolled padding loop</strong> (0.74.0) — <code>while len($o) &lt; $n … $o = $o .. " "</code> — pointing at <code>lpad</code>/<code>rpad</code> (and the display-cell <code>lpad_w</code>/<code>rpad_w</code>). Four independent sessions wrote this loop while the builtins sat in the binary; the note is the discoverability fix that reaches the author at authoring time. Narrow by design: only a <code>&lt;</code>/<code>&lt;=</code> comparison of <code>len</code>/<code>length</code> of the same variable the body self-appends a string literal to</td></tr>
 <tr><td><code>MIX-D3016</code></td><td>a <strong>script with no <code>-- version: X.Y.Z</code> header</strong> in its leading comment region (within the first 32 lines) (0.95.0), so <a href="/mix/invocation#--version-for-scripts"><code>mix SCRIPT --version</code></a> and <code>script_version()</code> can only say <code>unversioned</code> — every binary and every Mix script answers <code>--version</code> (Mark, 2026-09-25). Emitted by the lint driver, only for files <strong>run as scripts</strong>, decided by a deliberately simple heuristic over the path <em>as given</em>, in this order: (1) line 1 is a <code>#!</code> shebang — a script; (2) a <code>lib</code>, <code>_lib</code>, <code>tests</code> or <code>test</code> directory component — never reported: a library is loaded by <code>require</code>, and a test script must stay header-less, because a header would make it the entry script whose record <code>script_version()</code> returns; (3) a <code>bin</code>, <code>_bin</code>, <code>scripts</code> or <code>build</code> directory component — a script; (4) a serve citizen — a top-level <code>on &lt;verb&gt;</code> handler at column 0, or <code>--serve</code> mentioned in the leading comment region. <code>mix lint deploy.mix</code> from inside <code>_bin/</code> has no directory component, so lint from the repo root. Known false positive, Wontfix: a library under an absolute <code>/…/bin/…</code> path with no <code>lib</code> component is reported. The mirror holds too: any <code>/…/lib/…</code> or <code>/…/tests/…</code> ancestor in an absolute path exempts a script beneath it. Only the leading comment region counts as the header (see <a href="/mix/invocation#--version-for-scripts">invocation</a>), so a <code>-- version:</code> inside a heredoc does not satisfy it. A header line whose value is not <code>X.Y.Z</code> is reported on its own line, since the runtime treats it as absent. A note by default; <code>--require-version</code> makes it a warning, code unchanged</td></tr>
+<tr><td><code>MIX-D3017</code></td><td>an <strong>unprovable variable read inside an <code>ssh_mix</code> body with dynamic bindings</strong> — the name is bound nowhere in the body, but the call's opts are unreadable so <code>bindings</code>/<code>env</code> may supply it at runtime, and it is NOT an error. Fires only when the name is one edit away from something the body DOES bind (a parameter or local), where the typo is the likelier explanation: <code>'$pott' … did you mean '$port'?</code> One edit is one edit — an adjacent transposition (<code>$prot</code>) is TWO under plain Levenshtein, and the short-name budget stays at one so unrelated dynamic bindings keep their silence. A name with no near neighbour is an ordinary dynamic binding and stays silent</td></tr>
+<tr><td><code>MIX-D3018</code></td><td><strong><code>ssh_mix</code> opts are not a statically readable map</strong> — the injected names are unknown, so undefined-<strong>variable</strong> checks stand down for that body (dynamic bindings may supply any free DATA name). The boundary is split, not blanket: undefined-<strong>function</strong> checks still run (strict-data bindings cannot create a callable, so a function name the body does not define is undefined no matter what the opts hold). A variable bound exactly once to a map literal IS resolved (<code>$o = {bindings: {…}}</code>), so the fleet opts-variable shape keeps full checks</td></tr>
 <tr><td><code>MIX-D3015</code></td><td>a <strong>bare <code>$NAME</code> in a double-quoted string</strong> (0.90.0) where <code>NAME</code> is bound in the same file. Double quotes interpolate <code>${NAME}</code> only; the bare form is literal BY DESIGN, which is the opposite of bash — four occurrences in one file passed lint and all four failed at runtime. <code>\$NAME</code> and a single-quoted <code>'…'</code> string are the two clean spellings and neither is reported. The lexer drops the whole batch for a MULTI-LINE string and for one whose spelling contains <code>\"</code>: both mark NESTED source (an <code>ssh_mix</code> body, a <code>mix -c</code> program), where a bare <code>$rc</code> is the inner program's variable and correctly literal. A <strong>note</strong> where the heredoc twin <code>MIX-W2402</code> is a warning, and the asymmetry is measured — over 785 fleet scripts W2402 costs 4 findings and this one an order of magnitude more even after those exclusions, so a warning would fail <code>--deny-warnings</code> on scripts that are not wrong. D3xxx is the promotable namespace precisely so that can change once the residue is worked off</td></tr>
 </tbody></table>
 <p>Member-call spellings are covered too: a builtin-named <code>.name(</code> desugars
@@ -514,6 +516,7 @@ MIX-E1202  user-function arity mismatch     MIX-E1502  discarded pure transform
                                             MIX-W2307  send result never checked
                                             MIX-W2309  builtin-named map member unreachable via dot-call
                                             MIX-W2310  proven-missing lookup on a literal collection
+                                            MIX-W2311  fmt/sprintf surplus operands
                                             MIX-W2401  source/include defeats analysis
                                             MIX-W2402  bare bound variable in heredoc
                                             MIX-W2405  unknown escape kept literally
@@ -533,7 +536,7 @@ content; the suffix is only a tiebreak when neither grammar succeeds.</p>
 <p><strong>MIX-E1101</strong> flags a <code>$name</code> read only when the name is bound <strong>nowhere in its visible universe</strong> — function bodies see params + their own binders + everything bound anywhere at file level (Mix has no block scoping and no read-before-assign rule, so lexical order is deliberately ignored). <code>${name}</code> interpolation is never flagged (it falls back to the process environment), nor are <code>$1</code>-style positionals or the runtime-injected <code>rc</code> / <code>result</code> / <code>status</code> / <code>event</code> / <code>_</code>.</p>
 </li>
 <li>
-<p><strong>MIX-E1102</strong> resolves bareword calls against builtins, HOFs, evaluator special forms, every <code>function</code> definition in the file, the embedded prelude, <code>--allow-function</code> names, AND any assigned variable (a bareword call can dispatch to a function-valued variable). Calls inside <code>address ... end</code> blocks are sends and are never flagged; <code>MethodCall</code>/<code>ValueCall</code> are dynamic dispatch and are skipped. The hint carries the <strong>same "did you mean" the runtime prints</strong> for that name. One suggester serves both, so lint (where an agent looks first) and the failing run cannot disagree. It checks, in order: the deleted-name pointers (<code>regex_match</code> → <code>re_match(s, pattern)</code>), then a <strong>foreign-name synonym table</strong> for the names a python/bash/JS habit reaches for first (<code>json_decode</code>/<code>json_loads</code> → <code>json_parse</code>, <code>json_dumps</code> → <code>json_encode</code>, <code>str</code> → <code>to_string</code>, <code>trim_end</code>/<code>rstrip</code> → <code>rtrim</code>, <code>len_bytes</code> → <code>byte_length</code>, <code>getenv</code> → <code>env</code>, …), and only then edit distance. The order matters: <code>json_encode</code> is the nearest spelling of <code>json_decode</code> and means the opposite.</p>
+<p><strong>MIX-E1102</strong> resolves bareword calls against builtins, HOFs, evaluator special forms, every <code>function</code> definition in the file, the embedded prelude, <code>--allow-function</code> names, AND any assigned variable (a bareword call can dispatch to a function-valued variable). Calls inside <code>address ... end</code> blocks are sends and are never flagged; <code>MethodCall</code>/<code>ValueCall</code> are dynamic dispatch and are skipped. The hint carries the <strong>same "did you mean" the runtime prints</strong> for that name. One suggester serves both, so lint (where an agent looks first) and the failing run cannot disagree. It checks, in order: the deleted-name pointers (<code>regex_match</code> → <code>re_match(s, pattern)</code>), then the <strong>form table</strong> for the foreign get/set/find whose answer is Mix syntax, not a builtin name (<code>get</code> → <code>$m[key]</code> / <code>get_or</code>/<code>require_key</code>; <code>set</code> → <code>$m[key] = value</code>; <code>find</code> → <code>index_of</code>/<code>filter</code>, semantics as in <a href="/mix/collections">collections</a> — range inclusive, <code>sort</code> numeric-then-lexicographic, <code>filter</code> list-first), then a <strong>foreign-name synonym table</strong> for the names a python/bash/JS habit reaches for first (<code>json_decode</code>/<code>json_loads</code> → <code>json_parse</code>, <code>json_dumps</code> → <code>json_encode</code>, <code>str</code> → <code>to_string</code>, <code>trim_end</code>/<code>rstrip</code> → <code>rtrim</code>, <code>len_bytes</code> → <code>byte_length</code>, <code>getenv</code> → <code>env</code>, …), and only then edit distance. The order matters: <code>json_encode</code> is the nearest spelling of <code>json_decode</code> and means the opposite. A user-defined <code>fn get/set/find</code> is a known callable and never reaches the suggester.</p>
 </li>
 <li>
 <p><strong>MIX-E1201</strong> checks calls against the structured contract metadata (<code>mix builtins --json</code>), including non-contiguous exact-arity sets — <code>random(1)</code> is an error, <code>random()</code>/<code>random(min, max)</code> are not. The contract is the documented surface; some older builtins tolerate surplus arguments at runtime, and lint is deliberately stricter (<code>mix --strict-arity</code> makes the runtime agree).</p>
@@ -616,6 +619,19 @@ nested Mix source which the remote shell will parse again. Ship the source
 verbatim with <a href="/mix/remote#headline-idiom-ssh_mix--heredoc"><code>ssh_mix</code> + a heredoc</a>.
 Simple command strings, computed commands, <code>ssh_exec</code>, <code>ssh_mix</code>, and
 single-quoted strings containing ordinary <code>"</code> stay quiet.</p>
+</li>
+<li>
+<p><strong>MIX-W2311</strong> warns on a direct, unshadowed <a href="/mix/strings#sprintf--c-compatible-formatting-v0710"><code>fmt()</code>/<code>sprintf()</code></a>
+call whose template is a string literal that parses cleanly under the
+runtime grammar, when the call provides more operands than the template
+consumes — <code>fmt("%s", 1, 2)</code> provides two operands for one placeholder,
+and both builtins <strong>silently ignore</strong> the surplus (they are variadic, so
+the generic arity gate cannot see it). <code>%%</code> consumes nothing; a <code>*</code> width
+and a <code>sprintf</code> <code>.*</code> precision consume one operand each, so <code>fmt("%*s", 5, "x")</code> is exact and stays quiet. Invalid or unknown templates (which
+would raise at runtime), dynamically built templates, deficits (the
+runtime's own "not enough arguments" error), and calls a user function,
+variable, <code>address</code> block or <code>source</code>/<code>include</code> could shadow are silent
+too.</p>
 </li>
 <li>
 <p><strong>MIX-W2401</strong>: one <code>source</code>/<code>include</code> anywhere disables the undefined-name checks for the whole file (the loaded file can define anything) — reported once so you know analysis is degraded. Prefer <code>require()</code>: it is isolated, statically resolvable, and E1401/E1402 verify literal-path modules parse.</p>
@@ -723,16 +739,45 @@ names the call injects: the keys of <code>bindings</code> and of <code>env</code
 the shipped source as assignments. It does <strong>not</strong> see the enclosing file's
 functions or variables. So a bare <code>$base</code> passed as a binding is clean, while
 <code>$notbound</code>, or a call to a helper defined only in the outer file, is
-<code>MIX-E1101</code>/<code>MIX-E1102</code> with the body prefix. When the opts argument is not a
-map literal (<code>ssh_mix($h, $src, $opts)</code>) the injected names cannot be read,
-and name checks stand down for that body rather than cry wolf. The enclosing
-file keeps all of its own name checks. Everything else — legacy-name notes,
+<code>MIX-E1101</code>/<code>MIX-E1102</code> with the body prefix.</p>
+<p>The injected names are read from the opts argument when it is a map literal,
+or a variable bound <strong>exactly once</strong> to one (<code>$o = {bindings: {…}}</code> — the same
+sole-definition rule as the body itself, so the fleet opts-variable shape
+keeps full checks). When they cannot be read — a call, a concatenation, a
+multi-bound name — the boundary is <strong>split, not blanket</strong> (<code>MIX-D3018</code> at the
+call): dynamic bindings may supply any free DATA variable, so
+undefined-<strong>variable</strong> checks stand down (a read one edit away from a name the
+body binds still gets the <code>MIX-D3017</code> typo note), but a function name cannot
+ride in through strict-data bindings, so undefined-<strong>function</strong> checks and
+arity checks keep running. The enclosing file keeps all of its own name
+checks. Everything else — legacy-name notes,
 arity, the truthiness trap — applies normally, and <strong>errors from inside a
 body gate exactly as they would anywhere else</strong>.</p>
-<p>Only <code>ssh_mix</code> carries Mix source this way. <code>run</code>/<code>run_argv</code>/<code>run_pipeline</code>
-execute <em>shell</em> commands, Mix has no heredoc syntax, there is no
-<code>source</code>/<code>include</code>/<code>eval</code> builtin taking a string, and <code>--serve</code> runs a script
-<em>file</em> (which lint reaches directly).</p>
+<p><strong>Diagnostics map onto the enclosing file's real lines.</strong> <code>mix lint</code> reads
+the source text, and the lexer records — while decoding each literal — which
+physical line every decoded line was written on. So a double-quoted body
+whose lines are <code>\n</code> ESCAPES reports everything on the one line the literal
+physically occupies, a physically multi-line literal and a heredoc map
+line-for-line (a <code>\n</code> escape inside a heredoc lands on the escape's line,
+not an invented one), and a parse/lex error inside a body is mapped by the
+error's own inner line.</p>
+<p>Which opener a body is paired with is decided by the <strong>parser</strong>, not by
+matching text. With the source at hand, lint re-parses the file with
+literal-origin recording on: the parser records, in source order, one entry
+per literal <em>expression</em> it builds, and pairs those entries positionally
+with the same tree's literal expressions, verifying variant and decoded
+text per pair. Map keys (bare or quoted), <code>parse</code> delimiters and <code>on</code>
+names/doc-strings are not expressions, so identical text there can never
+steal a body's opener — a body opened on its own physical line reports
+there. If the recording and the tree disagree anywhere, the whole mapping
+is refused: a mapping can be missing, but it is never misattached.</p>
+<p>An embedder calling <code>analyze()</code> without <code>AnalyzerConfig::source</code> gets the
+documented linear estimate instead (<code>first_line + N - 1</code>, exact for the
+<code>$x = ssh_mix($HOST, '</code> and <code>$p = &lt;&lt;END</code> shapes), never invented accuracy.</p>
+<p><code>ssh_mix</code> and <code>ssh_mix_many</code> carry remote Mix source this way. <code>run</code>
+accepts shell command text; <code>run_argv</code> and <code>run_pipeline</code> execute argv
+specifications. Lint does not infer embedded source from those process
+arguments. <code>--serve</code> runs a script file, which lint can inspect directly.</p>
 <h2 id="what-lint-deliberately-does-not-do-v1">What lint deliberately does NOT do (v1)</h2>
 <ul>
 <li>Straight-line facts do not cross branches, loops, function-call boundaries,

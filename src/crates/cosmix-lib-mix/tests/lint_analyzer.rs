@@ -1142,3 +1142,142 @@ fn chain_operand_blocks_and_send_commands_are_walked() {
     let out = codes("send \"svc\" $f(1)\n");
     assert!(out.contains(&"MIX-E1101".to_string()), "got: {out:?}");
 }
+
+// ── W2311: fmt/sprintf surplus operands (A5) ────────────────────────
+
+#[test]
+fn fmt_and_sprintf_surplus_operands_warn_with_statement_lines() {
+    // Both variadic builtins silently ignore arguments past the template.
+    let out = lint("print(fmt(\"%s\", 1, 2))\nprint(sprintf(\"%s\", 1, 2))\n");
+    assert_eq!(
+        out,
+        vec![
+            ("MIX-W2311".to_string(), Some(1)),
+            ("MIX-W2311".to_string(), Some(2))
+        ]
+    );
+}
+
+#[test]
+fn fmt_dynamic_width_consumes_an_operand_and_escaped_percent_consumes_none() {
+    // `%*s` pulls TWO operands (width + value): exact is quiet, one extra
+    // warns. `%%` is a literal percent — a placeholder-free template with
+    // an argument is a surplus, without one it is exact.
+    assert_eq!(lint("$x = fmt(\"%*s\", 5, \"hi\")\n"), vec![]);
+    assert_eq!(
+        lint("$x = fmt(\"%*s\", 5, \"hi\", \"extra\")\n"),
+        vec![("MIX-W2311".to_string(), Some(1))]
+    );
+    assert_eq!(lint("$x = fmt(\"100%% done\")\n"), vec![]);
+    assert_eq!(
+        lint("$x = fmt(\"100%% done\", \"unused\")\n"),
+        vec![("MIX-W2311".to_string(), Some(1))]
+    );
+}
+
+#[test]
+fn sprintf_dynamic_width_and_precision_consume_operands() {
+    // A negative literal width operand still counts as ONE consumed
+    // operand (it left-justifies); `%*.*f` pulls width + precision +
+    // value = 3. Flags and length modifiers consume nothing extra.
+    assert_eq!(lint("$x = sprintf(\"%*d\", -5, 42)\n"), vec![]);
+    assert_eq!(
+        lint("$x = sprintf(\"%*d\", -5, 42, \"extra\")\n"),
+        vec![("MIX-W2311".to_string(), Some(1))]
+    );
+    assert_eq!(lint("$x = sprintf(\"%*.*f\", 8, 3, 1.5)\n"), vec![]);
+    assert_eq!(
+        lint("$x = sprintf(\"%*.*f\", 8, 3, 1.5, 0)\n"),
+        vec![("MIX-W2311".to_string(), Some(1))]
+    );
+    assert_eq!(lint("$x = sprintf(\"%#+08.3llx\", 255)\n"), vec![]);
+    assert_eq!(
+        lint("$x = sprintf(\"%#+08.3llx\", 255, 2)\n"),
+        vec![("MIX-W2311".to_string(), Some(1))]
+    );
+}
+
+#[test]
+fn fmt_and_sprintf_exact_and_deficits_stay_silent() {
+    // Exact match and too FEW arguments (the runtime's own "not enough
+    // arguments" error) produce no unused-operand warning.
+    assert_eq!(lint("$x = fmt(\"%s %d\", \"a\", 1)\n"), vec![]);
+    assert_eq!(lint("$x = fmt(\"%s %d\", \"a\")\n"), vec![]);
+    assert_eq!(lint("$x = sprintf(\"%.2f|%s\", 3.14, \"ok\")\n"), vec![]);
+    assert_eq!(lint("$x = sprintf(\"%s\")\n"), vec![]);
+}
+
+#[test]
+fn invalid_or_unknown_templates_stay_silent() {
+    // Each of these RAISES at runtime, so no definite surplus can be
+    // claimed: %x is not a fmt conversion (it is for sprintf), %p is
+    // unknown to both, a trailing % and fmt's unsupported `.*` and
+    // digit-after-`*` are errors.
+    assert_eq!(lint("$x = fmt(\"%s %x\", 1, 2, 3)\n"), vec![]);
+    assert_eq!(lint("$x = sprintf(\"%s %p\", 1, 2)\n"), vec![]);
+    assert_eq!(lint("$x = fmt(\"done %\", 1, 2)\n"), vec![]);
+    assert_eq!(lint("$x = fmt(\"%*.*f\", 1, 2, 3, 4)\n"), vec![]);
+    assert_eq!(lint("$x = fmt(\"%*5s\", 5, \"x\", \"y\")\n"), vec![]);
+    // A dynamic (non-literal) template is never judged.
+    let out = codes("$t = \"%s\"\n$x = fmt($t, 1, 2)\n");
+    assert!(!out.contains(&"MIX-W2311".to_string()), "got: {out:?}");
+}
+
+#[test]
+fn shadowed_fmt_and_sprintf_calls_stay_silent() {
+    // A user function of the same name is its own MIX-E1303 error; the
+    // surplus check stands down rather than double-diagnosing. A
+    // variable of the same name (bareword dispatch ambiguity) silences
+    // it outright.
+    let out = lint("fn fmt($a, $b)\n  return \"$a $b\"\nend\n$r = fmt(\"%s\", 1, 2)\n");
+    assert!(
+        out.contains(&("MIX-E1303".to_string(), Some(1))),
+        "the shadowing definition still errors: {out:?}"
+    );
+    assert!(
+        !out.iter().any(|(c, _)| c == "MIX-W2311"),
+        "a user-defined fmt silences the surplus warning: {out:?}"
+    );
+    let out = codes("$sprintf = \"custom\"\n$r = sprintf(\"%s\", 1, 2)\n");
+    assert!(
+        !out.contains(&"MIX-W2311".to_string()),
+        "a $sprintf variable silences the surplus warning: {out:?}"
+    );
+}
+
+#[test]
+fn fmt_surplus_found_in_nested_expressions() {
+    // Every call site is visited — list literals, concatenations,
+    // if-expression branches — each reported on its STATEMENT's line.
+    let src = "$a = [\"pre\", fmt(\"%s\", 1, 2)]\n$b = \"x\" .. sprintf(\"%d\", 1, 2)\n$c = if true then fmt(\"%s\", 1, 2) else \"n\" end\n";
+    let diags = lint(src);
+    assert_eq!(
+        diags,
+        vec![
+            ("MIX-W2311".to_string(), Some(1)),
+            ("MIX-W2311".to_string(), Some(2)),
+            ("MIX-W2311".to_string(), Some(3)),
+        ]
+    );
+}
+
+#[test]
+fn fmt_surplus_message_carries_expected_and_provided_counts() {
+    let src = "print(fmt(\"%s %d\", 1, 2, 3))\n";
+    let tokens = Lexer::new(src).tokenize().unwrap();
+    let stmts = Parser::new(tokens, src).parse_program().unwrap();
+    let a = analyze(&stmts, Some("test.mix"), &AnalyzerConfig::default());
+    let d = a
+        .diagnostics
+        .iter()
+        .find(|d| d.code == "MIX-W2311")
+        .expect("MIX-W2311 fires");
+    assert!(d.message.contains("consumes 2"), "{}", d.message);
+    assert!(d.message.contains("3 were provided"), "{}", d.message);
+    assert!(
+        d.hint
+            .as_deref()
+            .is_some_and(|h| h.contains("remove") && h.contains("placeholders")),
+        "hint names both fixes: {d:?}"
+    );
+}
