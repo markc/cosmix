@@ -362,12 +362,55 @@ fn version_header_diag(source: &str, file: &str, require: bool) -> Option<Diagno
 
 /// Lex+parse+analyze one file. If script parsing fails but the same
 /// source is valid strict data, report that validation mode instead.
+/// D1 (TODO-mix 2026-09-24): the `-c`/stdin pre-execution gate. Lint the
+/// source; a diagnostic in the hard-safe allowlist (E1201, E1202, E1303,
+/// E1501, E1502, E1203) is a refusal — the source is not run. Returns
+/// `(hard, soft)` diagnostics so the caller prints the hard set before
+/// exit 2 and the soft set only under `--agent`/`MIX_LINT=warn`.
+pub(crate) fn lint_source_for_execution(
+    source: &str,
+) -> (Vec<Diagnostic>, Vec<Diagnostic>) {
+    let mut hard = Vec::new();
+    let mut soft = Vec::new();
+    let outcome = lint_one(source, None, &AnalyzerConfig::default());
+    let mut push = |d: Box<Diagnostic>| {
+        if HARD_SAFE_EXEC_CODES.contains(&d.code) {
+            hard.push(*d);
+        } else {
+            soft.push(*d);
+        }
+    };
+    match outcome {
+        Ok(LintOutcome::Script(analysis)) => {
+            for d in analysis.diagnostics {
+                push(Box::new(d));
+            }
+        }
+        // A parse failure is the evaluator's own job to report — the
+        // gate only adjudicates analyzer diagnostics.
+        Ok(LintOutcome::StrictData) | Err(_) => {}
+    }
+    (hard, soft)
+}
+
+/// D1: the hard-safe allowlist — analyzer codes that REFUSE execution for
+/// `-c`/stdin. These are the statically-provable wrong-target side
+/// effects (arity, dead mutation, push-assign-back, literal-type) — the
+/// same family the runtime gates now raise, caught before any line runs.
+pub(crate) const HARD_SAFE_EXEC_CODES: &[&str] = &[
+    "MIX-E1201",
+    "MIX-E1202",
+    "MIX-E1303",
+    "MIX-E1501",
+    "MIX-E1502",
+    "MIX-E1203",
+];
+
 fn lint_one(
     source: &str,
     file: Option<&str>,
     cfg: &AnalyzerConfig,
-) -> Result<LintOutcome, Box<Diagnostic>> {
-    let to_diag = |code: &'static str, msg: String, span: Option<SpanLite>| {
+) -> Result<LintOutcome, Box<Diagnostic>> {    let to_diag = |code: &'static str, msg: String, span: Option<SpanLite>| {
         Box::new(Diagnostic {
             code,
             severity: Severity::Error,

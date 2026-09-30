@@ -191,6 +191,8 @@ static STRICT_ARITY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 const KNOWN_MIX_FLAGS: &[&str] = &[
     "--strict-arity",
     "--compat-arity",
+    "--no-lint",
+    "--agent",
     "--no-prelude",
     "--no-traceback",
     "--result-fd",
@@ -211,6 +213,35 @@ fn warn_trailing_flag_args(script_args: &[String]) {
             );
         }
     }
+}
+
+/// D1 (0.103.4): the `-c`/stdin pre-execution lint gate. A hard-safe
+/// diagnostic (arity, dead mutation, push-assign-back, literal-type) is
+/// statically provable — the script would raise or corrupt a target
+/// anyway — so the gate refuses with exit 2 BEFORE any line runs. The
+/// soft diagnostics print to stderr only under `--agent`/`MIX_LINT=warn`.
+/// `--no-lint` skips the whole gate. Returns the exit code when refused.
+fn exec_lint_gate(source: &str, no_lint: bool, agent_mode: bool) -> Option<i32> {
+    if no_lint {
+        return None;
+    }
+    let (hard, soft) = lint::lint_source_for_execution(source);
+    for d in &soft {
+        if agent_mode {
+            eprintln!("{}: {}: {}", d.code, d.severity.wire_name(), d.message);
+        }
+    }
+    if hard.is_empty() {
+        return None;
+    }
+    for d in &hard {
+        eprintln!("{}: {}: {}", d.code, d.severity.wire_name(), d.message);
+        if let Some(hint) = &d.hint {
+            eprintln!("  hint: {hint}");
+        }
+    }
+    eprintln!("mix: refusing to run — fix the above or pass --no-lint to override");
+    Some(2)
 }
 
 /// Apply the global CLI arity flag to a freshly built evaluator.
@@ -2028,6 +2059,13 @@ fn real_main() -> i32 {
     let mut i = 1;
     let mut no_prelude = false;
     let mut interactive_rc = false;
+    let mut no_lint = false;
+    // D1 (0.103.4): --agent or MIX_LINT=warn prints the gate's SOFT
+    // diagnostics to stderr (the hard set refuses regardless).
+    let mut agent_mode = matches!(
+        env::var("MIX_LINT").as_deref(),
+        Ok("warn" | "1" | "true" | "yes")
+    );
     let mut result_fd: Option<crate::result_fd::ResultFd> = None;
     while i < args.len() {
         match args[i].as_str() {
@@ -2091,6 +2129,9 @@ fn real_main() -> i32 {
                 let code = &args[i];
                 let script_args: Vec<String> = args[i + 1..].to_vec();
                 warn_trailing_flag_args(&script_args);
+                if let Some(exit) = exec_lint_gate(code, no_lint, agent_mode) {
+                    return exit;
+                }
                 return run_command_line(code, interactive_rc, &script_args, no_prelude, result_fd);
             }
             "--result-fd" => {
@@ -2158,6 +2199,20 @@ fn real_main() -> i32 {
                 // the default for script/-c/serve modes; this restores the
                 // compatible missing->nil / extra-ignored binding.
                 STRICT_ARITY.store(false, std::sync::atomic::Ordering::Relaxed);
+                i += 1;
+                continue;
+            }
+            "--no-lint" => {
+                // D1 (0.103.4): the escape hatch for the -c/stdin
+                // pre-execution lint gate.
+                no_lint = true;
+                i += 1;
+                continue;
+            }
+            "--agent" => {
+                // D1 (0.103.4): print the SOFT diagnostics (the ones the
+                // gate does not refuse on) to stderr before running.
+                agent_mode = true;
                 i += 1;
                 continue;
             }
@@ -2236,6 +2291,9 @@ fn real_main() -> i32 {
                 };
                 let script_args: Vec<String> = args[i + 1..].to_vec();
                 warn_trailing_flag_args(&script_args);
+                if let Some(exit) = exec_lint_gate(&source, no_lint, agent_mode) {
+                    return exit;
+                }
                 return run_source(&source, Some("-"), &script_args, no_prelude, Some(provenance));
             }
             arg if arg.starts_with('-') => {
