@@ -410,7 +410,8 @@ fn lint_one(
     source: &str,
     file: Option<&str>,
     cfg: &AnalyzerConfig,
-) -> Result<LintOutcome, Box<Diagnostic>> {    let to_diag = |code: &'static str, msg: String, span: Option<SpanLite>| {
+) -> Result<LintOutcome, Box<Diagnostic>> {
+    let to_diag = |code: &'static str, msg: String, span: Option<SpanLite>| {
         Box::new(Diagnostic {
             code,
             severity: Severity::Error,
@@ -440,6 +441,12 @@ fn lint_one(
             return strict_data_fallback(source, file, to_diag("MIX-E1001", e.to_string(), None));
         }
     };
+    // SPECULATIVE parse: the D1 pre-execution gate must be silent about
+    // parser deprecations (done/next) — the executed parse is the one
+    // allowed to emit them, exactly once. The classifier's probe
+    // invariant (semicolon_process.rs) depends on this.
+    let stmts =
+        match cosmix_mix::parser::Parser::new_speculative(tokens, source).parse_program() {
     let stmts = match cosmix_mix::parser::Parser::new(tokens, source).parse_program() {
         Ok(s) => s,
         Err(MixError::ParseError { msg, span }) | Err(MixError::IncompleteInput { msg, span }) => {
