@@ -10,6 +10,11 @@ This is the whole project in one repository: the Bus protocol, the Mix
 language, the daemon family, the desktop, and the documentation site
 ([cosmix.dev](https://cosmix.dev)).
 
+**CosMix Core is 100% free to use — unencumbered by copyright or paywalls.**
+No core component is bound to a specific upstream LLM/media provider; vendor
+integrations are optional Mix scripts over generic builtins, so anything
+paywalled stays a script you can drop, and core never inherits its terms.
+
 ## Get it running
 
 ```sh
