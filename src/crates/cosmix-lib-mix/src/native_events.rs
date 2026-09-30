@@ -100,6 +100,8 @@ pub(crate) struct Families {
     /// Socket subscriptions (ws_on/tcp_on). Their event commands are
     /// caller-chosen, so the family gate is source presence, not a
     /// handler-name lookup.
+    // Neither consumer exists in a build without sockets or the sleep pump.
+    #[cfg_attr(not(any(feature = "ws", feature = "tokio-sleep")), allow(dead_code))]
     pub sockets: bool,
 }
 
