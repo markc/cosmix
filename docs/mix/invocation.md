@@ -47,7 +47,7 @@ program, as before. A `--version` straight after a script path asks for the
 | `mix lint [flags] FILE...` | Semantic analysis: undefined names, arity, must-use, stable machine-readable diagnostics (0.29.0 — see [lint](lint.md)) |
 | `mix --no-prelude …` | Skip loading the standard prelude (applies to any run mode) |
 | `mix --no-traceback …` | Uncaught errors print the legacy single line instead of a traceback (0.29.0 — see [errors](errors.md)) |
-| `mix --strict-arity …` | Strict call arity: wrong-arity user-function/builtin calls raise catchable `ARITY_MISMATCH` instead of the compatible missing→nil / extra-ignored binding (0.29.0 — see [functions](functions.md)) |
+| `mix --strict-arity …` | Strict call arity: wrong-arity user-function/builtin calls raise catchable `ARITY_MISMATCH` instead of the compatible missing→nil / extra-ignored binding (0.29.0 — see [functions](functions.md)). Equivalents: `MIX_STRICT_ARITY=1` in the environment, `$strict_arity = true` in `~/.mixrc`, and `ssh_mix(host, src, {strict_arity: true})` for the remote argv (all 0.102.7). A mix flag placed AFTER the script/`-c` source is a script argument, never a flag — `mix` warns when a trailing argument matches one of its own flags |
 | `mix --serve <script> [--name <svc>]` | Run the script as a supervised Bus daemon citizen — see [serve](serve.md) |
 | `mix --version` / `-V` | Print version + build hash, and nothing else — no session lane, no Bus (0.89.1) |
 | `mix script.mix --version` / `-V` | Print the **script's** version line without running it (also `mix --serve script.mix --version`, `mix - --version`) — see [below](#--version-for-scripts) (0.95.0) |
