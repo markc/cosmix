@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-mix"
-version = "0.103.7"
+version = "0.103.8"
 edition = "2024"
 
 [[bin]]
