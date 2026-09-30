@@ -1815,6 +1815,140 @@ for its duration; **never** pass `{timeout: 0}` there — unlike an HTTP call,
 where the wait rides an in-flight request, a datagram wait with no sender is
 unbounded and nothing can interrupt it.
 
+## Socket subscriptions — `ws_on`, `tcp_on`, `ws_unwatch`, `tcp_unwatch` (v0.107.0)
+
+```
+ws_on(handle, command)                      -> source id ("ws:N")
+tcp_on(handle, command[, opts])             -> source id ("tcp:N")
+  opts: {frame: "line" | "bytes" (default), max: line length (default 65536)}
+ws_recv(source[, timeout])                  -> string | bytes | nil (Class C)
+tcp_recv(source[, {timeout, max}])          -> bytes | nil (Class C)
+tcp_recv_line(source[, {timeout}])          -> string | nil (Class C)
+ws_unwatch(source) / tcp_unwatch(source)    -> nil
+```
+
+The event-stream shape of the clients above. `ws_on`/`tcp_on` **move** an
+existing `ws_connect`/`tcp_connect` handle into a reader thread owned by
+the evaluator generation, and return a string source id. The reader is
+the connection's **single owner** (tungstenite's TLS state is never
+shared or raced), so numeric `ws_recv`/`ws_close`/`tcp_recv`/
+`tcp_recv_line`/`tcp_close` on the subscribed handle refuse
+deterministically (`handle N is a ws_on subscription — …`). Numeric
+`ws_send`/`tcp_send` **keep working**: they route through the owner
+thread's bounded command endpoint (a Send-safe channel + wake socketpair
+registered at subscribe time, removed when the source retires), and
+await a completion receipt. In a Class C body the send yields through
+the class-C yield while waiting; in Class S / plain evaluation it blocks
+bounded by the owner's send deadline. The owner writes non-blocking with
+partial state retained (nothing is re-sent or dropped), arms `POLLOUT`
+only while bytes are owed, and the wake socketpair is a control wakeup —
+a send never cancels the subscription. Admission is bounded across a
+send's **entire lifetime** — 64 ops and 64 MiB of payload per source,
+counting queued + in-flight + parked behind a cancelled caller (the
+reservation releases only when the receipt is answered or the command
+is retired): a full queue raises `SOCKET_SEND_BUSY` at admission, and a
+retiring source answers every outstanding receipt with
+`SOCKET_SEND_CLOSED`. The 30 s receipt deadline is stamped **at
+admission** (never restamped per queued hop) and checked absolutely
+every poll loop — continuous incoming data or wake traffic cannot
+stretch or starve it. A send that cannot finish in time fails its
+receipt; if any byte may have reached the wire the source hard-closes
+with one terminal event (`SOCKET_SEND_TIMEOUT`) — bytes are never
+silently dropped, duplicated or re-sent.
+
+**Events.** Frames arrive as events under the caller-chosen `command`
+(1–64 chars of `[a-zA-Z0-9._:-]`, e.g. `ticker.frame`):
+
+```json
+{"watch": "ws:1", "frame": {"kind": "text", "data": "…"}}
+{"watch": "ws:1", "frame": {"kind": "binary", "data": {"hex": "…"}}}
+{"watch": "tcp:2", "frame": {"kind": "bytes", "data": {"hex": "…"}}}
+{"watch": "tcp:2", "frame": {"kind": "line", "data": "…"}}
+{"watch": "ws:1", "closed": {"reason": "connection closed by peer"}}
+```
+
+WS message boundaries and text/binary kinds survive. `tcp_on` defaults to
+`frame: "bytes"` — ordered raw chunks of at most 64 KiB; `frame: "line"`
+splits on LF (one trailing CR stripped) with `max` bounding a line.
+
+**Ordering and overflow.** Records are an ordered, per-source FIFO bounded
+by 4096 frames and 64 MiB of payload per evaluator (across all its
+sources). When the bound is hit the reader **hard-closes the socket** and
+publishes exactly **one** terminal event (`closed: {"reason": "overflow"}`)
+— a frame is never silently dropped. A peer close (or a line over `max`
+with no newline) also publishes exactly one terminal; afterwards the
+source retires and a further recv raises `SOCKET_WATCH_HANDLE`.
+
+**Class C recv.** `ws_recv("ws:1"[, timeout])` (and the tcp forms) park on
+the source's FIFO through the evaluator's class-C yield — the read permit
+is released while waiting, so other verbs keep their latency targets.
+`nil` on timeout keeps the source usable (poll again); the terminal event
+raises `SOCKET_CLOSED` and retires it. At most one recv parks per source;
+a second refuses (`SOCKET_BUSY`). A mismatched verb refuses
+(`SOCKET_KIND`). Because this form reads the FIFO the event pump also
+consumes, recv on a *source* is refused in serve mode
+(`SOCKET_RECV_SERVE`) — use `on <command>` there.
+
+**Numeric Class C pull.** In a Class C async body (a read permit is
+held), `ws_recv(handle[, timeout])` / `tcp_recv` / `tcp_recv_line` on a
+**plain** numeric handle run as a pull instead of the sync builtin's
+blocking read: the connection leaves the registry for the duration of
+one call (at most one waiter per handle — ws and tcp handles count ids
+independently, so the same number is two different connections; a
+second concurrent recv on the same one refuses `SOCKET_BUSY`, a
+subscribed handle `SOCKET_SUBSCRIBED`),
+the socket goes non-blocking, and readiness/read `WouldBlock` are
+awaited in a cancel-safe loop under the call's deadline — never via
+periodic polls. Read state (TLS/frame buffers, `tcp_recv_line`'s
+read-ahead) stays inside the connection across `WouldBlock`. `nil` on
+timeout and a cancelled wait both return the connection to the registry
+with its blocking mode and timeouts restored — the source stays usable
+and a failed generation's resource survives for the next one; a peer
+close or error raises (`SOCKET_CLOSED`) and retires the handle, exactly
+like the sync path. Pull frames never enter the subscription FIFO, so
+the event pump cannot steal them, and the numeric pull therefore also
+works in serve mode. Class S and plain evaluation keep the pre-existing
+synchronous client path unchanged. The pull's AsyncFd readiness await
+is unix-only: on other targets the Class C interception falls through
+to the sync builtin (honest Class S blocking semantics), never a
+silently claimed yield.
+
+**Ownership.** Sources belong to the evaluator generation:
+`close_native_events`/generation teardown cancels, joins and retires every
+source, and a failed `--serve` reload leaves the old generation's
+subscriptions intact. `ws_unwatch`/`tcp_unwatch` cancel and join the
+reader, drop queued frames, wake a parked recv with `SOCKET_WATCH_HANDLE`,
+and emit **no** terminal event (an explicit close is not a peer close);
+queued-but-unrun sends are answered with `SOCKET_SEND_CLOSED`, never
+silently dropped. The reader parks in `poll(2)` on (socket, cancellation
+pipe, command pipe) with an infinite deadline — no timer, so an idle
+subscription costs ~zero context switches; a poll timeout exists only
+while a send is pending. The socket is non-blocking, so cancellation
+wins at the next poll wake (mid-frame TLS state survives in the stream
+buffers).
+
+**Limits and acceptance.** 16 sources per evaluator; max WS message 16 MiB
+(connect-time cap); subscriptions Linux only (`SOCKET_UNSUPPORTED`
+elsewhere, matching the pidfd-owned children). The numeric Class C pull
+needs the unix AsyncFd await: off-unix the interception falls through
+to the sync builtin — honest Class S blocking, never a silently claimed
+yield. A busy subscription's in-flight read drains
+in bounded read/write batches before rechecking cancellation and absolute
+deadlines. Automatic WebSocket control writes also have a 30-second bound;
+a peer that leaves a pong blocked cannot retain an owed write indefinitely.
+The loopback acceptance tests execute the builtins
+end-to-end through the real evaluator: the ~2 s delayed numeric recv with
+a concurrent handler tick (the pull yields the read permit — the tick
+lands while the recv is parked), same-connection send after subscribing
+with the FIFO intact, timeout-then-reuse, a second same-handle waiter
+refusing, close-while-parked retiring, and a cancelled pull leaving the
+handle intact for the next generation. The *strict* "other verbs stay
+under 1 ms while a recv is parked" acceptance and the 5 s idle
+context-switch measurement remain explicit external acceptance, measured
+by the coordinator's fixture rather than asserted here; they are never
+weakened by these changes. Binary frames in event bodies are hex-encoded
+— `from_hex()` on the way back.
+
 ## Capability classes
 
 Each system builtin carries a [capability class](capabilities.md) used by the

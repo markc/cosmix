@@ -400,14 +400,18 @@ builtin_table! {
     ("udp_recv", CapabilityClass::Network,        "system",  "Receive ONE UDP datagram: udp_recv(port[, {timeout, host, max}]) -> {bytes, text, from_host, from_port}, or nil on timeout (an ordinary answer, not a fault). timeout seconds default 30, 0 = wait forever; host = bind address default 0.0.0.0; max caps the read (default 65535 = never truncates; a longer datagram truncates to max, recvfrom(2)'s own contract). text is the payload as UTF-8 or nil — bytes always carries the truth (v0.71.0)", contract!((port: number, opts?: map) -> any; effects[blocking]; failure[raises])),
     ("ws_connect", CapabilityClass::Network,      "system",  "Open a websocket (ws:// or wss://): ws_connect(url[, {insecure, headers, timeout}]) -> numeric handle. insecure:true skips TLS cert verification (self-signed device endpoints — the LG SSAP case); headers adds handshake request headers; timeout seconds bounds connect AND handshake (default 30, must be positive). Requires ws feature (v0.74.0)", contract!((url: string, opts?: map) -> number; effects[blocking]; failure[raises])),
     ("ws_send", CapabilityClass::Network,         "system",  "Send one websocket frame: text for a string payload, binary for bytes/buffer; flushed before returning. A closed connection raises and retires the handle (v0.74.0)", contract!((handle: number, payload: any_of(string, bytes, buffer)) -> nil; effects[blocking]; failure[raises])),
-    ("ws_recv", CapabilityClass::Network,         "system",  "Wait for the next DATA frame: ws_recv(handle[, timeout]) -> string (text frame) | bytes (binary frame) | nil on timeout (poll again). timeout seconds default 30, 0 = wait forever. Ping/pong handled internally. A peer close RAISES (catchable) and retires the handle — closed is not confusable with quiet (v0.74.0)", contract!((handle: number, timeout?: number) -> any; effects[blocking]; failure[raises])),
+    ("ws_recv", CapabilityClass::Network,         "system",  "Wait for the next DATA frame: ws_recv(handle[, timeout]) -> string (text frame) | bytes (binary frame) | nil on timeout (poll again). timeout seconds default 30, 0 = wait forever. Ping/pong handled internally. A peer close RAISES (catchable) and retires the handle — closed is not confusable with quiet. In a Class C async body, numeric ws_recv(handle[, timeout]) yields on native readiness; subscribed numeric handles refuse SOCKET_SUBSCRIBED. Source-id recv yields outside serve mode; serve mode refuses SOCKET_RECV_SERVE so the event pump cannot steal frames. nil on timeout keeps the connection usable; a terminal raises SOCKET_CLOSED (v0.74.0)", contract!((handle: any_of(number, string), timeout?: number) -> any; effects[blocking]; failure[raises])),
     ("ws_close", CapabilityClass::Network,        "system",  "Close a websocket handle: true when it was live, false when unknown/already retired (never raises for the not-held case, like funlock) (v0.74.0)", contract!((handle: number) -> bool; failure[raises])),
     ("http_serve", CapabilityClass::Network,      "system",  "BLOCKING static file server — the python -m http.server slot: http_serve(root[, {port, host, duration, index, listing, render_md, requests}]) -> requests served. GET/HEAD only (405 otherwise), NO TLS ever and NO dynamic handlers (both are webd's job). port 0 (default) binds ephemeral and PRINTS the URL; host defaults 127.0.0.1 (pass \"0.0.0.0\" to expose); duration 0 = until SIGINT; listing opts into directory indexes; render_md serves .md as HTML (markdown feature); spa (true=index, or a shell filename) answers an extensionless would-be-404 with that shell so a client-side router boots — for a single-shell SPA; clean_urls serves /foo.html for /foo (GitHub Pages parity — for a pre-rendered page-per-route site), tried before spa. Traversal-proof: every canonicalised path must stay under the canonicalised root (v0.75.0)", contract!((root: string, opts?: map) -> number; effects[blocking]; failure[raises])),
     ("http_recv", CapabilityClass::Network,       "system",  "Accept ONE HTTP request, answer it, return it: http_recv(port[, {timeout, host, max, respond}]) -> {method, path, query, headers, body, bytes, from_host, from_port}, or nil on timeout. The OAuth-localhost-redirect / webhook-catch shape. respond: {status, body, content_type, headers} (default 200 \"ok\"); max caps the request body (default 1 MiB); host defaults 127.0.0.1 (v0.75.0)", contract!((port: number, opts?: map) -> any; effects[blocking]; failure[raises])),
     ("tcp_connect", CapabilityClass::Network,     "system",  "Open a raw TCP connection: tcp_connect(host, port[, {timeout, tls, insecure}]) -> numeric handle. tls:true wraps in TLS (ring-pinned, webpki roots); insecure:true skips cert verification. The stream-socket primitive for a line/binary protocol (SMTP/redis/memcached probe, banner grab) UDP/WS/HTTP don't cover (v0.78.0)", contract!((host: string, port: number, opts?: map) -> number; effects[blocking]; failure[raises])),
     ("tcp_send", CapabilityClass::Network,        "system",  "Send bytes on a TCP handle: tcp_send(h, payload) -> bytes sent (string/bytes/buffer, verbatim; flushed) (v0.78.0)", contract!((handle: number, payload: any_of(string, bytes, buffer)) -> number; effects[blocking]; failure[raises])),
-    ("tcp_recv", CapabilityClass::Network,        "system",  "Read available bytes: tcp_recv(h[, {timeout, max}]) -> bytes (buffered bytes first, then one read of at most 256 KiB — poll again for more even when max is larger) | nil on timeout (poll again). Bytes not string — a stream has no frame boundary. A peer close RAISES and retires the handle. timeout default 30 (0=forever, wedges a serve pump), max default 64 KiB (v0.78.0)", contract!((handle: number, opts?: map) -> any; effects[blocking]; failure[raises])),
-    ("tcp_recv_line", CapabilityClass::Network,   "system",  "Read the next LINE: tcp_recv_line(h[, {timeout, max}]) -> string (LF + one trailing CR stripped) | nil on timeout. Buffers across reads; if `max` bytes accumulate with no newline the handle RAISES and RETIRES (a peer that never terminates a line — broken framing). For line protocols (SMTP/redis) so a caller need not hand-roll a \\r\\n scanner (v0.78.0)", contract!((handle: number, opts?: map) -> any; effects[blocking]; failure[raises])),
+    ("tcp_recv", CapabilityClass::Network,        "system",  "Read available bytes: tcp_recv(h[, {timeout, max}]) -> bytes (buffered bytes first, then one read of at most 256 KiB — poll again for more even when max is larger) | nil on timeout (poll again). Bytes not string — a stream has no frame boundary. A peer close RAISES and retires the handle. timeout default 30 (0=forever), max default 64 KiB. Numeric Class C recv yields on native readiness. Source-id recv yields outside serve; serve mode refuses SOCKET_RECV_SERVE and consumes frames through handlers. nil on timeout keeps the connection usable; terminal raises SOCKET_CLOSED (v0.78.0)", contract!((handle: any_of(number, string), opts?: map) -> any; effects[blocking]; failure[raises])),
+    ("tcp_recv_line", CapabilityClass::Network,   "system",  "Read the next LINE: tcp_recv_line(h[, {timeout, max}]) -> string (LF + one trailing CR stripped) | nil on timeout. Buffers across reads; if `max` bytes accumulate with no newline the handle RAISES and RETIRES (a peer that never terminates a line — broken framing). For line protocols (SMTP/redis) so a caller need not hand-roll a \\r\\n scanner. Numeric Class C recv yields on native readiness. A line-mode source-id recv yields outside serve; serve mode refuses SOCKET_RECV_SERVE and uses event handlers. nil on timeout keeps the connection usable; terminal raises SOCKET_CLOSED (v0.78.0)", contract!((handle: any_of(number, string), opts?: map) -> any; effects[blocking]; failure[raises])),
+    ("ws_on",   CapabilityClass::Network,         "system",  "Subscribe a ws_connect handle to the event stream: ws_on(handle, command) -> source id (string). The connection MOVES to an evaluator-generation reader thread: ordered frames arrive as `command` events {watch, frame:{kind:\"text\"|\"binary\", data}} (binary data hex-encoded), a peer close as ONE terminal {watch, closed:{reason}} — then the source retires. ws_send on the moved handle routes to the owner and awaits its receipt; numeric ws_recv refuses. Serve handlers receive frames as events. The reader parks in poll(2) when idle (no timer). Overflow hard-closes the socket with exactly one terminal event, never a silent drop. ws_unwatch cancels, joins and emits NO terminal marker (v0.107.0)", contract!((handle: number, command: string) -> string; failure[raises])),
+    ("ws_unwatch", CapabilityClass::Network,      "system",  "Cancel a ws_on subscription: ws_unwatch(source) -> nil. Cancels and joins the reader, drops queued frames and wakes a parked ws_recv with SOCKET_WATCH_HANDLE. Emits NO terminal event (explicit close — documented). Unknown or retired sources raise (v0.107.0)", contract!((handle: string) -> nil; failure[raises])),
+    ("tcp_on",   CapabilityClass::Network,        "system",  "Subscribe a tcp_connect handle to the event stream: tcp_on(handle, command[, {frame:\"line\"|\"bytes\", max}]) -> source id (string). frame defaults to \"bytes\": ordered raw chunks of at most 64 KiB; frame:\"line\" splits on LF (one trailing CR stripped) with max capping the line length (default 65536) — a line over max hard-closes with one terminal event. Same ownership, ordering, overflow and retirement rules as ws_on; tcp_recv consumes a bytes source, tcp_recv_line a line source, and a mismatched verb refuses (SOCKET_KIND) (v0.107.0)", contract!((handle: number, command: string, opts?: map) -> string; failure[raises])),
+    ("tcp_unwatch", CapabilityClass::Network,     "system",  "Cancel a tcp_on subscription: tcp_unwatch(source) -> nil. Same contract as ws_unwatch (v0.107.0)", contract!((handle: string) -> nil; failure[raises])),
     ("tcp_close", CapabilityClass::Network,       "system",  "Close a TCP handle: true when live, false when unknown/already closed (never raises for that, like funlock) (v0.78.0)", contract!((handle: number) -> bool; failure[raises])),
     ("help", CapabilityClass::Pure,            "system",  "Show Mix builtin help in the REPL", contract!(() -> nil)),
 
@@ -884,7 +888,8 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
         // (tcp_* share the ws feature's tungstenite/rustls stack.)
         #[cfg(not(feature = "ws"))]
         name @ ("ws_connect" | "ws_send" | "ws_recv" | "ws_close" | "tcp_connect" | "tcp_send"
-            | "tcp_recv" | "tcp_recv_line" | "tcp_close") => Err(MixError::RuntimeError {
+            | "tcp_recv" | "tcp_recv_line" | "tcp_close" | "ws_on" | "tcp_on"
+            | "ws_unwatch" | "tcp_unwatch") => Err(MixError::RuntimeError {
             span: None,
             msg: format!("{name}() requires the `ws` feature (tungstenite/rustls)"),
         }),
@@ -927,6 +932,14 @@ pub const EVAL_SPECIAL_BUILTINS: &[&str] = &[
     "eprint_raw",
     "serve_name",
     "script_version",
+    // Socket subscriptions are evaluator-special (generation ownership of
+    // the reader thread). ws_recv/tcp_recv/tcp_recv_line stay in is_builtin:
+    // only their string-source Class C form is intercepted by the inline
+    // arm; the numeric-handle client path is call_builtin's.
+    "ws_on",
+    "tcp_on",
+    "ws_unwatch",
+    "tcp_unwatch",
 ];
 
 /// Membership gate the evaluator consults before dispatching to
@@ -21060,11 +21073,30 @@ fn ws_err(name: &str, msg: impl std::fmt::Display) -> MixError {
 }
 
 #[cfg(feature = "ws")]
-fn ws_handle_arg(name: &str, args: &[Value]) -> MixResult<u64> {
+fn ws_id_arg(name: &str, args: &[Value]) -> MixResult<u64> {
     let n = number_arg(name, args, 0)?;
     as_exact_integer(&format!("{name}(): handle"), n, 1, i64::MAX)?
         .try_into()
         .map_err(|_| ws_err(name, "invalid handle"))
+}
+
+#[cfg(feature = "ws")]
+fn ws_handle_arg(name: &str, args: &[Value]) -> MixResult<u64> {
+    let id = ws_id_arg(name, args)?;
+    // A subscribed handle's connection is owned by its reader thread:
+    // recv/close refuse loudly rather than race the reader for &mut conn
+    // (ws_send routes through the owner's command endpoint instead).
+    if crate::builtins::socket_sources::is_subscribed(crate::builtins::socket_sources::ClientKey::ws(
+        id,
+    )) {
+        return Err(ws_err(
+            name,
+            format!(
+                "handle {id} is a ws_on subscription — frames arrive as events; close it with ws_unwatch()"
+            ),
+        ));
+    }
+    Ok(id)
 }
 
 /// `ws_connect(url[, {insecure, headers, timeout}])` → numeric handle.
@@ -21260,11 +21292,15 @@ fn builtin_ws_connect(args: Vec<Value>) -> MixResult<Option<Value>> {
 }
 
 /// `ws_send(handle, payload)` — one frame out: text for a string payload,
-/// binary for bytes/buffer. Flushed before returning.
+/// binary for bytes/buffer. Flushed before returning. On a SUBSCRIBED
+/// handle the send routes through the owner thread's bounded command
+/// endpoint and blocks (bounded by the owner's send deadline) for the
+/// completion receipt — the connection has exactly one owner, and this
+/// path never touches it.
 #[cfg(feature = "ws")]
 fn builtin_ws_send(args: Vec<Value>) -> MixResult<Option<Value>> {
     expect_args("ws_send", &args, 2)?;
-    let id = ws_handle_arg("ws_send", &args)?;
+    let id = ws_id_arg("ws_send", &args)?;
     let msg = match &args[1] {
         Value::String(s) => tungstenite::Message::text(s.clone()),
         Value::Bytes(b) => tungstenite::Message::binary(b.to_vec()),
@@ -21276,6 +21312,24 @@ fn builtin_ws_send(args: Vec<Value>) -> MixResult<Option<Value>> {
             ));
         }
     };
+    if crate::builtins::socket_sources::is_subscribed(crate::builtins::socket_sources::ClientKey::ws(
+        id,
+    )) {
+        let (text, payload) = match &msg {
+            tungstenite::Message::Text(s) => (true, s.as_bytes().to_vec()),
+            tungstenite::Message::Binary(b) => (false, b.to_vec()),
+            _ => unreachable!("send payloads are text or binary"),
+        };
+        let rx = crate::builtins::socket_sources::send_ws(id, text, payload)?;
+        return match rx.blocking_recv() {
+            Ok(Ok(_)) => Ok(Some(Value::Nil)),
+            Ok(Err((code, message))) => Err(crate::native_events::refusal(&code, message)),
+            Err(_) => Err(crate::native_events::refusal(
+                "SOCKET_SEND_CLOSED",
+                "the socket source was closed before the send completed",
+            )),
+        };
+    }
     // Take the connection OUT of the registry for the duration of the
     // blocking write — the global mutex must never be held across network
     // I/O (a second evaluator thread's ws_* call on any OTHER handle
@@ -21458,6 +21512,19 @@ mod tcp_client {
                 Stream::Tls(t) => t.read(buf),
             }
         }
+        pub(super) fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            match &mut self.stream {
+                Stream::Plain(s) => s.write(buf),
+                Stream::Tls(t) => t.write(buf),
+            }
+        }
+        pub(super) fn flush(&mut self) -> std::io::Result<()> {
+            match &mut self.stream {
+                // Plain stream writes go straight to the kernel.
+                Stream::Plain(_) => Ok(()),
+                Stream::Tls(t) => t.flush(),
+            }
+        }
         pub(super) fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
             match &mut self.stream {
                 Stream::Plain(s) => s.write_all(buf).and_then(|_| s.flush()),
@@ -21476,11 +21543,30 @@ fn tcp_err(name: &str, msg: impl std::fmt::Display) -> MixError {
 }
 
 #[cfg(feature = "ws")]
-fn tcp_handle(name: &str, args: &[Value]) -> MixResult<u64> {
+fn tcp_id_arg(name: &str, args: &[Value]) -> MixResult<u64> {
     let n = number_arg(name, args, 0)?;
     as_exact_integer(&format!("{name}(): handle"), n, 1, i64::MAX)?
         .try_into()
         .map_err(|_| tcp_err(name, "invalid handle"))
+}
+
+#[cfg(feature = "ws")]
+fn tcp_handle(name: &str, args: &[Value]) -> MixResult<u64> {
+    let id = tcp_id_arg(name, args)?;
+    // A subscribed handle's connection is owned by its reader thread:
+    // recv refuses loudly rather than race the reader for &mut conn
+    // (tcp_send routes through the owner's command endpoint instead).
+    if crate::builtins::socket_sources::is_subscribed(crate::builtins::socket_sources::ClientKey::tcp(
+        id,
+    )) {
+        return Err(tcp_err(
+            name,
+            format!(
+                "handle {id} is a tcp_on subscription — frames arrive as events; close it with tcp_unwatch()"
+            ),
+        ));
+    }
+    Ok(id)
 }
 
 /// `tcp_connect(host, port[, {timeout, tls, insecure}])` → numeric handle.
@@ -21613,16 +21699,32 @@ fn builtin_tcp_connect(args: Vec<Value>) -> MixResult<Option<Value>> {
 }
 
 /// `tcp_send(h, payload)` → bytes sent (string/bytes/buffer, verbatim).
+/// On a SUBSCRIBED handle the send routes through the owner thread's
+/// bounded command endpoint and blocks (bounded by the owner's send
+/// deadline) for the completion receipt.
 #[cfg(feature = "ws")]
 fn builtin_tcp_send(args: Vec<Value>) -> MixResult<Option<Value>> {
     expect_args("tcp_send", &args, 2)?;
-    let id = tcp_handle("tcp_send", &args)?;
+    let id = tcp_id_arg("tcp_send", &args)?;
     let payload: Vec<u8> = match &args[1] {
         Value::String(s) => s.as_bytes().to_vec(),
         Value::Bytes(b) => b.to_vec(),
         Value::Buffer(b) => b.borrow().clone(),
         other => return Err(tcp_err("tcp_send()", format!("payload must be a string, bytes or buffer, got {}", other.type_name()))),
     };
+    if crate::builtins::socket_sources::is_subscribed(crate::builtins::socket_sources::ClientKey::tcp(
+        id,
+    )) {
+        let rx = crate::builtins::socket_sources::send_tcp(id, payload)?;
+        return match rx.blocking_recv() {
+            Ok(Ok(n)) => Ok(Some(Value::Number(n as f64))),
+            Ok(Err((code, message))) => Err(crate::native_events::refusal(&code, message)),
+            Err(_) => Err(crate::native_events::refusal(
+                "SOCKET_SEND_CLOSED",
+                "the socket source was closed before the send completed",
+            )),
+        };
+    }
     let mut conn = tcp_client::MAP
         .lock()
         .unwrap()
@@ -21804,6 +21906,2903 @@ fn tcp_recv_opts(name: &str, opts: Option<&Value>, default_max: usize) -> MixRes
         }
     }
     Ok((timeout_seconds, max))
+}
+
+// --- Native socket subscriptions: ws_on / tcp_on (v0.107.0) ---
+//
+// The event-stream shape of ws_connect/tcp_connect. Subscribing MOVES the
+// connection out of the process-global client registry into a reader thread
+// owned by the evaluator generation (native_events::NativeEvents); frames
+// arrive as events under the caller-chosen command, and the Class C source
+// forms ws_recv("ws:N")/tcp_recv/tcp_recv_line park on the ordered FIFO
+// through the evaluator's await_with_class_c_yield. See docs/mix/system.md
+// "Socket subscriptions".
+//
+// Wire discipline:
+//   * One std thread per source owns the wire — reads AND writes. It parks
+//     in poll(2) on (socket, cancel socketpair, command socketpair) with an
+//     infinite deadline while idle, so there are zero timer wakeups; a poll
+//     timeout exists only while an outgoing send is pending (its deadline).
+//     The socket is non-blocking, so after poll reports readable the reads
+//     run until WouldBlock: an explicit close (one byte on the cancel FD)
+//     wins at the next poll wake, and mid-frame TLS state stays intact
+//     inside tungstenite/rustls buffers across WouldBlock returns.
+//   * ws_send/tcp_send on a subscribed numeric handle reach the owner via a
+//     Send-safe command endpoint (bounded channel + wake byte + oneshot
+//     completion receipt). Admission is bounded for the send's ENTIRE
+//     lifetime — 64 ops and 64 MiB of payload across queued + in-flight,
+//     held as owned semaphore permits carried with the command and
+//     released only when its receipt is answered or it is retired (a
+//     cancelled caller's command keeps its reservation). The receipt
+//     deadline is stamped at ADMISSION and checked absolutely every poll
+//     loop, so queued hops and continuous POLLIN traffic cannot stretch
+//     or starve it. Writes run non-blocking with partial state retained
+//     (tcp: offset into the payload; ws: the message stays in
+//     tungstenite's out-buffer), and POLLOUT is armed only while bytes are
+//     owed. A send that cannot finish within its deadline fails its
+//     receipt AND — when any byte may have been written — hard-closes the
+//     source with one terminal event: bytes are never silently dropped or
+//     re-sent. The wake socketpair is a control wakeup, distinct from
+//     cancellation: a send never cancels the subscription.
+//   * ws_recv/tcp_recv/tcp_recv_line on a subscribed handle still refuse
+//     deterministically (the reader is the single read owner); numeric
+//     recv on an UNsubscribed handle runs as a Class C pull (below), never
+//     on the subscription FIFO, so the event pump cannot steal pull frames.
+//   * The thread touches only the queue's pending mutex for the instant of
+//     a push — never across I/O — so a parked recv or a send on another
+//     handle can never wedge behind a blocked reader.
+//   * Ordered, bounded FIFO: when the queue refuses a frame (byte or frame
+//     bound), the reader hard-closes the socket and publishes EXACTLY ONE
+//     terminal event — frames are never silently dropped.
+//
+// Class C numeric pull (v0.105.0): in a Class C async body (a read permit
+// is held), ws_recv/tcp_recv/tcp_recv_line on a plain numeric handle run a
+// cancel-safe non-blocking loop instead of the sync builtin's blocking
+// read. The conn leaves the global registry for the duration of ONE pull
+// (at most one waiter — a second pull on the same handle refuses
+// SOCKET_BUSY); readiness (AsyncFd on a dup'd fd) and read WouldBlock are
+// awaited under the call's deadline, with the TLS/frame state retained in
+// the conn across WouldBlock. nil timeout and cancellation both return the
+// conn to the registry (source stays usable); a peer close or error RAISES
+// and retires the handle exactly like the sync path. Class S and plain
+// evaluation keep the synchronous semantics.
+#[cfg(feature = "ws")]
+pub(crate) mod socket_sources {
+    use super::{tcp_client, tcp_err, ws_client, ws_err};
+    use crate::{
+        error::MixResult,
+        native_events::{Queue, refusal},
+        value::Value,
+    };
+    use std::{
+        collections::HashSet,
+        sync::{
+            Arc, LazyLock, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
+    #[cfg(target_os = "linux")]
+    use std::sync::atomic::AtomicU64;
+
+    /// Which process-global client registry a numeric handle names.
+    /// ws_connect and tcp_connect run INDEPENDENT id counters, so the same
+    /// number is two different live connections — every cross-connection
+    /// lookup (pull, subscription, send routing) keys by (family, id),
+    /// never by id alone.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+    pub(crate) enum ClientFamily {
+        Ws,
+        Tcp,
+    }
+
+    /// A numeric client handle disambiguated by its backend family.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+    pub(crate) struct ClientKey {
+        family: ClientFamily,
+        id: u64,
+    }
+
+    impl ClientKey {
+        pub(crate) const fn ws(id: u64) -> Self {
+            Self {
+                family: ClientFamily::Ws,
+                id,
+            }
+        }
+        pub(crate) const fn tcp(id: u64) -> Self {
+            Self {
+                family: ClientFamily::Tcp,
+                id,
+            }
+        }
+        /// The backend a numeric recv/send verb addresses.
+        pub(crate) fn of(name: &str, id: u64) -> Self {
+            if name.starts_with("ws_") {
+                Self::ws(id)
+            } else {
+                Self::tcp(id)
+            }
+        }
+    }
+
+    /// Message/frame cap shared with ws_connect's tungstenite config. The
+    /// FIFO byte bound (MAX_SOCKET_BYTES) always admits at least one frame
+    /// of this size, so a legal message alone can never overflow the queue.
+    pub(crate) const MAX_FRAME: usize = 16 * 1024 * 1024;
+    /// Maximum subscribed sources per evaluator generation.
+    pub(crate) const MAX_SOURCES: usize = 16;
+    /// Per-evaluator FIFO bounds (counted across all its sources).
+    pub(crate) const MAX_SOCKET_FRAMES: usize = 4096;
+    pub(crate) const MAX_SOCKET_BYTES: usize = 64 * 1024 * 1024;
+    /// tcp bytes-mode raw chunk size (the documented default).
+    const CHUNK: usize = 64 * 1024;
+
+    /// Bounded outgoing admission per source: at most this many sends
+    /// (ops) and payload bytes outstanding at once, counted across the
+    /// command's ENTIRE lifetime — queued, in flight, or parked behind a
+    /// cancelled caller. Owned semaphore permits travel with the command
+    /// and release only when its receipt is answered or it is retired.
+    /// (Linux-only: the owner-thread endpoint exists only there.)
+    #[cfg(target_os = "linux")]
+    pub(crate) const MAX_SEND_OPS: usize = 64;
+    #[cfg(target_os = "linux")]
+    pub(crate) const MAX_SEND_BYTES: usize = 64 * 1024 * 1024;
+    /// A send receipt's deadline, stamped at ADMISSION: queued or in
+    /// flight, the receipt answers within this window of the call —
+    /// never 30 s per queued hop.
+    #[cfg(target_os = "linux")]
+    pub(crate) const SEND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Source kinds a Class C recv verb may consume. The subscription stores
+    /// its kind so a mismatched verb refuses instead of misreading bytes.
+    pub(crate) const KIND_WS: &str = "ws";
+    pub(crate) const KIND_TCP_BYTES: &str = "tcp:bytes";
+    pub(crate) const KIND_TCP_LINE: &str = "tcp:line";
+
+    /// One ordered frame record. Owned Vec<u8> only — Send across std
+    /// threads, never Rc<Value>.
+    #[derive(Clone, Debug)]
+    pub(crate) struct SocketRecord {
+        /// "text" | "binary" (ws) | "bytes" | "line" (tcp).
+        pub kind: &'static str,
+        pub data: Vec<u8>,
+    }
+
+    /// tcp_on mode: raw chunks or newline-split lines with a length bound.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct TcpMode {
+        pub line: bool,
+        pub max: usize,
+    }
+
+    fn number_of(v: &Value, what: &str) -> MixResult<f64> {
+        match v {
+            Value::Number(n) => Ok(*n),
+            other => Err(refusal(
+                "SOCKET_ARGUMENT",
+                format!("{what} must be a number, got {}", other.type_name()),
+            )),
+        }
+    }
+
+    fn usize_of(v: &Value, what: &str) -> MixResult<usize> {
+        let n = number_of(v, what)?;
+        if n.fract() != 0.0 || n < 1.0 || n > usize::MAX as f64 {
+            return Err(refusal(
+                "SOCKET_ARGUMENT",
+                format!("{what} must be a positive integer"),
+            ));
+        }
+        Ok(n as usize)
+    }
+
+    /// The numeric client handle created by ws_connect/tcp_connect.
+    pub(crate) fn client_id_of(v: Option<&Value>, name: &str) -> MixResult<u64> {
+        let v = v.ok_or_else(|| refusal("SOCKET_ARGUMENT", format!("{name}(): missing handle")))?;
+        let n = number_of(v, &format!("{name}(): handle"))?;
+        if n.fract() != 0.0 || n < 1.0 || n > i64::MAX as f64 {
+            return Err(refusal("SOCKET_ARGUMENT", format!("{name}(): invalid handle")));
+        }
+        Ok(n as u64)
+    }
+
+    /// The event command frames are delivered under. Handlers are keyed by
+    /// it, so it must be a name a Mix event command can carry.
+    pub(crate) fn event_command_of(v: Option<&Value>, name: &str) -> MixResult<String> {
+        let v = v.ok_or_else(|| refusal("SOCKET_ARGUMENT", format!("{name}(): missing command")))?;
+        let Value::String(s) = v else {
+            return Err(refusal("SOCKET_ARGUMENT", format!("{name}(): command must be a string")));
+        };
+        if s.is_empty()
+            || s.len() > 64
+            || !s
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':'))
+        {
+            return Err(refusal(
+                "SOCKET_ARGUMENT",
+                format!("{name}(): command must be 1-64 characters of [a-zA-Z0-9._:-]"),
+            ));
+        }
+        Ok(s.clone())
+    }
+
+    pub(crate) fn parse_tcp_on_opts(opts: Option<&Value>) -> MixResult<TcpMode> {
+        let mut line = false;
+        let mut max = 65536usize;
+        if let Some(v) = opts {
+            match v {
+                Value::Nil => {}
+                Value::Map(m) => {
+                    for k in m.keys() {
+                        if !matches!(k.as_str(), "frame" | "max") {
+                            return Err(refusal(
+                                "TCP_ON_ARGUMENT",
+                                format!("unknown option '{k}' (supported: frame, max)"),
+                            ));
+                        }
+                    }
+                    if let Some(f) = m.get("frame") {
+                        match f {
+                            Value::String(s) if s == "line" => line = true,
+                            Value::String(s) if s == "bytes" => line = false,
+                            other => {
+                                return Err(refusal(
+                                    "TCP_ON_ARGUMENT",
+                                    format!(
+                                        "option 'frame' must be \"line\" or \"bytes\", got {}",
+                                        other.type_name()
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    if let Some(x) = m.get("max") {
+                        max = usize_of(x, "tcp_on(): option 'max'")?;
+                        if max > MAX_FRAME {
+                            return Err(refusal(
+                                "TCP_ON_ARGUMENT",
+                                format!("option 'max' must be at most {MAX_FRAME}"),
+                            ));
+                        }
+                    }
+                }
+                other => {
+                    return Err(refusal(
+                        "TCP_ON_ARGUMENT",
+                        format!("options must be a map or nil, got {}", other.type_name()),
+                    ));
+                }
+            }
+        }
+        Ok(TcpMode { line, max })
+    }
+
+    /// Class C source-recv options: ws_recv(source[, timeout]) or
+    /// tcp_recv/tcp_recv_line(source[, {timeout, max}]). timeout 0 waits
+    /// forever; a nil result (timeout) keeps the source usable.
+    pub(crate) fn parse_source_recv_opts(
+        name: &str,
+        opts: Option<&Value>,
+        default_max: usize,
+    ) -> MixResult<(f64, usize)> {
+        let mut timeout_seconds = 30.0f64;
+        let mut max = default_max;
+        if let Some(v) = opts {
+            match v {
+                Value::Nil => {}
+                Value::Number(n) if name == "ws_recv" => timeout_seconds = *n,
+                Value::Map(m) => {
+                    for k in m.keys() {
+                        if !matches!(k.as_str(), "timeout" | "max") {
+                            return Err(refusal(
+                                "SOCKET_ARGUMENT",
+                                format!("{name}(): unknown option '{k}' (supported: timeout, max)"),
+                            ));
+                        }
+                    }
+                    if let Some(t) = m.get("timeout") {
+                        timeout_seconds = number_of(t, &format!("{name}(): option 'timeout'"))?;
+                    }
+                    if let Some(x) = m.get("max") {
+                        max = usize_of(x, &format!("{name}(): option 'max'"))?;
+                    }
+                }
+                other => {
+                    return Err(refusal(
+                        "SOCKET_ARGUMENT",
+                        format!("{name}(): options must be a map or nil, got {}", other.type_name()),
+                    ));
+                }
+            }
+        }
+        if !timeout_seconds.is_finite() || timeout_seconds < 0.0 {
+            return Err(refusal(
+                "SOCKET_ARGUMENT",
+                format!("{name}(): timeout must be a non-negative number"),
+            ));
+        }
+        Ok((timeout_seconds, max))
+    }
+
+    /// Completion receipt payload: Send-safe because MixError is not (it
+    /// can carry an Rc-based Value); the receiver rebuilds the structured
+    /// error from the code/message pair.
+    pub(crate) type SendReceipt = Result<usize, (String, String)>;
+
+    /// Owned admission permits travelling with one send command. They
+    /// exist to be held, then dropped: the reservation releases when the
+    /// command's receipt is answered or the command is retired — NOT when
+    /// it merely moves channel → worker, so a cancelled Class C caller's
+    /// command keeps its reservation until the owner thread answers it.
+    pub(crate) struct SendPermits {
+        _ops: tokio::sync::OwnedSemaphorePermit,
+        _bytes: tokio::sync::OwnedSemaphorePermit,
+    }
+
+    /// One command to the single owner (reader) thread.
+    pub(crate) enum SocketCommand {
+        Tcp {
+            payload: Vec<u8>,
+            /// Receipt deadline from ADMISSION — carried through the queue
+            /// and into flight, never restamped when dequeued.
+            deadline: std::time::Instant,
+            permits: SendPermits,
+            receipt: tokio::sync::oneshot::Sender<SendReceipt>,
+        },
+        Ws {
+            text: bool,
+            payload: Vec<u8>,
+            deadline: std::time::Instant,
+            permits: SendPermits,
+            receipt: tokio::sync::oneshot::Sender<SendReceipt>,
+        },
+    }
+
+    impl SocketCommand {
+        pub(crate) fn receipt(self) -> Option<tokio::sync::oneshot::Sender<SendReceipt>> {
+            match self {
+                SocketCommand::Tcp { receipt, .. } | SocketCommand::Ws { receipt, .. } => Some(receipt),
+            }
+        }
+    }
+
+    /// The Send-safe control endpoint for a subscribed numeric handle: the
+    /// bounded command channel plus the write end of the wake socketpair,
+    /// and the admission semaphores bounding queued + in-flight sends.
+    #[cfg(target_os = "linux")]
+    pub(crate) struct SendEndpoint {
+        pub(super) tx: std::sync::mpsc::SyncSender<SocketCommand>,
+        pub(super) wake: std::os::unix::net::UnixStream,
+        /// Whole-lifetime admission: ops and payload bytes, reserved
+        /// before enqueue and held by the command's permits until its
+        /// receipt is answered or it is retired.
+        ops: Arc<tokio::sync::Semaphore>,
+        bytes: Arc<tokio::sync::Semaphore>,
+        /// Receipt deadline from admission (millis). Production is always
+        /// SEND_DEADLINE; only the in-crate test fixture shortens it.
+        deadline: AtomicU64,
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) struct SendEndpoint;
+
+    #[cfg(target_os = "linux")]
+    impl SendEndpoint {
+        /// Reserve one op and the payload's bytes for the send's ENTIRE
+        /// lifetime. A full queue refuses SOCKET_SEND_BUSY; a reservation
+        /// that cannot complete releases what it took (RAII on the `?`).
+        pub(crate) fn admit(&self, payload_len: usize) -> MixResult<SendPermits> {
+            let full = || refusal("SOCKET_SEND_BUSY", "the socket source's outgoing send queue is full");
+            if payload_len > MAX_SEND_BYTES {
+                return Err(full());
+            }
+            let ops = self.ops.clone().try_acquire_owned().map_err(|_| full())?;
+            let bytes = self
+                .bytes
+                .clone()
+                .try_acquire_many_owned(payload_len as u32)
+                .map_err(|_| full())?;
+            Ok(SendPermits {
+                _ops: ops,
+                _bytes: bytes,
+            })
+        }
+
+        /// The per-source receipt deadline (production SEND_DEADLINE; the
+        /// test fixture alone may shorten it).
+        pub(crate) fn send_deadline(&self) -> std::time::Duration {
+            std::time::Duration::from_millis(self.deadline.load(Ordering::Relaxed).max(1))
+        }
+
+        /// Test-only knobs: shorten the receipt deadline per-source and
+        /// inspect outstanding admission. Never user-exposed.
+        #[cfg(test)]
+        pub(crate) fn set_deadline_for_test(&self, d: std::time::Duration) {
+            self.deadline
+                .store(d.as_millis().max(1) as u64, Ordering::Relaxed);
+        }
+        #[cfg(test)]
+        pub(crate) fn available_permits(&self) -> (usize, usize) {
+            (self.ops.available_permits(), self.bytes.available_permits())
+        }
+
+        /// Enqueue one bounded send; the owner thread performs the write
+        /// and answers the receipt. Full/closed are explicit errors, never
+        /// a silent drop. (Admission ahead of it keeps the channel from
+        /// actually filling; the arms stay for defense.)
+        pub(crate) fn send(&self, cmd: SocketCommand) -> MixResult<()> {
+            use std::sync::mpsc::TrySendError;
+            match self.tx.try_send(cmd) {
+                Ok(()) => {
+                    let mut wake = &self.wake;
+                    let _ = std::io::Write::write_all(&mut wake, &[1u8]);
+                    Ok(())
+                }
+                Err(TrySendError::Full(_)) => Err(refusal(
+                    "SOCKET_SEND_BUSY",
+                    "the socket source's outgoing send queue is full",
+                )),
+                Err(TrySendError::Disconnected(_)) => Err(refusal(
+                    "SOCKET_SEND_CLOSED",
+                    "the socket source is closed or retiring",
+                )),
+            }
+        }
+    }
+
+    /// Numeric client handles whose connection moved to a subscription,
+    /// keyed by (backend family, numeric id) — the two client registries
+    /// have independent id counters, so id alone would collide. Consulted
+    /// by the sync ws_*/tcp_* builtins: recv/close refuse loudly on a
+    /// subscribed handle; send routes through the endpoint instead.
+    #[cfg(target_os = "linux")]
+    static SUBSCRIBED: LazyLock<
+        Mutex<std::collections::HashMap<ClientKey, std::sync::Arc<SendEndpoint>>>,
+    > = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+    #[cfg(not(target_os = "linux"))]
+    static SUBSCRIBED: LazyLock<Mutex<HashSet<ClientKey>>> =
+        LazyLock::new(|| Mutex::new(HashSet::new()));
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn register_subscribed(key: ClientKey, endpoint: std::sync::Arc<SendEndpoint>) {
+        SUBSCRIBED.lock().unwrap().insert(key, endpoint);
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn send_endpoint(key: ClientKey) -> Option<std::sync::Arc<SendEndpoint>> {
+        SUBSCRIBED.lock().unwrap().get(&key).cloned()
+    }
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn register_subscribed(_key: ClientKey, _endpoint: std::sync::Arc<SendEndpoint>) {}
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn send_endpoint(_key: ClientKey) -> Option<std::sync::Arc<SendEndpoint>> {
+        None
+    }
+
+    pub(crate) fn unmark_subscribed(key: ClientKey) {
+        SUBSCRIBED.lock().unwrap().remove(&key);
+    }
+    pub(crate) fn is_subscribed(key: ClientKey) -> bool {
+        SUBSCRIBED.lock().unwrap().get(&key).is_some()
+    }
+
+    /// `ws_send` on a subscribed handle: enqueue one bounded message for
+    /// the owner thread and return the completion receipt. The caller
+    /// awaits it (Class C yields; Class S blocks boundedly).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn send_ws(
+        id: u64,
+        text: bool,
+        payload: Vec<u8>,
+    ) -> MixResult<tokio::sync::oneshot::Receiver<SendReceipt>> {
+        if payload.len() > MAX_FRAME {
+            return Err(refusal(
+                "SOCKET_SEND_SIZE",
+                format!("payload exceeds the {MAX_FRAME} byte send bound"),
+            ));
+        }
+        let endpoint = send_endpoint(ClientKey::ws(id)).ok_or_else(|| {
+            refusal(
+                "SOCKET_SEND_CLOSED",
+                format!("handle {id} is a subscription whose source is closed or retiring"),
+            )
+        })?;
+        // Admission first: the owned permits travel with the command and
+        // hold the reservation until the receipt is answered or the
+        // command is retired. The deadline is stamped HERE — every
+        // receipt path is bounded from admission, not from when the
+        // owner dequeues the command.
+        let permits = endpoint.admit(payload.len())?;
+        let deadline = std::time::Instant::now() + endpoint.send_deadline();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        endpoint.send(SocketCommand::Ws {
+            text,
+            payload,
+            deadline,
+            permits,
+            receipt: tx,
+        })?;
+        Ok(rx)
+    }
+
+    /// `tcp_send` on a subscribed handle (bytes sent = payload length).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn send_tcp(
+        id: u64,
+        payload: Vec<u8>,
+    ) -> MixResult<tokio::sync::oneshot::Receiver<SendReceipt>> {
+        if payload.len() > MAX_FRAME {
+            return Err(refusal(
+                "SOCKET_SEND_SIZE",
+                format!("payload exceeds the {MAX_FRAME} byte send bound"),
+            ));
+        }
+        let endpoint = send_endpoint(ClientKey::tcp(id)).ok_or_else(|| {
+            refusal(
+                "SOCKET_SEND_CLOSED",
+                format!("handle {id} is a subscription whose source is closed or retiring"),
+            )
+        })?;
+        let permits = endpoint.admit(payload.len())?;
+        let deadline = std::time::Instant::now() + endpoint.send_deadline();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        endpoint.send(SocketCommand::Tcp {
+            payload,
+            deadline,
+            permits,
+            receipt: tx,
+        })?;
+        Ok(rx)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn send_ws(
+        _id: u64,
+        _text: bool,
+        _payload: Vec<u8>,
+    ) -> MixResult<tokio::sync::oneshot::Receiver<SendReceipt>> {
+        Err(refusal(
+            "SOCKET_UNSUPPORTED",
+            "socket subscriptions require Linux poll(2)",
+        ))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn send_tcp(
+        _id: u64,
+        _payload: Vec<u8>,
+    ) -> MixResult<tokio::sync::oneshot::Receiver<SendReceipt>> {
+        Err(refusal(
+            "SOCKET_UNSUPPORTED",
+            "socket subscriptions require Linux poll(2)",
+        ))
+    }
+
+    // --- Class C numeric pull (v0.105.0) ---
+    //
+    // A plain numeric handle's recv inside a Class C async body (a read
+    // permit is held). The conn leaves the process-global registry for the
+    // duration of ONE pull; the evaluator awaits this future through
+    // await_with_class_c_yield, so the read permit is released while the
+    // socket is not ready. The socket is non-blocking and read state
+    // (TLS/frame buffers, tcp read-ahead) stays inside the conn across
+    // WouldBlock returns; readiness is awaited on an AsyncFd dup of the
+    // socket's fd, in a cancel-safe loop. No periodic idle polls: every
+    // wait is an event-driven readiness await under the call's deadline.
+    // nil timeout and cancellation return the conn to the registry (the
+    // source stays usable); a peer close or error RAISES and retires the
+    // handle, exactly like the sync path. The AsyncFd readiness await is
+    // unix-only: on other targets the evaluator never routes here (its
+    // Class C interception is unix-gated and falls through to the sync
+    // builtin — honest Class S semantics, never a silently claimed
+    // yield).
+
+    /// A numeric connection pulled out of the global registry for one
+    /// Class C recv.
+    enum PullWire {
+        Ws(Box<ws_client::WsConn>),
+        Tcp(tcp_client::Conn),
+    }
+
+    /// Owns the pulled conn. Drop returns it to the registry with blocking
+    /// mode and its original timeouts restored — a cancelled wait is safe
+    /// and the source stays usable; a pull that finished with a frame or
+    /// nil, or retired on close/error, leaves the wire slot empty.
+    pub(crate) struct PullGuard {
+        key: ClientKey,
+        wire: Option<PullWire>,
+        read_timeout: Option<std::time::Duration>,
+        write_timeout: Option<std::time::Duration>,
+    }
+
+    /// At most one Class C pull per numeric handle, process-wide — keyed
+    /// by (family, id), so a ws handle and a tcp handle that share a
+    /// number pull independently. The conn leaves the registry for the
+    /// duration of the pull, so without this a second concurrent recv
+    /// would misreport "unknown handle"; the set turns that into a
+    /// precise SOCKET_BUSY refusal.
+    static PULLED: LazyLock<Mutex<HashSet<ClientKey>>> =
+        LazyLock::new(|| Mutex::new(HashSet::new()));
+
+    fn restore_blocking(
+        tcp: &std::net::TcpStream,
+        read: Option<std::time::Duration>,
+        write: Option<std::time::Duration>,
+    ) {
+        let _ = tcp.set_nonblocking(false);
+        let _ = tcp.set_read_timeout(read);
+        let _ = tcp.set_write_timeout(write);
+    }
+
+    impl PullGuard {
+        fn tcp(&self) -> &std::net::TcpStream {
+            match self.wire.as_ref().expect("wire present") {
+                PullWire::Ws(c) => ws_client::tcp_of(c).expect("ws conn has a tcp stream"),
+                PullWire::Tcp(c) => c.tcp(),
+            }
+        }
+
+        /// Success or nil timeout: the conn returns to the registry with
+        /// blocking mode and its original timeouts restored.
+        fn finish(&mut self) {
+            let Some(wire) = self.wire.take() else {
+                return;
+            };
+            let tcp = match &wire {
+                PullWire::Ws(c) => ws_client::tcp_of(c).expect("ws conn has a tcp stream"),
+                PullWire::Tcp(c) => c.tcp(),
+            };
+            restore_blocking(tcp, self.read_timeout, self.write_timeout);
+            match wire {
+                PullWire::Ws(c) => {
+                    ws_client::MAP.lock().unwrap().insert(self.key.id, *c);
+                }
+                PullWire::Tcp(c) => {
+                    tcp_client::MAP.lock().unwrap().insert(self.key.id, c);
+                }
+            }
+            PULLED.lock().unwrap().remove(&self.key);
+        }
+
+        /// Close/error: retire the handle — the conn is dropped, exactly
+        /// like the sync path's close/raise.
+        fn retire(&mut self) {
+            self.wire = None;
+            PULLED.lock().unwrap().remove(&self.key);
+        }
+    }
+
+    impl Drop for PullGuard {
+        fn drop(&mut self) {
+            if self.wire.is_some() {
+                self.finish();
+            }
+        }
+    }
+
+    /// Adopt the connection inside its owning module; callers never access
+    /// the private process-wide connection registries directly.
+    pub(crate) fn subscribe_ws(
+        queue: std::sync::Arc<crate::native_events::Queue>,
+        id: String,
+        command: String,
+        client_id: u64,
+    ) -> MixResult<SocketSource> {
+        let conn = ws_client::MAP.lock().unwrap().remove(&client_id)
+            .ok_or_else(|| refusal("WS_ON_HANDLE", format!("unknown ws handle {client_id}")))?;
+        spawn_ws(queue, id, command, client_id, conn)
+    }
+
+    pub(crate) fn subscribe_tcp(
+        queue: std::sync::Arc<crate::native_events::Queue>,
+        id: String,
+        command: String,
+        client_id: u64,
+        mode: TcpMode,
+    ) -> MixResult<SocketSource> {
+        let conn = tcp_client::MAP.lock().unwrap().remove(&client_id)
+            .ok_or_else(|| refusal("TCP_ON_HANDLE", format!("unknown tcp handle {client_id}")))?;
+        spawn_tcp(queue, id, command, client_id, conn, mode)
+    }
+
+    /// Take a plain numeric handle out of the global registry for one
+    /// Class C recv. Refuses a subscribed handle (the reader thread is
+    /// the single read owner) and a second concurrent pull on the same
+    /// handle (SOCKET_BUSY).
+    pub(crate) fn pull_conn(name: &str, id: u64) -> MixResult<PullGuard> {
+        let key = ClientKey::of(name, id);
+        if is_subscribed(key) {
+            return Err(refusal(
+                "SOCKET_SUBSCRIBED",
+                format!(
+                    "handle {id} is a subscription — frames arrive as events; recv the source string instead"
+                ),
+            ));
+        }
+        {
+            let mut pulled = PULLED.lock().unwrap();
+            if pulled.contains(&key) {
+                return Err(refusal(
+                    "SOCKET_BUSY",
+                    "another recv is already waiting on this handle",
+                ));
+            }
+            pulled.insert(key);
+        }
+        let (wire, read_timeout, write_timeout) = if name == "ws_recv" {
+            let conn = ws_client::MAP
+                .lock()
+                .unwrap()
+                .remove(&id)
+                .ok_or_else(|| {
+                    PULLED.lock().unwrap().remove(&key);
+                    ws_err(name, format!("unknown ws handle {id}"))
+                })?;
+            let tcp = ws_client::tcp_of(&conn).expect("ws conn has a tcp stream");
+            let read_timeout = tcp.read_timeout().ok().flatten();
+            let write_timeout = tcp.write_timeout().ok().flatten();
+            (
+                PullWire::Ws(Box::new(conn)),
+                read_timeout,
+                write_timeout,
+            )
+        } else {
+            let conn = tcp_client::MAP
+                .lock()
+                .unwrap()
+                .remove(&id)
+                .ok_or_else(|| {
+                    PULLED.lock().unwrap().remove(&key);
+                    tcp_err(name, format!("unknown tcp handle {id}"))
+                })?;
+            let tcp = conn.tcp();
+            let read_timeout = tcp.read_timeout().ok().flatten();
+            let write_timeout = tcp.write_timeout().ok().flatten();
+            (
+                PullWire::Tcp(conn),
+                read_timeout,
+                write_timeout,
+            )
+        };
+        let guard = PullGuard {
+            key,
+            wire: Some(wire),
+            read_timeout,
+            write_timeout,
+        };
+        if let Err(e) = guard.tcp().set_nonblocking(true) {
+            drop(guard); // Drop reinserts the conn and clears the slot
+            return Err(refusal("SOCKET_PULL", e.to_string()));
+        }
+        Ok(guard)
+    }
+
+    /// The Class C pull loop: cancel-safe non-blocking reads with event-
+    /// driven readiness awaits under the call's deadline. `name` selects
+    /// the ws/tcp semantics; `max` bounds a tcp_recv take.
+    #[cfg(unix)]
+    pub(crate) async fn pull_recv(
+        name: &str,
+        mut guard: PullGuard,
+        timeout_seconds: f64,
+        max: usize,
+    ) -> MixResult<Value> {
+        use tokio::io::unix::AsyncFd;
+        use tokio::io::Interest;
+        let dup = guard
+            .tcp()
+            .try_clone()
+            .map_err(|e| refusal("SOCKET_PULL", e.to_string()))?;
+        let ready = AsyncFd::with_interest(dup, Interest::READABLE)
+            .map_err(|e| refusal("SOCKET_PULL", e.to_string()))?;
+        let deadline = (timeout_seconds > 0.0)
+            .then(|| std::time::Instant::now() + std::time::Duration::from_secs_f64(timeout_seconds));
+        loop {
+            let left = deadline.map(|d| d.saturating_duration_since(std::time::Instant::now()));
+            if left.is_some_and(|l| l.is_zero()) {
+                guard.finish();
+                return Ok(Value::Nil);
+            }
+            let would_block = match guard.wire.as_mut().expect("wire present") {
+                PullWire::Ws(conn) => match conn.read() {
+                    Ok(tungstenite::Message::Text(t)) => {
+                        guard.finish();
+                        return Ok(Value::String(t.to_string()));
+                    }
+                    Ok(tungstenite::Message::Binary(b)) => {
+                        let v = Value::bytes(b.to_vec());
+                        guard.finish();
+                        return Ok(v);
+                    }
+                    // Control frames: tungstenite queues the pong reply
+                    // itself; keep waiting under the SAME deadline.
+                    Ok(_) => false,
+                    Err(tungstenite::Error::Io(e))
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        // Flush queued pong/close replies; the non-
+                        // blocking socket cannot stall this.
+                        let _ = conn.flush();
+                        true
+                    }
+                    Err(tungstenite::Error::ConnectionClosed
+                    | tungstenite::Error::AlreadyClosed) => {
+                        guard.retire();
+                        return Err(refusal(
+                            "SOCKET_CLOSED",
+                            format!("{name}: connection closed by peer"),
+                        ));
+                    }
+                    Err(e) => {
+                        guard.retire();
+                        return Err(refusal("SOCKET_CLOSED", format!("{name}: {e}")));
+                    }
+                },
+                PullWire::Tcp(conn) => {
+                    // Buffered bytes first: tcp_recv_line's read-ahead and
+                    // tcp_recv's remainder belong to the next read.
+                    if name == "tcp_recv_line"
+                        && let Some(nl) = conn.buf.iter().position(|&b| b == b'\n')
+                    {
+                        let mut line: Vec<u8> = conn.buf.drain(..=nl).collect();
+                        line.pop(); // \n
+                        if line.last() == Some(&b'\r') {
+                            line.pop();
+                        }
+                        let s = String::from_utf8_lossy(&line).into_owned();
+                        guard.finish();
+                        return Ok(Value::String(s));
+                    }
+                    if name == "tcp_recv" && !conn.buf.is_empty() {
+                        let take = conn.buf.len().min(max);
+                        let out: Vec<u8> = conn.buf.drain(..take).collect();
+                        guard.finish();
+                        return Ok(Value::bytes(out));
+                    }
+                    if name == "tcp_recv_line" && conn.buf.len() > max {
+                        guard.retire();
+                        return Err(refusal(
+                            "SOCKET_CLOSED",
+                            format!("{name}: line exceeds max ({max} bytes) with no newline"),
+                        ));
+                    }
+                    let mut tmp = vec![0u8; CHUNK];
+                    let mut eintr = 0u32;
+                    loop {
+                        match conn.read(&mut tmp) {
+                            Ok(0) => {
+                                guard.retire();
+                                return Err(refusal(
+                                    "SOCKET_CLOSED",
+                                    format!("{name}: connection closed by peer"),
+                                ));
+                            }
+                            Ok(n) => {
+                                conn.buf.extend_from_slice(&tmp[..n]);
+                                break false; // serve the buffer next round
+                            }
+                            Err(e)
+                                if matches!(
+                                    e.kind(),
+                                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                                ) =>
+                            {
+                                break true;
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                                if crate::interrupt::is_interrupted() {
+                                    guard.finish();
+                                    return Ok(Value::Nil);
+                                }
+                                eintr += 1;
+                                if eintr > 10_000 {
+                                    guard.retire();
+                                    return Err(refusal(
+                                        "SOCKET_CLOSED",
+                                        format!(
+                                            "{name}: read interrupted repeatedly (a signal storm?)"
+                                        ),
+                                    ));
+                                }
+                                continue;
+                            }
+                            Err(e) => {
+                                guard.retire();
+                                return Err(refusal("SOCKET_CLOSED", format!("{name}: {e}")));
+                            }
+                        }
+                    }
+                }
+            };
+            if would_block {
+                match left {
+                    None => {
+                        match ready.readable().await {
+                            Ok(mut readiness) => readiness.clear_ready(),
+                            Err(e) => {
+                                guard.retire();
+                                return Err(refusal("SOCKET_CLOSED", format!("{name}: readiness failed: {e}")));
+                            }
+                        }
+                    }
+                    Some(l) => {
+                        match tokio::time::timeout(l, ready.readable()).await {
+                            Ok(Ok(mut readiness)) => readiness.clear_ready(),
+                            Ok(Err(e)) => {
+                                guard.retire();
+                                return Err(refusal("SOCKET_CLOSED", format!("{name}: readiness failed: {e}")));
+                            }
+                            Err(_) => {
+                                guard.finish();
+                                return Ok(Value::Nil);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Non-unix: there is no AsyncFd readiness primitive to await, so a
+    /// pull cannot yield. The evaluator never routes here (its Class C
+    /// interception is unix-gated and falls through to the sync builtin
+    /// — honest Class S blocking semantics), but a direct call refuses
+    /// explicitly; the guard's Drop returns the conn to the registry.
+    #[cfg(not(unix))]
+    pub(crate) async fn pull_recv(
+        name: &str,
+        _guard: PullGuard,
+        _timeout_seconds: f64,
+        _max: usize,
+    ) -> MixResult<Value> {
+        Err(refusal(
+            "SOCKET_UNSUPPORTED",
+            format!(
+                "{name} inside a Class C body requires a unix platform; the plain blocking builtin keeps Class S semantics"
+            ),
+        ))
+    }
+
+    /// Binary event-frame payloads are hex-encoded (JSON has no bytes).
+    pub(crate) fn hex_encode(data: &[u8]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut out = String::with_capacity(data.len() * 2);
+        for &b in data {
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0xf) as usize] as char);
+        }
+        out
+    }
+
+    enum Wire {
+        Ws(Box<ws_client::WsConn>),
+        Tcp(tcp_client::Conn),
+    }
+
+    enum DrainOutcome {
+        /// Drained what poll exposed; park in poll again.
+        More,
+        /// Batch budget reached; service cancellation and sends, then
+        /// resume even if the codec already buffered the next frame.
+        Yield,
+        /// The peer closed or the connection failed; publish one terminal.
+        Terminal(String),
+        /// The bounded FIFO refused a frame; hard-close, one terminal.
+        Overflow,
+    }
+
+    #[cfg(target_os = "linux")]
+    mod linux {
+        use super::*;
+        use std::{
+            collections::VecDeque,
+            io::{Read, Write},
+            os::{
+                fd::{AsRawFd, RawFd},
+                unix::net::UnixStream,
+            },
+        };
+
+        /// One subscribed socket: its reader (owner) thread, cancellation
+        /// pipe and command wake pipe. Owned by the evaluator generation
+        /// (NativeEvents). Drop writes the cancel byte and joins — bounded
+        /// by the non-blocking read/write discipline, never by a peer.
+        pub(crate) struct SocketSource {
+            key: ClientKey,
+            cancel: UnixStream,
+            worker: Option<std::thread::JoinHandle<()>>,
+            /// True once the reader published its terminal record (or was
+            /// cancelled); prune sites drop-and-join completed sources.
+            pub completed: Arc<AtomicBool>,
+        }
+
+        /// How the reader loop exited.
+        enum Terminal {
+            /// Explicit close (cancel byte): no terminal marker.
+            None,
+            /// The bounded FIFO refused a frame: hard-close, one terminal.
+            Overflow,
+            /// The peer closed, an error occurred, or a send timed out:
+            /// publish one terminal carrying the reason.
+            Reason(String),
+        }
+
+        /// One in-flight send owned by the reader thread. The deadline is
+        /// the admission stamp carried in the command — never restamped —
+        /// and the permits keep the admission reservation until `answer`.
+        enum Outgoing {
+            Tcp {
+                payload: Vec<u8>,
+                off: usize,
+                deadline: std::time::Instant,
+                _permits: SendPermits,
+                receipt: tokio::sync::oneshot::Sender<SendReceipt>,
+            },
+            Ws {
+                text: bool,
+                payload: Vec<u8>,
+                sent: bool,
+                deadline: std::time::Instant,
+                _permits: SendPermits,
+                receipt: tokio::sync::oneshot::Sender<SendReceipt>,
+            },
+        }
+
+        impl Outgoing {
+            fn deadline(&self) -> std::time::Instant {
+                match self {
+                    Outgoing::Tcp { deadline, .. } | Outgoing::Ws { deadline, .. } => *deadline,
+                }
+            }
+
+            /// Any byte possibly on the wire? An expiry after progress
+            /// hard-closes the source — the caller resending the payload
+            /// would duplicate bytes. Before progress there is nothing to
+            /// duplicate, so the receipt alone is failed. A ws `send()`
+            /// counts as progress even on WouldBlock: the message may
+            /// already sit in tungstenite's out-buffer.
+            fn started(&self) -> bool {
+                match self {
+                    Outgoing::Tcp { off, .. } => *off > 0,
+                    Outgoing::Ws { sent, .. } => *sent,
+                }
+            }
+
+            /// Consume the outgoing and answer its receipt. If the caller
+            /// (a cancelled Class C task) dropped the receiver, the send
+            /// simply reports nowhere — the write itself is unaffected.
+            /// Consuming drops the permits: the reservation releases here.
+            fn answer(self, result: SendReceipt) {
+                let receipt = match self {
+                    Outgoing::Tcp { receipt, .. } | Outgoing::Ws { receipt, .. } => receipt,
+                };
+                let _ = receipt.send(result);
+            }
+        }
+
+        fn start_outgoing(q: &mut VecDeque<SocketCommand>) -> Option<Outgoing> {
+            q.pop_front().map(|cmd| match cmd {
+                SocketCommand::Tcp {
+                    payload,
+                    deadline,
+                    permits,
+                    receipt,
+                } => Outgoing::Tcp {
+                    payload,
+                    off: 0,
+                    deadline,
+                    _permits: permits,
+                    receipt,
+                },
+                SocketCommand::Ws {
+                    text,
+                    payload,
+                    deadline,
+                    permits,
+                    receipt,
+                } => Outgoing::Ws {
+                    text,
+                    payload,
+                    sent: false,
+                    deadline,
+                    _permits: permits,
+                    receipt,
+                },
+            })
+        }
+
+        fn deadline_ms(deadline: &std::time::Instant) -> i32 {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            left.as_millis().clamp(1, i32::MAX as u128) as i32
+        }
+
+        /// Advance one in-flight send. Some(result) = finished (the
+        /// caller answers the receipt); None = WouldBlock, wait for
+        /// POLLOUT. Partial state is retained — the tcp offset, or the
+        /// message inside tungstenite's out-buffer — so nothing is
+        /// re-sent or dropped.
+        fn step_outgoing(wire: &mut Wire, o: &mut Outgoing) -> Option<SendReceipt> {
+            if o.deadline() <= std::time::Instant::now() {
+                return None; // The owner answers expiry before its next poll.
+            }
+            match (wire, o) {
+                (Wire::Tcp(conn), Outgoing::Tcp { payload, off, deadline, .. }) => {
+                    for _ in 0..4 {
+                        if *off == payload.len() { break; }
+                        if *deadline <= std::time::Instant::now() { return None; }
+                        let end = (*off + CHUNK).min(payload.len());
+                        match conn.write(&payload[*off..end]) {
+                            Ok(0) => {
+                                return Some(Err((
+                                    "SOCKET_SEND_CLOSED".into(),
+                                    "write returned 0 bytes".into(),
+                                )));
+                            }
+                            Ok(n) => *off += n,
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return None,
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                            Err(e) => return Some(Err(("SOCKET_SEND_ERROR".into(), e.to_string()))),
+                        }
+                    }
+                    if *off < payload.len() { return None; }
+                    match conn.flush() {
+                        Ok(()) => Some(Ok(payload.len())),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => None,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => None,
+                        Err(e) => Some(Err(("SOCKET_SEND_ERROR".into(), e.to_string()))),
+                    }
+                }
+                (Wire::Ws(conn), Outgoing::Ws { text, payload, sent, .. }) => {
+                    if !*sent {
+                        let msg = if *text {
+                            tungstenite::Message::text(
+                                String::from_utf8_lossy(payload).into_owned(),
+                            )
+                        } else {
+                            tungstenite::Message::binary(payload.clone())
+                        };
+                        match conn.send(msg) {
+                            Ok(()) => *sent = true,
+                            // WouldBlock mid-send: the message is queued in
+                            // tungstenite's out-buffer — from here only
+                            // flush, never a second send (no duplicates).
+                            Err(tungstenite::Error::Io(e))
+                                if e.kind() == std::io::ErrorKind::WouldBlock =>
+                            {
+                                *sent = true
+                            }
+                            Err(tungstenite::Error::ConnectionClosed
+                            | tungstenite::Error::AlreadyClosed) => {
+                                return Some(Err((
+                                    "SOCKET_SEND_CLOSED".into(),
+                                    "connection closed".into(),
+                                )));
+                            }
+                            Err(e) => {
+                                return Some(Err(("SOCKET_SEND_ERROR".into(), e.to_string())));
+                            }
+                        }
+                    }
+                    match conn.flush() {
+                        Ok(()) => Some(Ok(payload.len())),
+                        Err(tungstenite::Error::Io(e))
+                            if e.kind() == std::io::ErrorKind::WouldBlock =>
+                        {
+                            None
+                        }
+                        Err(tungstenite::Error::ConnectionClosed
+                        | tungstenite::Error::AlreadyClosed) => Some(Err((
+                            "SOCKET_SEND_CLOSED".into(),
+                            "connection closed".into(),
+                        ))),
+                        Err(e) => Some(Err(("SOCKET_SEND_ERROR".into(), e.to_string()))),
+                    }
+                }
+                // Wire and command kinds are fixed per source at spawn.
+                _ => unreachable!("send command/wire kind mismatch"),
+            }
+        }
+
+        pub(super) fn spawn_ws(
+            queue: Arc<Queue>,
+            id: String,
+            command: String,
+            client_id: u64,
+            conn: ws_client::WsConn,
+        ) -> MixResult<SocketSource> {
+            let tcp = ws_client::tcp_of(&conn)
+                .ok_or_else(|| refusal("WS_ON_STREAM", "unsupported stream type for subscription"))?;
+            let fd = tcp.as_raw_fd();
+            tcp.set_nonblocking(true)
+                .map_err(|e| refusal("WS_ON_STREAM", e.to_string()))?;
+            spawn(
+                queue,
+                id,
+                command,
+                ClientKey::ws(client_id),
+                Wire::Ws(Box::new(conn)),
+                fd,
+                None,
+                TcpMode { line: false, max: 0 },
+            )
+        }
+
+        pub(super) fn spawn_tcp(
+            queue: Arc<Queue>,
+            id: String,
+            command: String,
+            client_id: u64,
+            mut conn: tcp_client::Conn,
+            mode: TcpMode,
+        ) -> MixResult<SocketSource> {
+            let fd = conn.tcp().as_raw_fd();
+            conn.tcp()
+                .set_nonblocking(true)
+                .map_err(|e| refusal("TCP_ON_STREAM", e.to_string()))?;
+            // tcp_recv_line's read-ahead belongs to the stream, not lost.
+            let seed = std::mem::take(&mut conn.buf);
+            spawn(queue, id, command, ClientKey::tcp(client_id), Wire::Tcp(conn), fd, Some(seed), mode)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn spawn(
+            queue: Arc<Queue>,
+            id: String,
+            _command: String,
+            key: ClientKey,
+            wire: Wire,
+            sock_fd: RawFd,
+            seed: Option<Vec<u8>>,
+            mode: TcpMode,
+        ) -> MixResult<SocketSource> {
+            let (cancel, cancel_wake) =
+                UnixStream::pair().map_err(|e| refusal("SOCKET_PAIR", e.to_string()))?;
+            // The command wake pair: SendEndpoint holds the write end, the
+            // owner thread polls the read end. Distinct from cancellation —
+            // a send is a control wakeup, never a cancel.
+            let (wake, mut cmd_wake) =
+                UnixStream::pair().map_err(|e| refusal("SOCKET_PAIR", e.to_string()))?;
+            wake.set_nonblocking(true).map_err(|e| refusal("SOCKET_PAIR", e.to_string()))?;
+            cmd_wake.set_nonblocking(true).map_err(|e| refusal("SOCKET_PAIR", e.to_string()))?;
+            let (cmd_tx, cmd_rx) = std::sync::mpsc::sync_channel(MAX_SEND_OPS);
+            let endpoint = std::sync::Arc::new(SendEndpoint {
+                tx: cmd_tx,
+                wake,
+                ops: Arc::new(tokio::sync::Semaphore::new(MAX_SEND_OPS)),
+                bytes: Arc::new(tokio::sync::Semaphore::new(MAX_SEND_BYTES)),
+                deadline: AtomicU64::new(SEND_DEADLINE.as_millis() as u64),
+            });
+            let worker_endpoint = endpoint.clone();
+            register_subscribed(key, endpoint);
+            let completed = Arc::new(AtomicBool::new(false));
+            let worker_completed = completed.clone();
+            let worker_id = id.clone();
+            let worker = std::thread::Builder::new()
+                .name("mix-socket-read".into())
+                .spawn(move || {
+                    let mut wire = wire;
+                    let mut fds = [
+                        libc::pollfd {
+                            fd: sock_fd,
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                        libc::pollfd {
+                            fd: cancel_wake.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                        libc::pollfd {
+                            fd: cmd_wake.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                    ];
+                    let mut line_buf: Vec<u8> = Vec::new();
+                    let mut seed = seed;
+                    let mut out: Option<Outgoing> = None;
+                    let mut send_q: VecDeque<SocketCommand> = VecDeque::new();
+                    let mut read_pending = seed.as_ref().is_some_and(|b| !b.is_empty());
+                    let mut control_pending = false;
+                    let mut control_deadline: Option<std::time::Instant> = None;
+                    let outcome = loop {
+                        if control_pending {
+                            let deadline = control_deadline.get_or_insert_with(|| {
+                                std::time::Instant::now() + worker_endpoint.send_deadline()
+                            });
+                            if *deadline <= std::time::Instant::now() {
+                                break Terminal::Reason("control write timed out".into());
+                            }
+                        } else {
+                            control_deadline = None;
+                        }
+                        // Absolute expiry, checked EVERY loop regardless
+                        // of readiness: continuous POLLIN (a chattering
+                        // peer) or command wake traffic cannot starve a
+                        // send deadline. Progress made means bytes may be
+                        // on the wire — fail the receipt AND hard-close,
+                        // because a caller resending the payload would
+                        // duplicate them. A send that never wrote a byte
+                        // is answered and dropped in place (a resend is
+                        // unambiguous) and the next queued send starts.
+                        // A cancel byte that landed before this check
+                        // answered its poll round first, so explicit
+                        // close still wins over expiry.
+                        if let Some(o) = out.as_ref()
+                            && o.deadline() <= std::time::Instant::now()
+                        {
+                            let o = out.take().expect("outgoing present");
+                            if o.started() {
+                                o.answer(Err((
+                                    "SOCKET_SEND_TIMEOUT".into(),
+                                    format!(
+                                        "send did not complete within {} s; the connection was closed",
+                                        SEND_DEADLINE.as_secs()
+                                    ),
+                                )));
+                                break Terminal::Reason(format!(
+                                    "send timed out after {} s",
+                                    SEND_DEADLINE.as_secs()
+                                ));
+                            }
+                            o.answer(Err((
+                                "SOCKET_SEND_TIMEOUT".into(),
+                                format!(
+                                    "send did not complete within {} s",
+                                    SEND_DEADLINE.as_secs()
+                                ),
+                            )));
+                            out = start_outgoing(&mut send_q);
+                            continue;
+                        }
+                        // POLLOUT only while bytes are owed; a poll timeout
+                        // exists only to fire an owed write's deadline.
+                        fds[0].events = libc::POLLIN
+                            | if out.is_some() || control_pending { libc::POLLOUT } else { 0 };
+                        let timeout = if read_pending { 0 } else {
+                            out.as_ref().map(Outgoing::deadline).into_iter()
+                                .chain(control_deadline).min()
+                                .map(|deadline| deadline_ms(&deadline)).unwrap_or(-1)
+                        };
+                        let rc = unsafe { libc::poll(fds.as_mut_ptr(), 3, timeout) };
+                        if rc < 0 {
+                            if std::io::Error::last_os_error().kind()
+                                == std::io::ErrorKind::Interrupted
+                            {
+                                continue;
+                            }
+                            break Terminal::Reason(format!(
+                                "poll failed: {}",
+                                std::io::Error::last_os_error()
+                            ));
+                        }
+                        // Cancellation wins simultaneous readiness: an
+                        // explicit close publishes NO terminal marker, but
+                        // a pending send's receipt is still answered (a
+                        // blocking Class S caller must not hang).
+                        if fds[1].revents != 0 {
+                            if let Some(o) = out.take() {
+                                o.answer(Err((
+                                    "SOCKET_SEND_CLOSED".into(),
+                                    "the subscription was closed before the send finished".into(),
+                                )));
+                            }
+                            break Terminal::None;
+                        }
+                        if fds[2].revents != 0 {
+                            // Drain wake bytes, then the bounded channel.
+                            let mut b = [0u8; 64];
+                            while let Ok(n) = cmd_wake.read(&mut b) {
+                                if n == 0 || n < b.len() {
+                                    break;
+                                }
+                            }
+                            while let Ok(cmd) = cmd_rx.try_recv() {
+                                send_q.push_back(cmd);
+                            }
+                            // The next round arms POLLOUT and writes; the
+                            // top-of-loop expiry check runs first, so an
+                            // already-expired command never writes a byte.
+                            if out.is_none() {
+                                out = start_outgoing(&mut send_q);
+                            }
+                        }
+                        if read_pending || fds[0].revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0 {
+                            match drain(
+                                &queue,
+                                &worker_id,
+                                &mut wire,
+                                &mut line_buf,
+                                &mut seed,
+                                mode,
+                                &mut control_pending,
+                            ) {
+                                DrainOutcome::More => { read_pending = false; }
+                                DrainOutcome::Yield => { read_pending = true; }
+                                DrainOutcome::Overflow => {
+                                    if let Some(o) = out.take() {
+                                        o.answer(Err((
+                                            "SOCKET_SEND_CLOSED".into(),
+                                            "the connection was closed: the frame queue overflowed".into(),
+                                        )));
+                                    }
+                                    break Terminal::Overflow;
+                                }
+                                DrainOutcome::Terminal(reason) => {
+                                    if let Some(o) = out.take() {
+                                        o.answer(Err((
+                                            "SOCKET_SEND_CLOSED".into(),
+                                            format!(
+                                                "the connection closed before the send finished: {reason}"
+                                            ),
+                                        )));
+                                    }
+                                    break Terminal::Reason(reason);
+                                }
+                            }
+                        }
+                        // A pending send advances on POLLOUT. Expiry is the
+                        // top-of-loop absolute check — never gated on rc,
+                        // which continuous readiness would starve.
+                        if let Some(o) = out.as_mut()
+                            && fds[0].revents & libc::POLLOUT != 0
+                            && let Some(result) = step_outgoing(&mut wire, o)
+                        {
+                            out.take().expect("outgoing present").answer(result);
+                            out = start_outgoing(&mut send_q);
+                        }
+                        // A pong queued by tungstenite can hit backpressure
+                        // without a user send. Keep POLLOUT armed until that
+                        // control write flushes; it must not wait for another
+                        // incoming frame to wake the source.
+                        if control_pending && fds[0].revents & libc::POLLOUT != 0
+                            && let Wire::Ws(conn) = &mut wire
+                        {
+                            match conn.flush() {
+                                Ok(()) => control_pending = false,
+                                Err(tungstenite::Error::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {},
+                                Err(e) => break Terminal::Reason(e.to_string()),
+                            }
+                        }
+                    };
+                    // The wire is gone: fail every still-queued send
+                    // explicitly — a receipt must never silently vanish.
+                    while let Ok(cmd) = cmd_rx.try_recv() {
+                        if let Some(receipt) = cmd.receipt() {
+                            let _ = receipt.send(Err((
+                                "SOCKET_SEND_CLOSED".into(),
+                                "the socket source was closed before the send ran".into(),
+                            )));
+                        }
+                    }
+                    for cmd in send_q.drain(..) {
+                        if let Some(receipt) = cmd.receipt() {
+                            let _ = receipt.send(Err((
+                                "SOCKET_SEND_CLOSED".into(),
+                                "the socket source was closed before the send ran".into(),
+                            )));
+                        }
+                    }
+                    match outcome {
+                        Terminal::None => {} // explicit close: no terminal
+                        Terminal::Overflow => {
+                            // The bounded FIFO refused a frame: hard-close
+                            // the socket and publish exactly one terminal
+                            // event — frames are never silently dropped.
+                            drop(wire);
+                            queue.socket_closed(
+                                &worker_id,
+                                serde_json::json!({
+                                    "reason": "overflow",
+                                    "message": "the socket frame queue exceeded its byte or frame bound; the connection was closed",
+                                }),
+                            );
+                            unmark_subscribed(key);
+                        }
+                        Terminal::Reason(reason) => {
+                            drop(wire);
+                            queue.socket_closed(
+                                &worker_id,
+                                serde_json::json!({ "reason": reason }),
+                            );
+                            unmark_subscribed(key);
+                        }
+                    }
+                    // Publish-then-complete: a prune site that sees this
+                    // flag may drop-and-join; the terminal record is in.
+                    worker_completed.store(true, Ordering::Release);
+                });
+            match worker {
+                Ok(worker) => Ok(SocketSource {
+                    key,
+                    cancel,
+                    worker: Some(worker),
+                    completed,
+                }),
+                Err(e) => {
+                    unmark_subscribed(key);
+                    Err(refusal("SOCKET_THREAD", e.to_string()))
+                }
+            }
+        }
+
+        fn drain(
+            queue: &Queue,
+            id: &str,
+            wire: &mut Wire,
+            line_buf: &mut Vec<u8>,
+            seed: &mut Option<Vec<u8>>,
+            mode: TcpMode,
+            control_pending: &mut bool,
+        ) -> DrainOutcome {
+            // Bytes buffered before the subscription (a prior tcp_recv_line
+            // read may have pulled past a newline) belong to the stream.
+            if let Some(buf) = seed.take()
+                && !buf.is_empty()
+            {
+                if mode.line {
+                    line_buf.extend_from_slice(&buf);
+                    match split_lines(queue, id, line_buf, mode.max) {
+                        DrainOutcome::More => {}
+                        other => return other,
+                    }
+                } else if !push(queue, id, SocketRecord {
+                    kind: "bytes",
+                    data: buf,
+                }) {
+                    return DrainOutcome::Overflow;
+                }
+            }
+            match wire {
+                Wire::Ws(conn) => {
+                    use tungstenite::Message;
+                    for _ in 0..16 {
+                        match conn.read() {
+                            Ok(Message::Text(t)) => {
+                                if !push(
+                                    queue,
+                                    id,
+                                    SocketRecord { kind: "text", data: t.as_bytes().to_vec() },
+                                ) {
+                                    return DrainOutcome::Overflow;
+                                }
+                            }
+                            Ok(Message::Binary(b)) => {
+                                if !push(
+                                    queue,
+                                    id,
+                                    SocketRecord { kind: "binary", data: b.to_vec() },
+                                ) {
+                                    return DrainOutcome::Overflow;
+                                }
+                            }
+                            // Control frames never surface; tungstenite
+                            // queues the pong reply, flushed below.
+                            Ok(_) => {
+                                *control_pending = true;
+                                continue;
+                            }
+                            Err(tungstenite::Error::Io(e))
+                                if e.kind() == std::io::ErrorKind::WouldBlock =>
+                            {
+                                // Flush queued pong/close replies; the
+                                // non-blocking socket cannot stall this.
+                                match conn.flush() {
+                                    Ok(()) => *control_pending = false,
+                                    Err(tungstenite::Error::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => *control_pending = true,
+                                    Err(e) => return DrainOutcome::Terminal(e.to_string()),
+                                }
+                                return DrainOutcome::More;
+                            }
+                            Err(tungstenite::Error::ConnectionClosed
+                            | tungstenite::Error::AlreadyClosed) => {
+                                return DrainOutcome::Terminal(
+                                    "connection closed by peer".into(),
+                                );
+                            }
+                            Err(e) => return DrainOutcome::Terminal(e.to_string()),
+                        }
+                    }
+                    DrainOutcome::Yield
+                }
+                Wire::Tcp(conn) => {
+                    let mut eintr = 0u32;
+                    for _ in 0..4 {
+                        let mut tmp = vec![0u8; CHUNK];
+                        match conn.read(&mut tmp) {
+                            Ok(0) => {
+                                return DrainOutcome::Terminal(
+                                    "connection closed by peer".into(),
+                                );
+                            }
+                            Ok(n) => {
+                                if mode.line {
+                                    line_buf.extend_from_slice(&tmp[..n]);
+                                    match split_lines(queue, id, line_buf, mode.max) {
+                                        DrainOutcome::More => continue,
+                                        other => return other,
+                                    }
+                                } else if !push(queue, id, SocketRecord {
+                                    kind: "bytes",
+                                    data: tmp[..n].to_vec(),
+                                }) {
+                                    return DrainOutcome::Overflow;
+                                }
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                return DrainOutcome::More;
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                                eintr += 1;
+                                if eintr > 10_000 {
+                                    return DrainOutcome::Terminal(
+                                        "read interrupted repeatedly".into(),
+                                    );
+                                }
+                                continue;
+                            }
+                            Err(e) => return DrainOutcome::Terminal(e.to_string()),
+                        }
+                    }
+                    DrainOutcome::Yield
+                }
+            }
+        }
+
+        fn split_lines(
+            queue: &Queue,
+            id: &str,
+            line_buf: &mut Vec<u8>,
+            max: usize,
+        ) -> DrainOutcome {
+            while let Some(nl) = line_buf.iter().position(|&b| b == b'\n') {
+                let mut line: Vec<u8> = line_buf.drain(..=nl).collect();
+                line.pop(); // \n
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                if !push(queue, id, SocketRecord { kind: "line", data: line }) {
+                    return DrainOutcome::Overflow;
+                }
+            }
+            if line_buf.len() > max {
+                return DrainOutcome::Terminal(format!(
+                    "line exceeds max ({max} bytes) with no newline"
+                ));
+            }
+            DrainOutcome::More
+        }
+
+        fn push(queue: &Queue, id: &str, record: SocketRecord) -> bool {
+            queue.socket_push(id, record)
+        }
+
+        impl Drop for SocketSource {
+            fn drop(&mut self) {
+                // One byte wakes poll(2); the reader exits without
+                // publishing a terminal marker (explicit close, documented).
+                let _ = self.cancel.write_all(&[1u8]);
+                let _ = self.cancel.shutdown(std::net::Shutdown::Write);
+                if let Some(w) = self.worker.take() {
+                    let _ = w.join();
+                }
+                unmark_subscribed(self.key);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) use linux::SocketSource;
+    #[cfg(target_os = "linux")]
+    use linux::{spawn_tcp, spawn_ws};
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) struct SocketSource {
+        pub id: String,
+        pub command: String,
+        pub kind: &'static str,
+        pub completed: Arc<AtomicBool>,
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn spawn_ws(
+        _queue: Arc<Queue>,
+        _id: String,
+        _command: String,
+        _client_id: u64,
+        _conn: ws_client::WsConn,
+    ) -> MixResult<SocketSource> {
+        Err(refusal("SOCKET_UNSUPPORTED", "ws_on requires Linux poll(2)"))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn spawn_tcp(
+        _queue: Arc<Queue>,
+        _id: String,
+        _command: String,
+        _client_id: u64,
+        _conn: tcp_client::Conn,
+        _mode: TcpMode,
+    ) -> MixResult<SocketSource> {
+        Err(refusal("SOCKET_UNSUPPORTED", "tcp_on requires Linux poll(2)"))
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    mod tests {
+        use super::*;
+        use crate::error::MixError;
+        use crate::native_events::{NativeEvents, Queue, SocketNext};
+        use std::io::{Read, Write};
+
+        /// Plain-ws client for fixtures: ws_connect's shape minus the
+        /// builtin option surface. Loopback (127.0.0.1) only.
+        fn ws_client_conn(port: u16) -> ws_client::WsConn {
+            use tungstenite::client::IntoClientRequest;
+            let stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            let request = format!("ws://127.0.0.1:{port}/")
+                .into_client_request()
+                .unwrap();
+            tungstenite::client_tls_with_config(request, stream, None, None)
+                .unwrap()
+                .0
+        }
+
+        /// Connect a loopback client stream and register it as tcp handle.
+        fn tcp_client_handle(port: u16) -> u64 {
+            let stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let id = tcp_client::NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            tcp_client::MAP.lock().unwrap().insert(
+                id,
+                tcp_client::Conn {
+                    stream: tcp_client::Stream::Plain(stream),
+                    buf: Vec::new(),
+                },
+            );
+            id
+        }
+
+        #[tokio::test]
+        async fn ws_subscription_orders_frames_then_one_terminal_and_retires() {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let mut conn = tungstenite::accept(stream).unwrap();
+                for n in 0..5 {
+                    conn.send(tungstenite::Message::text(format!("msg{n}")))
+                        .unwrap();
+                }
+                conn.send(tungstenite::Message::binary(vec![0u8, 1, 2, 255]))
+                    .unwrap();
+                conn.close(None).unwrap();
+                conn.flush().ok();
+            });
+            let conn = ws_client_conn(port);
+            let id = ws_client::NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            ws_client::MAP.lock().unwrap().insert(id, conn);
+            let mut ne = NativeEvents::default();
+            let h = ne.ws_on(id, "test.ws".to_string()).unwrap();
+            assert!(h.starts_with("ws:"));
+            assert!(is_subscribed(ClientKey::ws(id)), "the moved numeric handle is marked subscribed");
+            let q = ne.queue.clone();
+            for n in 0..5 {
+                let rec = match q.next_socket(&h, KIND_WS, usize::MAX).await.unwrap() {
+                    SocketNext::Frame(rec) => rec,
+                    other => panic!("expected frame, got {other:?}"),
+                };
+                assert_eq!(rec.kind, "text");
+                assert_eq!(rec.data, format!("msg{n}").into_bytes());
+            }
+            let rec = match q.next_socket(&h, KIND_WS, usize::MAX).await.unwrap() {
+                SocketNext::Frame(rec) => rec,
+                other => panic!("expected frame, got {other:?}"),
+            };
+            assert_eq!(rec.kind, "binary");
+            assert_eq!(rec.data, vec![0u8, 1, 2, 255]);
+            let closed = match q.next_socket(&h, KIND_WS, usize::MAX).await.unwrap() {
+                SocketNext::Closed(closed) => closed,
+                other => panic!("expected terminal, got {other:?}"),
+            };
+            assert!(closed["reason"].as_str().is_some());
+            // Retired: exactly one terminal, then the source is gone and
+            // the numeric handle is unmarked.
+            let err = q.next_socket(&h, KIND_WS, usize::MAX).await.unwrap_err();
+            assert!(matches!(err, MixError::Structured(info) if info.code == "SOCKET_WATCH_HANDLE"));
+            assert!(!is_subscribed(ClientKey::ws(id)));
+            server.join().unwrap();
+            ne.close();
+        }
+
+        #[tokio::test]
+        async fn tcp_line_mode_splits_orders_and_bounds() {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.write_all(b"one\r\ntwo\nthree\n").unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                drop(stream); // peer close → one terminal
+            });
+            let id = tcp_client_handle(port);
+            let mut ne = NativeEvents::default();
+            let h = ne
+                .tcp_on(id, "test.tcp".to_string(), TcpMode { line: true, max: 32 })
+                .unwrap();
+            let q = ne.queue.clone();
+            let mut lines = Vec::new();
+            for _ in 0..3 {
+                match q.next_socket(&h, KIND_TCP_LINE, usize::MAX).await.unwrap() {
+                    SocketNext::Frame(rec) => {
+                        assert_eq!(rec.kind, "line");
+                        lines.push(String::from_utf8(rec.data).unwrap());
+                    }
+                    other => panic!("expected line, got {other:?}"),
+                }
+            }
+            assert_eq!(lines, ["one", "two", "three"]);
+            assert!(matches!(
+                q.next_socket(&h, KIND_TCP_LINE, usize::MAX).await.unwrap(),
+                SocketNext::Closed(_)
+            ));
+            server.join().unwrap();
+            ne.close();
+        }
+
+        #[tokio::test]
+        async fn line_over_max_hard_closes_with_terminal() {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.write_all(b"short\n").unwrap();
+                stream.write_all(&[b'a'; 100]).unwrap(); // no newline, over max
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                drop(stream);
+            });
+            let id = tcp_client_handle(port);
+            let mut ne = NativeEvents::default();
+            let h = ne
+                .tcp_on(id, "test.tcp".to_string(), TcpMode { line: true, max: 32 })
+                .unwrap();
+            let q = ne.queue.clone();
+            match q.next_socket(&h, KIND_TCP_LINE, usize::MAX).await.unwrap() {
+                SocketNext::Frame(rec) => assert_eq!(rec.data, b"short"),
+                other => panic!("expected the short line, got {other:?}"),
+            }
+            let closed = match q.next_socket(&h, KIND_TCP_LINE, usize::MAX).await.unwrap() {
+                SocketNext::Closed(closed) => closed,
+                other => panic!("expected terminal, got {other:?}"),
+            };
+            assert!(
+                closed["reason"]
+                    .as_str()
+                    .is_some_and(|r| r.contains("line exceeds max")),
+                "reason: {closed}"
+            );
+            server.join().unwrap();
+            ne.close();
+        }
+
+        #[tokio::test]
+        async fn tcp_bytes_mode_reassembles_chunks_in_order() {
+            let payload: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let payload_tx = payload.clone();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.write_all(&payload_tx).unwrap();
+                drop(stream); // peer close → one terminal
+            });
+            let id = tcp_client_handle(port);
+            let mut ne = NativeEvents::default();
+            let h = ne
+                .tcp_on(id, "test.bytes".to_string(), TcpMode { line: false, max: 0 })
+                .unwrap();
+            let q = ne.queue.clone();
+            let mut got = Vec::new();
+            loop {
+                match q.next_socket(&h, KIND_TCP_BYTES, usize::MAX).await.unwrap() {
+                    SocketNext::Frame(rec) => {
+                        assert_eq!(rec.kind, "bytes");
+                        got.extend_from_slice(&rec.data);
+                    }
+                    SocketNext::Closed(_) => break,
+                    SocketNext::Idle => unreachable!(),
+                }
+            }
+            assert_eq!(got, payload);
+            assert!(!is_subscribed(ClientKey::tcp(id)));
+            server.join().unwrap();
+            ne.close();
+        }
+
+        #[tokio::test]
+        async fn explicit_unwatch_cancels_joins_and_emits_no_terminal() {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (tx, rx) = std::sync::mpsc::channel::<usize>();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.write_all(b"hello\n").unwrap();
+                let mut buf = [0u8; 16];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                tx.send(n).unwrap();
+            });
+            let id = tcp_client_handle(port);
+            let mut ne = NativeEvents::default();
+            let h = ne
+                .tcp_on(id, "test.line".to_string(), TcpMode { line: true, max: 64 })
+                .unwrap();
+            let q = ne.queue.clone();
+            match q.next_socket(&h, KIND_TCP_LINE, usize::MAX).await.unwrap() {
+                SocketNext::Frame(rec) => assert_eq!(rec.data, b"hello"),
+                other => panic!("expected line, got {other:?}"),
+            }
+            ne.socket_unwatch("tcp", &h).unwrap();
+            // Explicit close: no terminal marker, the slot is gone, the
+            // reader joined and the socket closed (server read EOF).
+            assert_eq!(q.socket_snapshot().0, 0);
+            let err = q.next_socket(&h, KIND_TCP_LINE, usize::MAX).await.unwrap_err();
+            assert!(matches!(err, MixError::Structured(info) if info.code == "SOCKET_WATCH_HANDLE"));
+            assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(), 0);
+            assert!(!is_subscribed(ClientKey::tcp(id)));
+            let err = ne.socket_unwatch("tcp", &h).unwrap_err();
+            assert!(matches!(err, MixError::Structured(info) if info.code == "SOCKET_WATCH_HANDLE"));
+            server.join().unwrap();
+        }
+
+        #[tokio::test]
+        async fn close_wakes_a_parked_recv_and_joins_the_reader() {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (tx, rx) = std::sync::mpsc::channel::<usize>();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 8];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                tx.send(n).unwrap();
+            });
+            let id = tcp_client_handle(port);
+            let mut ne = NativeEvents::default();
+            let h = ne
+                .tcp_on(id, "test.close".to_string(), TcpMode { line: false, max: 0 })
+                .unwrap();
+            let q = ne.queue.clone();
+            let parked_queue = q.clone();
+            let wait =
+                tokio::spawn(async move {
+                    parked_queue.next_socket(&h, KIND_TCP_BYTES, usize::MAX).await.map_err(|e| match e {
+                        MixError::Structured(info) => info.code.to_string(),
+                        other => panic!("expected structured cancellation, got {other}"),
+                    })
+                });
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            ne.close();
+            let err = wait.await.unwrap().unwrap_err();
+            assert_eq!(err, "NATIVE_CLOSED");
+            assert_eq!(q.socket_snapshot().0, 0);
+            assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(), 0);
+            assert!(!is_subscribed(ClientKey::tcp(id)));
+            server.join().unwrap();
+        }
+
+        #[tokio::test]
+        async fn overflow_refuses_push_and_admits_exactly_one_terminal() {
+            let q = Queue::default();
+            q.register_socket_for_test("tcp:1", "test.tcp", KIND_TCP_BYTES);
+            let mut pushed = 0usize;
+            loop {
+                if q.socket_push(
+                    "tcp:1",
+                    SocketRecord { kind: "bytes", data: vec![0u8; 1] },
+                ) {
+                    pushed += 1;
+                    assert!(pushed <= MAX_SOCKET_FRAMES + 1);
+                } else {
+                    break;
+                }
+            }
+            assert!(pushed > 0);
+            q.socket_closed("tcp:1", serde_json::json!({"reason": "overflow"}));
+            // All queued frames drain in order, then exactly one terminal.
+            for _ in 0..pushed {
+                assert!(matches!(
+                    q.next_socket("tcp:1", KIND_TCP_BYTES, usize::MAX).await.unwrap(),
+                    SocketNext::Frame(_)
+                ));
+            }
+            assert!(matches!(
+                q.next_socket("tcp:1", KIND_TCP_BYTES, usize::MAX).await.unwrap(),
+                SocketNext::Closed(_)
+            ));
+            let err = q.next_socket("tcp:1", KIND_TCP_BYTES, usize::MAX).await.unwrap_err();
+            assert!(matches!(err, MixError::Structured(info) if info.code == "SOCKET_WATCH_HANDLE"));
+        }
+
+        #[tokio::test]
+        async fn one_parked_recv_and_timeout_cancellation_keep_records() {
+            let q = Arc::new(Queue::default());
+            q.register_socket_for_test("ws:1", "test.ws", KIND_WS);
+            let mut ne = NativeEvents::default();
+            ne.queue = q.clone();
+            let first = ne.park_socket("ws:1").unwrap();
+            let err = ne.park_socket("ws:1").err().expect("second waiter must refuse");
+            assert!(matches!(err, MixError::Structured(info) if info.code == "SOCKET_BUSY"));
+            drop(first);
+            let _again = ne.park_socket("ws:1").unwrap();
+            // A timed-out (cancelled) wait consumes nothing.
+            let timed = tokio::time::timeout(
+                std::time::Duration::from_millis(1),
+                q.next_socket("ws:1", KIND_WS, usize::MAX),
+            )
+            .await;
+            assert!(timed.is_err());
+            q.socket_push("ws:1", SocketRecord { kind: "text", data: b"kept".to_vec() });
+            match q.next_socket("ws:1", KIND_WS, usize::MAX).await.unwrap() {
+                SocketNext::Frame(rec) => assert_eq!(rec.data, b"kept"),
+                other => panic!("expected the kept frame, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn mismatched_recv_verb_refuses_by_kind() {
+            let q = Queue::default();
+            q.register_socket_for_test("tcp:1", "test.tcp", KIND_TCP_BYTES);
+            let err = q.next_socket("tcp:1", KIND_TCP_LINE, usize::MAX).await.unwrap_err();
+            assert!(matches!(err, MixError::Structured(info) if info.code == "SOCKET_KIND"));
+        }
+
+        #[tokio::test]
+        async fn idle_subscription_stays_quiet_with_no_periodic_poll() {
+            // The reader parks in poll(2) with an infinite deadline: no
+            // frames, no wakeups, no terminal while the peer is quiet.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || {
+                let (_stream, _) = listener.accept().unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            });
+            let id = tcp_client_handle(port);
+            let mut ne = NativeEvents::default();
+            let h = ne
+                .tcp_on(id, "test.idle".to_string(), TcpMode { line: false, max: 0 })
+                .unwrap();
+            let q = ne.queue.clone();
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            assert!(q.socket_idle_for_test(&h));
+            let err = tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                q.next_socket(&h, KIND_TCP_BYTES, usize::MAX),
+            )
+            .await
+            .expect_err("an idle source delivers nothing");
+            assert!(matches!(err, tokio::time::error::Elapsed { .. }));
+            ne.close();
+            server.join().unwrap();
+        }
+
+        /// Same-connection send after subscribing: the owner thread writes
+        /// the payload, the receipt reports the bytes, and the read FIFO
+        /// keeps delivering around the send.
+        #[tokio::test]
+        async fn subscribed_tcp_send_reaches_peer_and_frames_keep_flowing() {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.write_all(b"frame-1").unwrap();
+                let mut buf = vec![0u8; 16];
+                let n = stream.read(&mut buf).unwrap();
+                tx.send(buf[..n].to_vec()).unwrap();
+                stream.write_all(b"frame-2").unwrap();
+            });
+            let id = tcp_client_handle(port);
+            let mut ne = NativeEvents::default();
+            let h = ne
+                .tcp_on(id, "test.send".to_string(), TcpMode { line: false, max: 0 })
+                .unwrap();
+            let q = ne.queue.clone();
+            match q.next_socket(&h, KIND_TCP_BYTES, usize::MAX).await.unwrap() {
+                SocketNext::Frame(rec) => assert_eq!(rec.data, b"frame-1"),
+                other => panic!("expected frame-1, got {other:?}"),
+            }
+            // The subscribed numeric handle is still sendable, via the
+            // owner thread's bounded command endpoint.
+            let receipt = send_tcp(id, b"pong-payload".to_vec()).unwrap();
+            assert_eq!(receipt.await.unwrap().unwrap(), 12);
+            assert_eq!(
+                rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+                b"pong-payload"
+            );
+            // Reads were not disturbed by the send.
+            match q.next_socket(&h, KIND_TCP_BYTES, usize::MAX).await.unwrap() {
+                SocketNext::Frame(rec) => assert_eq!(rec.data, b"frame-2"),
+                other => panic!("expected frame-2, got {other:?}"),
+            }
+            ne.close();
+            server.join().unwrap();
+        }
+
+        /// ws_send on a subscribed handle: text and binary frames reach
+        /// the peer verbatim through the owner thread.
+        #[tokio::test]
+        async fn subscribed_ws_send_delivers_text_and_binary() {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (tx, rx) = std::sync::mpsc::channel::<(String, Vec<u8>)>();
+            let server = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let mut conn = tungstenite::accept(stream).unwrap();
+                let t = match conn.read().unwrap() {
+                    tungstenite::Message::Text(t) => t,
+                    other => panic!("expected text, got {other:?}"),
+                };
+                let b = match conn.read().unwrap() {
+                    tungstenite::Message::Binary(b) => b,
+                    other => panic!("expected binary, got {other:?}"),
+                };
+                tx.send((t.to_string(), b.to_vec())).unwrap();
+            });
+            let conn = ws_client_conn(port);
+            let id = ws_client::NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            ws_client::MAP.lock().unwrap().insert(id, conn);
+            let mut ne = NativeEvents::default();
+            let h = ne.ws_on(id, "test.wssend".to_string()).unwrap();
+            assert!(h.starts_with("ws:"));
+            assert!(is_subscribed(ClientKey::ws(id)));
+            let text = send_ws(id, true, b"hello".to_vec()).unwrap();
+            assert_eq!(text.await.unwrap().unwrap(), 5);
+            let bin = send_ws(id, false, vec![0u8, 1, 2, 255]).unwrap();
+            assert_eq!(bin.await.unwrap().unwrap(), 4);
+            let (t, b) = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            assert_eq!(t, "hello");
+            assert_eq!(b, vec![0u8, 1, 2, 255]);
+            ne.close();
+            server.join().unwrap();
+        }
+
+        #[tokio::test]
+        async fn subscribed_ws_partial_send_preserves_ping_pong() {
+            use std::os::fd::AsRawFd;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let payload = vec![0x51u8; 8 * 1024 * 1024];
+            let expected = payload.clone();
+            let server = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                stream.set_write_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut conn = tungstenite::accept(stream).unwrap();
+                let mut peek = [0u8; 1];
+                assert_eq!(conn.get_ref().peek(&mut peek).unwrap(), 1);
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+                conn.send(tungstenite::Message::Ping(b"control".to_vec().into())).unwrap();
+                let mut data = false;
+                let mut pong = false;
+                while !data || !pong {
+                    match conn.read().unwrap() {
+                        tungstenite::Message::Binary(bytes) => { assert_eq!(bytes.as_ref(), expected); data = true; }
+                        tungstenite::Message::Pong(bytes) => { assert_eq!(bytes.as_ref(), b"control"); pong = true; }
+                        other => panic!("unexpected frame {other:?}"),
+                    }
+                }
+            });
+            let conn = ws_client_conn(port);
+            let stream = match conn.get_ref() {
+                tungstenite::stream::MaybeTlsStream::Plain(stream) => stream,
+                _ => panic!("fixture must use plain loopback WS"),
+            };
+            let size = 4096i32;
+            // SAFETY: live socket fd and correctly sized integer option.
+            assert_eq!(unsafe { libc::setsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, (&size as *const i32).cast(), std::mem::size_of_val(&size) as libc::socklen_t) }, 0);
+            let id = ws_client::NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            ws_client::MAP.lock().unwrap().insert(id, conn);
+            let mut ne = NativeEvents::default();
+            ne.ws_on(id, "test.partial".into()).unwrap();
+            let mut receipt = send_ws(id, false, payload).unwrap();
+            started_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            assert!(matches!(receipt.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)), "large write must actually be blocked before peer reads");
+            release_tx.send(()).unwrap();
+            assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(5), receipt).await.unwrap().unwrap().unwrap(), 8 * 1024 * 1024);
+            server.join().unwrap();
+            ne.close();
+        }
+
+        #[tokio::test]
+        async fn ws_control_backpressure_expires_without_user_send() {
+            use std::os::fd::AsRawFd;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (go_tx, go_rx) = std::sync::mpsc::channel();
+            let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let size = 1024i32;
+                // SAFETY: live fd, integer option and its exact size.
+                assert_eq!(unsafe { libc::setsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF, (&size as *const i32).cast(), std::mem::size_of_val(&size) as libc::socklen_t) }, 0);
+                stream.set_write_timeout(Some(std::time::Duration::from_secs(3))).unwrap();
+                let mut conn = tungstenite::accept(stream).unwrap();
+                go_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+                // Real legal server Ping frames, with no reads of client Pongs.
+                // The small receive window makes automatic control writes stall.
+                let mut ping = [0x42u8; 127]; ping[0] = 0x89; ping[1] = 125;
+                for _ in 0..25_000 {
+                    if conn.get_mut().write_all(&ping).is_err() { break; }
+                }
+                // Keep the peer alive and its receive window blocked until
+                // the client reports expiry. A peer reset cannot prove it.
+                let _ = stop_rx.recv_timeout(std::time::Duration::from_secs(5));
+            });
+            let conn = ws_client_conn(port);
+            let stream = match conn.get_ref() {
+                tungstenite::stream::MaybeTlsStream::Plain(stream) => stream,
+                _ => panic!("fixture must use plain loopback WS"),
+            };
+            let size = 1024i32;
+            // SAFETY: live fd, integer option and its exact size.
+            assert_eq!(unsafe { libc::setsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, (&size as *const i32).cast(), std::mem::size_of_val(&size) as libc::socklen_t) }, 0);
+            let id = ws_client::NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            ws_client::MAP.lock().unwrap().insert(id, conn);
+            let mut ne = NativeEvents::default();
+            let source = ne.ws_on(id, "test.control".into()).unwrap();
+            send_endpoint(ClientKey::ws(id)).unwrap().deadline.store(80, Ordering::Relaxed);
+            go_tx.send(()).unwrap();
+            let terminal = tokio::time::timeout(std::time::Duration::from_secs(3), ne.queue.next_socket(&source, KIND_WS, usize::MAX)).await.unwrap().unwrap();
+            match terminal {
+                SocketNext::Closed(closed) => assert_eq!(closed["reason"], "control write timed out"),
+                other => panic!("expected control-write expiry, got {other:?}"),
+            }
+            stop_tx.send(()).unwrap();
+            ne.close();
+            server.join().unwrap();
+        }
+
+        #[tokio::test]
+        async fn wss_partial_frame_survives_pull_timeout_and_subscription() {
+            use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+            // Disposable self-signed loopback fixtures; no production identity.
+            let cert = CertificateDer::from_pem_slice(include_bytes!("../tests/fixtures/socket-test-cert.pem")).unwrap();
+            let key = PrivateKeyDer::from_pem_slice(include_bytes!("../tests/fixtures/socket-test-key.pem")).unwrap();
+            let config = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions().unwrap().with_no_client_auth()
+                .with_single_cert(vec![cert], key).unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let expected = vec![0x71u8; 2 * 1024 * 1024];
+            let payload = expected.clone();
+            let server = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                stream.set_write_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let tls = rustls::StreamOwned::new(rustls::ServerConnection::new(Arc::new(config)).unwrap(), stream);
+                let mut conn = tungstenite::accept(tls).unwrap();
+                let mut header = vec![0x82, 127];
+                header.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+                conn.get_mut().write_all(&header).unwrap();
+                conn.get_mut().write_all(&payload[..2048]).unwrap();
+                conn.get_mut().flush().unwrap();
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+                conn.get_mut().write_all(&payload[2048..]).unwrap();
+                conn.get_mut().flush().unwrap();
+                assert_eq!(conn.read().unwrap().into_text().unwrap(), "after-timeout");
+                conn.send(tungstenite::Message::text("subscription-after-tls-pull")).unwrap();
+            });
+            let mut opts = indexmap::IndexMap::new();
+            opts.insert("insecure".into(), Value::Bool(true)); // explicit test-only self-signed choice
+            let handle = super::super::builtin_ws_connect(vec![Value::String(format!("wss://127.0.0.1:{port}/")), Value::map(opts)]).unwrap().unwrap();
+            let id = match handle { Value::Number(n) => n as u64, _ => panic!("numeric WS handle expected") };
+            started_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            let guard = pull_conn("ws_recv", id).unwrap();
+            assert!(matches!(pull_recv("ws_recv", guard, 0.04, usize::MAX).await.unwrap(), Value::Nil));
+            let guard = pull_conn("ws_recv", id).unwrap();
+            release_tx.send(()).unwrap();
+            let bytes = pull_recv("ws_recv", guard, 5.0, usize::MAX).await.unwrap();
+            match &bytes { Value::Bytes(bytes) => assert_eq!(bytes.as_ref(), expected.as_slice()), other => panic!("expected TLS binary, got {}", other.type_name()) }
+            let mut ne = NativeEvents::default();
+            let source = ne.ws_on(id, "test.tls".into()).unwrap();
+            assert_eq!(send_ws(id, true, b"after-timeout".to_vec()).unwrap().await.unwrap().unwrap(), 13);
+            match tokio::time::timeout(std::time::Duration::from_secs(5), ne.queue.next_socket(&source, KIND_WS, usize::MAX)).await.unwrap().unwrap() {
+                SocketNext::Frame(frame) => assert_eq!(frame.data, b"subscription-after-tls-pull"),
+                other => panic!("expected subscription frame, got {other:?}"),
+            }
+            server.join().unwrap();
+            ne.close();
+        }
+
+        /// Numeric pull: nil on timeout keeps the source usable, a second
+        #[tokio::test]
+        async fn partial_line_pull_rearms_readiness_without_starving_tokio() {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                started_tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                stream.write_all(b"partial-line").unwrap();
+                let _ = stop_rx.recv_timeout(std::time::Duration::from_secs(5));
+            });
+            let id = tcp_client_handle(port);
+            started_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            let guard = pull_conn("tcp_recv_line", id).unwrap();
+            let tick = std::cell::Cell::new(false);
+            let cpu_start = thread_cpu();
+            tokio::join!(
+                async {
+                    let result = pull_recv("tcp_recv_line", guard, 0.25, 65536).await.unwrap();
+                    assert!(matches!(result, Value::Nil));
+                    assert!(tick.get(), "stale readiness must not spin until the receive deadline and starve the reactor");
+                },
+                async {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    tick.set(true);
+                }
+            );
+            assert!(thread_cpu() - cpu_start < std::time::Duration::from_millis(80),
+                "idle partial recv consumed CPU while waiting for its deadline");
+            stop_tx.send(()).unwrap();
+            server.join().unwrap();
+            tcp_client::MAP.lock().unwrap().remove(&id);
+            fn thread_cpu() -> std::time::Duration {
+                let mut stamp = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+                // SAFETY: the writable timespec lives through the call.
+                assert_eq!(unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut stamp) }, 0);
+                std::time::Duration::new(stamp.tv_sec as u64, stamp.tv_nsec as u32)
+            }
+        }
+
+        /// Numeric pull: nil on timeout keeps the source usable, a second
+        /// waiter on the same handle refuses deterministically, and the
+        /// restored handle still behaves on the plain sync path.
+        #[tokio::test]
+        async fn numeric_pull_timeout_then_reuse_and_single_waiter() {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                rx.recv().unwrap(); // go signal
+                stream.write_all(b"late-bytes").unwrap();
+            });
+            let id = tcp_client_handle(port);
+            let guard = pull_conn("tcp_recv", id).unwrap();
+            // Second waiter on the same handle: deterministic refusal.
+            let err = pull_conn("tcp_recv", id).err().expect("second pull must refuse");
+            assert!(matches!(err, MixError::Structured(info) if info.code == "SOCKET_BUSY"));
+            // Timeout → nil; the conn returns to the registry, usable.
+            let out = pull_recv("tcp_recv", guard, 0.05, 65536).await.unwrap();
+            assert!(matches!(out, Value::Nil));
+            assert!(tcp_client::MAP.lock().unwrap().contains_key(&id));
+            tx.send(()).unwrap();
+            let guard = pull_conn("tcp_recv", id).unwrap();
+            let out = pull_recv("tcp_recv", guard, 5.0, 65536).await.unwrap();
+            assert!(matches!(&out, Value::Bytes(b) if b.as_slice() == b"late-bytes"));
+            assert!(tcp_client::MAP.lock().unwrap().contains_key(&id));
+            // The server has gone: the plain sync recv now raises the
+            // peer-close error and retires, same as pre-subscription use.
+            let err = crate::builtins::builtin_tcp_recv(vec![Value::Number(id as f64)])
+                .unwrap_err();
+            assert!(err.to_string().contains("closed by peer"));
+            assert!(!tcp_client::MAP.lock().unwrap().contains_key(&id));
+            server.join().unwrap();
+        }
+
+        /// A parked pull on a peer-closed connection raises and retires;
+        /// a cancelled (dropped) pull returns the conn intact — a failed
+        /// generation's resource survives for the next one.
+        #[tokio::test]
+        async fn numeric_pull_close_retires_and_cancel_returns_conn() {
+            // (a) close while parked
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                drop(stream); // immediate peer close
+            });
+            let id = tcp_client_handle(port);
+            let guard = pull_conn("tcp_recv", id).unwrap();
+            let err = pull_recv("tcp_recv", guard, 5.0, 65536).await.unwrap_err();
+            assert!(matches!(err, MixError::Structured(info) if info.code == "SOCKET_CLOSED"));
+            assert!(!tcp_client::MAP.lock().unwrap().contains_key(&id), "close retires the handle");
+            server.join().unwrap();
+
+            // (b) cancelled pull: the conn returns to the registry
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || {
+                let (_stream, _) = listener.accept().unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            });
+            let id = tcp_client_handle(port);
+            {
+                let guard = pull_conn("tcp_recv", id).unwrap();
+                let mut fut = Box::pin(pull_recv("tcp_recv", guard, 5.0, 65536));
+                // Poll once (registers readiness; read → WouldBlock),
+                // then drop: cancellation mid-wait.
+                {
+                    use std::task::{Context, Waker};
+                    assert!(fut
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending());
+                }
+                drop(fut);
+            }
+            assert!(
+                tcp_client::MAP.lock().unwrap().contains_key(&id),
+                "a cancelled pull returns the conn to the registry"
+            );
+            // The old resource is intact for the next generation.
+            let guard = pull_conn("tcp_recv", id).unwrap();
+            let out = pull_recv("tcp_recv", guard, 0.05, 65536).await.unwrap();
+            assert!(matches!(out, Value::Nil)); // timeout before the peer closes
+            server.join().unwrap();
+        }
+
+        /// Two independent pulls on two handles proceed concurrently.
+        #[tokio::test]
+        async fn two_independent_pulls_proceed_concurrently() {
+            let l1 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let p1 = l1.local_addr().unwrap().port();
+            let l2 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let p2 = l2.local_addr().unwrap().port();
+            let s1 = std::thread::spawn(move || {
+                let (mut stream, _) = l1.accept().unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                stream.write_all(b"one").unwrap();
+            });
+            let s2 = std::thread::spawn(move || {
+                let (mut stream, _) = l2.accept().unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                stream.write_all(b"two").unwrap();
+            });
+            let id1 = tcp_client_handle(p1);
+            let id2 = tcp_client_handle(p2);
+            let g1 = pull_conn("tcp_recv", id1).unwrap();
+            let g2 = pull_conn("tcp_recv", id2).unwrap();
+            let (a, b) = tokio::join!(
+                pull_recv("tcp_recv", g1, 5.0, 65536),
+                pull_recv("tcp_recv", g2, 5.0, 65536),
+            );
+            let a = a.unwrap();
+            let b = b.unwrap();
+            assert!(matches!(&a, Value::Bytes(bytes) if bytes.as_slice() == b"one"));
+            assert!(matches!(&b, Value::Bytes(bytes) if bytes.as_slice() == b"two"));
+            s1.join().unwrap();
+            s2.join().unwrap();
+        }
+
+        /// Numeric ws pull in a real loopback exchange.
+        #[tokio::test]
+        async fn numeric_ws_pull_yields_a_text_frame() {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let mut conn = tungstenite::accept(stream).unwrap();
+                conn.send(tungstenite::Message::text("hello-pull")).unwrap();
+                conn.flush().ok();
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            });
+            let conn = ws_client_conn(port);
+            let id = ws_client::NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            ws_client::MAP.lock().unwrap().insert(id, conn);
+            let guard = pull_conn("ws_recv", id).unwrap();
+            let out = pull_recv("ws_recv", guard, 5.0, usize::MAX).await.unwrap();
+            assert_eq!(out.to_mix_string(), "hello-pull");
+            assert!(ws_client::MAP.lock().unwrap().contains_key(&id));
+            server.join().unwrap();
+        }
+
+        /// Recv on a subscribed numeric handle refuses deterministically
+        /// (the reader thread is the single read owner), both on the sync
+        /// builtin path and on the pull entry.
+        #[tokio::test]
+        async fn recv_on_subscribed_handle_refuses() {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || {
+                let (_stream, _) = listener.accept().unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            });
+            let id = tcp_client_handle(port);
+            let mut ne = NativeEvents::default();
+            let _h = ne
+                .tcp_on(id, "test.refuse".to_string(), TcpMode { line: false, max: 0 })
+                .unwrap();
+            let err = crate::builtins::builtin_tcp_recv(vec![Value::Number(id as f64)])
+                .unwrap_err();
+            assert!(err.to_string().contains("tcp_on subscription"));
+            let err = pull_conn("tcp_recv", id).err().expect("subscribed receive must refuse");
+            assert!(matches!(err, MixError::Structured(info) if info.code == "SOCKET_SUBSCRIBED"));
+            ne.close();
+            server.join().unwrap();
+        }
+
+        /// ws_connect and tcp_connect count ids independently, so the same
+        /// NUMBER is two live connections. Seed both registries with the
+        /// same id and prove the pairs stay independent: concurrent
+        /// numeric pulls, concurrent adoption, sends routed to the right
+        /// peer, and retirement of one never touching the other.
+        #[tokio::test]
+        async fn same_id_ws_and_tcp_stay_independent_end_to_end() {
+            // No id counter ever reaches this: seeding the SAME number in
+            // BOTH registries cannot collide with a real handle.
+            const SHARED: u64 = 4_000_000_000_000;
+            let ws_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let ws_port = ws_l.local_addr().unwrap().port();
+            let tcp_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let tcp_port = tcp_l.local_addr().unwrap().port();
+            let (ws_tx, ws_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+            let (tcp_tx, tcp_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+            let ws_server = std::thread::spawn(move || {
+                let (stream, _) = ws_l.accept().unwrap();
+                let mut conn = tungstenite::accept(stream).unwrap();
+                conn.send(tungstenite::Message::text("w-hello")).unwrap();
+                let t = match conn.read().unwrap() {
+                    tungstenite::Message::Text(t) => t,
+                    other => panic!("expected text, got {other:?}"),
+                };
+                ws_tx.send(t.as_bytes().to_vec()).unwrap();
+                conn.send(tungstenite::Message::binary(b"w-reply".to_vec()))
+                    .unwrap();
+                let t = match conn.read().unwrap() {
+                    tungstenite::Message::Text(t) => t,
+                    other => panic!("expected text, got {other:?}"),
+                };
+                ws_tx.send(t.as_bytes().to_vec()).unwrap();
+            });
+            let tcp_server = std::thread::spawn(move || {
+                let (mut stream, _) = tcp_l.accept().unwrap();
+                stream.write_all(b"t-hello").unwrap();
+                let mut buf = vec![0u8; 32];
+                let n = stream.read(&mut buf).unwrap();
+                tcp_tx.send(buf[..n].to_vec()).unwrap();
+                stream.write_all(b"t-reply").unwrap();
+            });
+            // Seed BOTH registries with the SAME numeric id.
+            let ws_conn = ws_client_conn(ws_port);
+            ws_client::MAP.lock().unwrap().insert(SHARED, ws_conn);
+            let tcp_stream = std::net::TcpStream::connect(("127.0.0.1", tcp_port)).unwrap();
+            tcp_client::MAP.lock().unwrap().insert(
+                SHARED,
+                tcp_client::Conn {
+                    stream: tcp_client::Stream::Plain(tcp_stream),
+                    buf: Vec::new(),
+                },
+            );
+            // Concurrent pulls on the SAME id: both admitted (keyed by
+            // family — not one SOCKET_BUSY on a phantom collision).
+            let g_ws = pull_conn("ws_recv", SHARED).unwrap();
+            let g_tcp = pull_conn("tcp_recv", SHARED).unwrap();
+            let (w, t) = tokio::join!(
+                pull_recv("ws_recv", g_ws, 5.0, usize::MAX),
+                pull_recv("tcp_recv", g_tcp, 5.0, 65536),
+            );
+            assert_eq!(w.unwrap().to_mix_string(), "w-hello");
+            assert!(matches!(&t.unwrap(), Value::Bytes(b) if b.as_slice() == b"t-hello"));
+            // Both conns returned to their registries: adopt BOTH.
+            let mut ne = NativeEvents::default();
+            let h_ws = ne.ws_on(SHARED, "test.samews".to_string()).unwrap();
+            let h_tcp = ne
+                .tcp_on(SHARED, "test.sametcp".to_string(), TcpMode { line: false, max: 0 })
+                .unwrap();
+            assert!(is_subscribed(ClientKey::ws(SHARED)));
+            assert!(is_subscribed(ClientKey::tcp(SHARED)));
+            let q = ne.queue.clone();
+            // Sends route to the RIGHT peer through each owner thread.
+            let send_w = send_ws(SHARED, true, b"w-out".to_vec()).unwrap();
+            let send_t = send_tcp(SHARED, b"t-out".to_vec()).unwrap();
+            assert_eq!(send_w.await.unwrap().unwrap(), 5);
+            assert_eq!(send_t.await.unwrap().unwrap(), 5);
+            assert_eq!(
+                ws_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+                b"w-out"
+            );
+            assert_eq!(
+                tcp_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+                b"t-out"
+            );
+            // Both sources keep delivering around the sends.
+            match q.next_socket(&h_ws, KIND_WS, usize::MAX).await.unwrap() {
+                SocketNext::Frame(rec) => assert_eq!(rec.data, b"w-reply"),
+                other => panic!("expected w-reply, got {other:?}"),
+            }
+            match q.next_socket(&h_tcp, KIND_TCP_BYTES, usize::MAX).await.unwrap() {
+                SocketNext::Frame(rec) => assert_eq!(rec.data, b"t-reply"),
+                other => panic!("expected t-reply, got {other:?}"),
+            }
+            // Retire the tcp source: the ws side is untouched, tcp sends
+            // refuse, and a ws numeric recv still sees ITS subscription.
+            ne.socket_unwatch("tcp", &h_tcp).unwrap();
+            assert!(!is_subscribed(ClientKey::tcp(SHARED)));
+            assert!(is_subscribed(ClientKey::ws(SHARED)));
+            let send_w2 = send_ws(SHARED, true, b"w-out2".to_vec()).unwrap();
+            assert_eq!(send_w2.await.unwrap().unwrap(), 6);
+            assert_eq!(
+                ws_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+                b"w-out2"
+            );
+            let err = send_tcp(SHARED, b"x".to_vec()).unwrap_err();
+            assert!(matches!(err, MixError::Structured(info) if info.code == "SOCKET_SEND_CLOSED"));
+            let err = pull_conn("ws_recv", SHARED).err().expect("subscribed pull refused");
+            assert!(matches!(err, MixError::Structured(info) if info.code == "SOCKET_SUBSCRIBED"));
+            ne.close();
+            ws_server.join().unwrap();
+            tcp_server.join().unwrap();
+        }
+
+        /// Bounded admission counts queued + in-flight sends across their
+        /// whole lifetime: ops (64) and payload bytes (64 MiB). A full
+        /// queue refuses SOCKET_SEND_BUSY at ADMISSION, and retiring the
+        /// source answers every receipt and releases every reservation.
+        #[tokio::test]
+        async fn send_admission_bounds_and_retire_releases_permits() {
+            let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || {
+                let (_stream, _) = listener.accept().unwrap();
+                stop_rx.recv().unwrap(); // stalled peer: never reads a byte
+            });
+            let id = tcp_client_handle(port);
+            let mut ne = NativeEvents::default();
+            let h = ne
+                .tcp_on(id, "test.admit".to_string(), TcpMode { line: false, max: 0 })
+                .unwrap();
+            let endpoint = send_endpoint(ClientKey::tcp(id)).unwrap();
+            // Empty payloads consume one op and zero byte permits; Tokio
+            // permits zero acquisitions. Pin this against a review claim
+            // that zero permits panic, and verify the actual empty send.
+            let empty = endpoint.admit(0).expect("zero-byte admission");
+            assert_eq!(endpoint.available_permits(), (MAX_SEND_OPS - 1, MAX_SEND_BYTES));
+            drop(empty);
+            assert_eq!(send_tcp(id, Vec::new()).unwrap().await.unwrap().unwrap(), 0);
+            // Ops bound: 64 reservations, the 65th refuses.
+            let mut manual = Vec::new();
+            for _ in 0..MAX_SEND_OPS {
+                manual.push(endpoint.admit(1).unwrap());
+            }
+            let err = endpoint.admit(1).err().expect("full admission refused");
+            assert!(matches!(err, MixError::Structured(info) if info.code == "SOCKET_SEND_BUSY"));
+            drop(manual); // RAII release: the full queue drains to empty
+            assert_eq!(endpoint.available_permits(), (MAX_SEND_OPS, MAX_SEND_BYTES));
+            // Byte bound: one MAX_SEND_BYTES reservation fills it.
+            let big = endpoint.admit(MAX_SEND_BYTES).unwrap();
+            assert!(endpoint.admit(1).is_err());
+            drop(big);
+            // Real sends to the stalled peer: 8 x 8 MiB = the byte bound;
+            // the 9th refuses at admission, before the worker even runs.
+            let mut rxs = Vec::new();
+            let payload = vec![0x5au8; 8 * 1024 * 1024];
+            for _ in 0..8 {
+                rxs.push(send_tcp(id, payload.clone()).unwrap());
+            }
+            let err = send_tcp(id, payload).unwrap_err();
+            assert!(matches!(err, MixError::Structured(info) if info.code == "SOCKET_SEND_BUSY"));
+            assert_eq!(endpoint.available_permits(), (MAX_SEND_OPS - 8, 0));
+            // Retire: every receipt answers, every permit releases.
+            ne.socket_unwatch("tcp", &h).unwrap();
+            for rx in rxs {
+                let (code, _) = rx.await.unwrap().unwrap_err();
+                assert_eq!(code, "SOCKET_SEND_CLOSED");
+            }
+            assert_eq!(
+                endpoint.available_permits(),
+                (MAX_SEND_OPS, MAX_SEND_BYTES),
+                "retirement releases every reservation"
+            );
+            assert!(!is_subscribed(ClientKey::tcp(id)));
+            stop_tx.send(()).unwrap();
+            server.join().unwrap();
+        }
+
+        /// A stalled peer holds a large send in partial-write state: the
+        /// receipt deadline (from ADMISSION) fails the in-flight send and
+        /// hard-closes the source with one terminal, every queued receipt
+        /// answers, and a cancelled caller's reservation is held until the
+        /// worker answers — never leaked by cancellation.
+        #[tokio::test]
+        async fn stalled_send_expiry_answers_queued_and_cancelled_calls() {
+            // (a) partial write + expiry + queued receipts
+            let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || {
+                let (_stream, _) = listener.accept().unwrap();
+                stop_rx.recv().unwrap();
+            });
+            let id = tcp_client_handle(port);
+            let mut ne = NativeEvents::default();
+            let h = ne
+                .tcp_on(id, "test.expire".to_string(), TcpMode { line: false, max: 0 })
+                .unwrap();
+            let endpoint = send_endpoint(ClientKey::tcp(id)).unwrap();
+            endpoint.set_deadline_for_test(std::time::Duration::from_millis(300));
+            let q = ne.queue.clone();
+            let admitted = std::time::Instant::now();
+            let big = send_tcp(id, vec![0x33u8; 8 * 1024 * 1024]).unwrap();
+            let queued1 = send_tcp(id, b"q1".to_vec()).unwrap();
+            let queued2 = send_tcp(id, b"q2".to_vec()).unwrap();
+            // In-flight expiry: fails its receipt (bounded from ADMISSION)
+            // and hard-closes — a resend would duplicate partial bytes.
+            let (code, _) = big.await.unwrap().unwrap_err();
+            assert_eq!(code, "SOCKET_SEND_TIMEOUT");
+            assert!(
+                admitted.elapsed() < std::time::Duration::from_secs(5),
+                "receipt bounded from admission, not per queued hop"
+            );
+            // Retirement answers every queued receipt explicitly.
+            for rx in [queued1, queued2] {
+                let (code, _) = rx.await.unwrap().unwrap_err();
+                assert_eq!(code, "SOCKET_SEND_CLOSED");
+            }
+            // One terminal, reason truthful; the handle unmarks.
+            match q.next_socket(&h, KIND_TCP_BYTES, usize::MAX).await.unwrap() {
+                SocketNext::Closed(closed) => {
+                    assert!(closed["reason"].as_str().unwrap().contains("send timed out"));
+                }
+                other => panic!("expected terminal, got {other:?}"),
+            }
+            assert!(!is_subscribed(ClientKey::tcp(id)));
+            stop_tx.send(()).unwrap();
+            server.join().unwrap();
+
+            // (b) a cancelled caller's command keeps its reservation until
+            // the worker answers it
+            let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || {
+                let (_stream, _) = listener.accept().unwrap();
+                stop_rx.recv().unwrap();
+            });
+            let id = tcp_client_handle(port);
+            let mut ne = NativeEvents::default();
+            let _h = ne
+                .tcp_on(id, "test.cancel".to_string(), TcpMode { line: false, max: 0 })
+                .unwrap();
+            let endpoint = send_endpoint(ClientKey::tcp(id)).unwrap();
+            endpoint.set_deadline_for_test(std::time::Duration::from_millis(300));
+            let rx = send_tcp(id, vec![0x44u8; 8 * 1024 * 1024]).unwrap();
+            drop(rx); // cancelled caller: the send reports nowhere
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert_eq!(
+                endpoint.available_permits(),
+                (MAX_SEND_OPS - 1, MAX_SEND_BYTES - 8 * 1024 * 1024),
+                "cancellation must not release the reservation"
+            );
+            // The worker answers (to nobody) on expiry and releases it.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            assert_eq!(endpoint.available_permits(), (MAX_SEND_OPS, MAX_SEND_BYTES));
+            stop_tx.send(()).unwrap();
+            server.join().unwrap();
+        }
+
+        /// A burst of 64 wakes (one byte per admitted send, exactly the
+        /// ops bound) must not wedge the wake drain: the reader's non-
+        /// blocking wake pair drains an exact 64-byte read, and all
+        /// receipts answer in FIFO order with no freeze.
+        #[tokio::test]
+        async fn full_wake_burst_drains_and_all_receipts_answer() {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+            let server = std::thread::spawn(move || {
+                use std::io::Read;
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut got = Vec::new();
+                let mut buf = [0u8; 256];
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            got.extend_from_slice(&buf[..n]);
+                            if got.len() >= 64 {
+                                break;
+                            }
+                        }
+                    }
+                }
+                tx.send(got).unwrap();
+            });
+            let id = tcp_client_handle(port);
+            let mut ne = NativeEvents::default();
+            let _h = ne
+                .tcp_on(id, "test.burst".to_string(), TcpMode { line: false, max: 0 })
+                .unwrap();
+            // Admit and enqueue the full 64-op bound back-to-back, then
+            // await every receipt: a wedged wake drain would hang here.
+            let mut rxs = Vec::new();
+            for i in 0..MAX_SEND_OPS as u8 {
+                rxs.push(send_tcp(id, vec![i]).unwrap());
+            }
+            for rx in rxs {
+                assert_eq!(rx.await.unwrap().unwrap(), 1);
+            }
+            let got = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+            assert_eq!(got, (0..MAX_SEND_OPS as u8).collect::<Vec<_>>());
+            ne.close();
+            server.join().unwrap();
+        }
+
+        /// Continuous incoming data (POLLIN never idle) must not starve a
+        /// send deadline: the absolute expiry check runs every loop, so
+        /// the stalled send still fails and hard-closes on time while the
+        /// flood keeps flowing into the FIFO.
+        #[tokio::test]
+        async fn continuous_incoming_cannot_starve_the_send_deadline() {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let flood = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let server = std::thread::spawn({
+                let flood = flood.clone();
+                move || {
+                    use std::io::Write;
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let chunk = vec![0u8; 1024];
+                    // Flood ~1 KiB/ms until the source hard-closes.
+                    while flood.load(Ordering::Relaxed) {
+                        if stream.write_all(&chunk).is_err() {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+            });
+            let id = tcp_client_handle(port);
+            let mut ne = NativeEvents::default();
+            let h = ne
+                .tcp_on(id, "test.flood".to_string(), TcpMode { line: false, max: 0 })
+                .unwrap();
+            let endpoint = send_endpoint(ClientKey::tcp(id)).unwrap();
+            endpoint.set_deadline_for_test(std::time::Duration::from_millis(300));
+            let q = ne.queue.clone();
+            let admitted = std::time::Instant::now();
+            let rx = send_tcp(id, vec![0x66u8; 8 * 1024 * 1024]).unwrap();
+            let (code, _) = rx.await.unwrap().unwrap_err();
+            assert_eq!(code, "SOCKET_SEND_TIMEOUT");
+            assert!(
+                admitted.elapsed() < std::time::Duration::from_secs(2),
+                "expiry fired under continuous POLLIN, not only when poll went quiet"
+            );
+            // The flood kept flowing into the FIFO while the send stalled,
+            // and the source still published its one truthful terminal.
+            assert!(q.socket_snapshot().1 > 0, "incoming frames kept arriving");
+            let mut frames = 0usize;
+            loop {
+                match q.next_socket(&h, KIND_TCP_BYTES, usize::MAX).await.unwrap() {
+                    SocketNext::Frame(_) => {
+                        frames += 1;
+                        assert!(frames < MAX_SOCKET_FRAMES, "the flood overran the FIFO");
+                    }
+                    SocketNext::Closed(closed) => {
+                        assert!(closed["reason"].as_str().unwrap().contains("send timed out"));
+                        break;
+                    }
+                    SocketNext::Idle => unreachable!(),
+                }
+            }
+            flood.store(false, Ordering::Relaxed);
+            server.join().unwrap();
+        }
+    }
 }
 
 /// `tcp_close(h)` → bool (true when live, false when unknown — funlock

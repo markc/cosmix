@@ -48,16 +48,44 @@ impl PendingSource {
     }
 }
 
+/// One socket subscription's ordered FIFO (ws_on/tcp_on). Ordered and
+/// lossless — the antipode of the coalescing `sources` map above, which is
+/// deliberately unsuitable for frames.
+#[cfg(feature = "ws")]
+#[derive(Default)]
+struct PendingSocket {
+    command: String,
+    /// Which Class C recv verb may consume this source's records.
+    kind: &'static str,
+    frames: VecDeque<crate::builtins::socket_sources::SocketRecord>,
+    bytes: usize,
+    closed: Option<serde_json::Value>,
+    /// At most one Class C recv may park on a source at a time.
+    parked: bool,
+}
+
 #[derive(Default)]
 struct Pending {
     watches: BTreeMap<String, PendingWatch>,
     sources: BTreeMap<String, PendingSource>,
     children: VecDeque<serde_json::Value>,
+    /// Ordered socket frames (ws_on/tcp_on): one FIFO per source, bounded
+    /// by MAX_SOCKET_FRAMES / MAX_SOCKET_BYTES across all sources —
+    /// overflow hard-closes the source, never a silent drop.
+    #[cfg(feature = "ws")]
+    sockets: BTreeMap<String, PendingSocket>,
+    #[cfg(feature = "ws")]
+    last_socket: Option<String>,
+    #[cfg(feature = "ws")]
+    socket_frames: usize,
+    #[cfg(feature = "ws")]
+    socket_bytes: usize,
     count: usize,
     closed: bool,
     last_watch: Option<String>,
     last_source: Option<String>,
-    /// Round-robin over filesystem (0), child (1) and net/audio (2) records.
+    /// Round-robin over filesystem (0), child (1), net/audio (2) and
+    /// socket (3) records.
     turn: usize,
 }
 
@@ -69,6 +97,10 @@ pub(crate) struct Families {
     pub children: bool,
     pub net: bool,
     pub audio: bool,
+    /// Socket subscriptions (ws_on/tcp_on). Their event commands are
+    /// caller-chosen, so the family gate is source presence, not a
+    /// handler-name lookup.
+    pub sockets: bool,
 }
 
 impl Families {
@@ -77,13 +109,14 @@ impl Families {
         children: true,
         net: true,
         audio: true,
+        sockets: true,
     };
 
     /// Only the `tokio-sleep` sleep pump selects on native events
     /// (evaluator.rs `sleep()`); without the feature it has no caller.
     #[cfg(feature = "tokio-sleep")]
     pub fn any(self) -> bool {
-        self.filesystem || self.children || self.net || self.audio
+        self.filesystem || self.children || self.net || self.audio || self.sockets
     }
 
     fn source(self, command: &str) -> bool {
@@ -95,6 +128,15 @@ impl Families {
     }
 }
 
+/// One Class C recv outcome on a socket source.
+#[cfg(feature = "ws")]
+#[derive(Debug)]
+pub(crate) enum SocketNext {
+    Frame(crate::builtins::socket_sources::SocketRecord),
+    Closed(serde_json::Value),
+    Idle,
+}
+
 #[derive(Default)]
 pub(crate) struct Queue {
     pending: Mutex<Pending>,
@@ -103,6 +145,16 @@ pub(crate) struct Queue {
 }
 
 impl Queue {
+    #[cfg(all(test, feature = "ws"))]
+    pub(crate) fn socket_snapshot(&self) -> (usize, usize, usize) {
+        let p = self.pending.lock().unwrap();
+        (p.sockets.len(), p.socket_frames, p.socket_bytes)
+    }
+    #[cfg(all(test, feature = "ws"))]
+    pub(crate) fn socket_idle_for_test(&self, handle: &str) -> bool {
+        self.pending.lock().unwrap().sockets.get(handle)
+            .is_some_and(|s| s.frames.is_empty() && s.closed.is_none())
+    }
     #[cfg(target_os = "linux")]
     pub fn overflow_watches(&self) {
         let mut p = self.pending.lock().unwrap();
@@ -186,6 +238,159 @@ impl Queue {
         s.closed = Some(reason);
         drop(p);
         self.ready.notify_waiters();
+    }
+
+    /// Admit one socket frame. `false` means the byte/frame bound was hit:
+    /// the caller MUST hard-close and publish exactly one terminal event —
+    /// frames are never silently dropped.
+    #[cfg(feature = "ws")]
+    pub fn socket_push(
+        &self,
+        handle: &str,
+        record: crate::builtins::socket_sources::SocketRecord,
+    ) -> bool {
+        let mut p = self.pending.lock().unwrap();
+        if !p.sockets.contains_key(handle) {
+            // Unsubscribed mid-push: the record dies with the subscription.
+            return true;
+        }
+        let len = record.data.len();
+        if p.socket_frames + 1 > crate::builtins::socket_sources::MAX_SOCKET_FRAMES
+            || p.socket_bytes + len > crate::builtins::socket_sources::MAX_SOCKET_BYTES
+        {
+            return false;
+        }
+        let s = p.sockets.get_mut(handle).expect("socket slot checked above");
+        s.bytes += len;
+        s.frames.push_back(record);
+        p.socket_bytes += len;
+        p.socket_frames += 1;
+        drop(p);
+        self.ready.notify_waiters();
+        true
+    }
+
+    /// One terminal record per source; further terminals are ignored.
+    #[cfg(feature = "ws")]
+    pub fn socket_closed(&self, handle: &str, reason: serde_json::Value) {
+        let mut p = self.pending.lock().unwrap();
+        if let Some(s) = p.sockets.get_mut(handle)
+            && s.closed.is_none()
+        {
+            s.closed = Some(reason);
+        }
+        drop(p);
+        self.ready.notify_waiters();
+    }
+
+    /// Class C recv on one source: the next ordered record, or the
+    /// terminal. `expect` is the source kind the verb may consume; `max`
+    /// bounds a bytes-mode take (the remainder stays queued, in order).
+    #[cfg(feature = "ws")]
+    pub async fn next_socket(
+        &self,
+        handle: &str,
+        expect: &'static str,
+        max: usize,
+    ) -> MixResult<SocketNext> {
+        loop {
+            let ready = self.ready.notified();
+            tokio::pin!(ready);
+            ready.as_mut().enable();
+            {
+                let mut p = self.pending.lock().unwrap();
+                if p.closed {
+                    return Err(refusal("NATIVE_CLOSED", "native sources retired"));
+                }
+                let Some(s) = p.sockets.get_mut(handle) else {
+                    return Err(refusal(
+                        "SOCKET_WATCH_HANDLE",
+                        "unknown or retired socket source",
+                    ));
+                };
+                if s.kind != expect {
+                    return Err(refusal(
+                        "SOCKET_KIND",
+                        format!(
+                            "source {handle} is a {} subscription — use the matching recv verb",
+                            s.kind
+                        ),
+                    ));
+                }
+                if !s.frames.is_empty() {
+                    let head = if s.frames.front().unwrap().data.len() <= max {
+                        let rec = s.frames.pop_front().unwrap();
+                        s.bytes -= rec.data.len();
+                        p.socket_bytes -= rec.data.len();
+                        p.socket_frames -= 1;
+                        rec
+                    } else {
+                        let rec = s.frames.front_mut().unwrap();
+                        let rest = rec.data.split_off(max);
+                        let head = crate::builtins::socket_sources::SocketRecord {
+                            kind: rec.kind,
+                            data: std::mem::replace(&mut rec.data, rest),
+                        };
+                        s.bytes -= head.data.len();
+                        p.socket_bytes -= head.data.len();
+                        head
+                    };
+                    return Ok(SocketNext::Frame(head));
+                }
+                if let Some(closed) = s.closed.take() {
+                    p.sockets.remove(handle);
+                    return Ok(SocketNext::Closed(closed));
+                }
+            }
+            ready.await;
+        }
+    }
+
+    /// The event-pump consumer: whole records, in order, under the source's
+    /// command; the terminal record removes the slot (retired).
+    #[cfg(feature = "ws")]
+    fn take_socket(p: &mut Pending, handle: &str) -> Option<IncomingEvent> {
+        let s = p.sockets.get_mut(handle)?;
+        if !s.frames.is_empty() {
+            let rec = s.frames.pop_front().unwrap();
+            s.bytes -= rec.data.len();
+            p.socket_bytes -= rec.data.len();
+            p.socket_frames -= 1;
+            let data = match rec.kind {
+                "text" | "line" => {
+                    serde_json::Value::String(String::from_utf8_lossy(&rec.data).into_owned())
+                }
+                _ => serde_json::json!({
+                    "hex": crate::builtins::socket_sources::hex_encode(&rec.data),
+                }),
+            };
+            let command = s.command.clone();
+            return Some(event(
+                &command,
+                serde_json::json!({"watch": handle, "frame": {"kind": rec.kind, "data": data}}),
+            ));
+        }
+        if let Some(closed) = s.closed.take() {
+            let command = s.command.clone();
+            p.sockets.remove(handle);
+            return Some(event(
+                &command,
+                serde_json::json!({"watch": handle, "closed": closed}),
+            ));
+        }
+        None
+    }
+
+    #[cfg(all(test, feature = "ws"))]
+    pub(crate) fn register_socket_for_test(&self, handle: &str, command: &str, kind: &'static str) {
+        self.pending.lock().unwrap().sockets.insert(
+            handle.into(),
+            PendingSocket {
+                command: command.into(),
+                kind,
+                ..Default::default()
+            },
+        );
     }
 
     #[cfg(test)]
@@ -301,8 +506,24 @@ impl Queue {
                         .or_else(|| ready.first())
                         .cloned();
                     let child = families.children && !p.children.is_empty();
-                    for step in 0..3 {
-                        let family = (p.turn + step) % 3;
+                    #[cfg(feature = "ws")]
+                    let ready: Vec<_> = p
+                        .sockets
+                        .iter()
+                        .filter(|(_, s)| {
+                            families.sockets && (!s.frames.is_empty() || s.closed.is_some())
+                        })
+                        .map(|(h, _)| h.clone())
+                        .collect();
+                    #[cfg(feature = "ws")]
+                    let so = ready
+                        .iter()
+                        .find(|h| p.last_socket.as_ref().is_none_or(|last| *h > last))
+                        .or_else(|| ready.first())
+                        .cloned();
+                    let families_n: usize = if cfg!(feature = "ws") { 4 } else { 3 };
+                    for step in 0..families_n {
+                        let family = (p.turn + step) % families_n;
                         if family == 0
                             && let Some(h) = &h
                         {
@@ -319,8 +540,16 @@ impl Queue {
                             && let Some(s) = &s
                         {
                             p.last_source = Some(s.clone());
-                            p.turn = 0;
+                            p.turn = 3;
                             return Ok(Self::take_source(&mut p, s).unwrap());
+                        }
+                        #[cfg(feature = "ws")]
+                        if family == 3
+                            && let Some(so) = &so
+                        {
+                            p.last_socket = Some(so.clone());
+                            p.turn = 0;
+                            return Ok(Self::take_socket(&mut p, so).unwrap());
                         }
                     }
                 }
@@ -365,6 +594,9 @@ pub(crate) struct NativeEvents {
     filesystem: Option<crate::fs_watch::Registry>,
     children: Vec<crate::child_events::ChildWatch>,
     desktop: BTreeMap<String, crate::desktop_events::Source>,
+    /// Subscribed sockets (ws_on/tcp_on), owned by this generation.
+    #[cfg(feature = "ws")]
+    pub(crate) sockets: BTreeMap<String, crate::builtins::socket_sources::SocketSource>,
 }
 
 impl NativeEvents {
@@ -383,10 +615,27 @@ impl NativeEvents {
     }
     pub fn has_sources(&mut self) -> bool {
         self.children.retain(|c| !c.finished());
+        // Completed socket readers published their terminal record before
+        // setting the flag; dropping them here joins an exited thread.
+        // Undelivered records survive in the queue's pending slots.
+        #[cfg(feature = "ws")]
+        self.sockets
+            .retain(|_, s| !s.completed.load(std::sync::atomic::Ordering::Acquire));
         !self.watches.is_empty()
             || !self.children.is_empty()
             || !self.desktop.is_empty()
             || !self.queue.pending.lock().unwrap().children.is_empty()
+            || {
+                #[cfg(feature = "ws")]
+                {
+                    !self.sockets.is_empty()
+                        || !self.queue.pending.lock().unwrap().sockets.is_empty()
+                }
+                #[cfg(not(feature = "ws"))]
+                {
+                    false
+                }
+            }
     }
 
     /// `net_watch`: one rtnetlink subscription per handle.
@@ -570,6 +819,148 @@ impl NativeEvents {
             .then_some(false)
     }
 
+    /// `ws_on`: move a ws_connect handle into a subscription reader owned
+    /// by this generation. The reader is the connection's single owner:
+    /// numeric ws_recv/ws_close refuse from here on, while ws_send routes
+    /// through the owner thread's command endpoint (registered by
+    /// spawn_ws, removed when the source retires).
+    #[cfg(feature = "ws")]
+    pub fn ws_on(&mut self, client_id: u64, command: String) -> MixResult<String> {
+        self.ensure_open()?;
+        self.check_socket_limit()?;
+        self.socket_sub("ws", crate::builtins::socket_sources::KIND_WS, command, |queue, id, command| {
+            crate::builtins::socket_sources::subscribe_ws(queue, id, command, client_id)
+        })
+    }
+
+    /// `tcp_on`: move a tcp_connect handle into a subscription reader.
+    #[cfg(feature = "ws")]
+    pub fn tcp_on(
+        &mut self,
+        client_id: u64,
+        command: String,
+        mode: crate::builtins::socket_sources::TcpMode,
+    ) -> MixResult<String> {
+        self.ensure_open()?;
+        self.check_socket_limit()?;
+        let kind = if mode.line {
+            crate::builtins::socket_sources::KIND_TCP_LINE
+        } else {
+            crate::builtins::socket_sources::KIND_TCP_BYTES
+        };
+        self.socket_sub("tcp", kind, command, |queue, id, command| {
+            crate::builtins::socket_sources::subscribe_tcp(queue, id, command, client_id, mode)
+        })
+    }
+
+    #[cfg(feature = "ws")]
+    fn check_socket_limit(&self) -> MixResult<()> {
+        if self.sockets.len() >= crate::builtins::socket_sources::MAX_SOURCES {
+            return Err(refusal(
+                "SOCKET_LIMIT",
+                "maximum 16 socket sources per evaluator",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Register the pending slot first (the worker may publish at once),
+    /// then spawn the reader; a failed spawn leaves no slot behind.
+    #[cfg(feature = "ws")]
+    fn socket_sub(
+        &mut self,
+        family: &str,
+        kind: &'static str,
+        command: String,
+        start: impl FnOnce(
+            Arc<Queue>,
+            String,
+            String,
+        ) -> MixResult<crate::builtins::socket_sources::SocketSource>,
+    ) -> MixResult<String> {
+        let h = format!("{family}:{}", NEXT_HANDLE.fetch_add(1, Ordering::Relaxed));
+        self.queue.pending.lock().unwrap().sockets.insert(
+            h.clone(),
+            PendingSocket {
+                command: command.clone(),
+                kind,
+                ..Default::default()
+            },
+        );
+        match start(self.queue.clone(), h.clone(), command) {
+            Ok(source) => {
+                self.sockets.insert(h.clone(), source);
+                Ok(h)
+            }
+            Err(e) => {
+                self.remove_socket_pending(&h);
+                Err(e)
+            }
+        }
+    }
+
+    /// Class C recv parking: at most one waiter per source. The guard
+    /// clears the slot when the wait completes OR is cancelled (a Class C
+    /// task abort drops the future, which drops the guard).
+    #[cfg(feature = "ws")]
+    pub fn park_socket(&mut self, h: &str) -> MixResult<ParkGuard> {
+        {
+            let mut p = self.queue.pending.lock().unwrap();
+            let Some(s) = p.sockets.get_mut(h) else {
+                return Err(refusal(
+                    "SOCKET_WATCH_HANDLE",
+                    "unknown or retired socket source",
+                ));
+            };
+            if s.parked {
+                return Err(refusal(
+                    "SOCKET_BUSY",
+                    "another recv is already waiting on this source",
+                ));
+            }
+            s.parked = true;
+        }
+        Ok(ParkGuard {
+            queue: self.queue.clone(),
+            handle: h.to_string(),
+        })
+    }
+
+    /// `ws_unwatch` / `tcp_unwatch`. Explicit close: cancel + join, drop
+    /// queued frames, NO terminal marker (documented). A handle of the
+    /// other family is refused, not cancelled.
+    #[cfg(feature = "ws")]
+    pub fn socket_unwatch(&mut self, family: &str, h: &str) -> MixResult<()> {
+        let known = h.starts_with(&format!("{family}:"))
+            && (self.sockets.contains_key(h)
+                || self.queue.pending.lock().unwrap().sockets.contains_key(h));
+        if !known {
+            return Err(refusal(
+                "SOCKET_WATCH_HANDLE",
+                "unknown or retired socket source",
+            ));
+        }
+        // Drop pending first: records the worker publishes while it is
+        // being cancelled find no slot and are discarded; a parked recv
+        // wakes with SOCKET_WATCH_HANDLE instead of hanging.
+        self.remove_socket_pending(h);
+        if let Some(source) = self.sockets.remove(h) {
+            drop(source); // cancel byte + join
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "ws")]
+    fn remove_socket_pending(&self, h: &str) {
+        let mut p = self.queue.pending.lock().unwrap();
+        if let Some(s) = p.sockets.remove(h) {
+            p.socket_frames -= s.frames.len();
+            p.socket_bytes -= s.bytes;
+        }
+        drop(p);
+        self.queue.ready.notify_waiters();
+    }
+
     pub fn close(&mut self) {
         {
             let mut p = self.queue.pending.lock().unwrap();
@@ -578,18 +969,43 @@ impl NativeEvents {
             p.sources.clear();
             p.children.clear();
             p.count = 0;
+            #[cfg(feature = "ws")]
+            {
+                p.sockets.clear();
+                p.socket_frames = 0;
+                p.socket_bytes = 0;
+            }
         }
         self.queue.ready.notify_waiters();
         self.watches.clear();
         self.filesystem = None;
         self.children.clear();
         self.desktop.clear();
+        #[cfg(feature = "ws")]
+        self.sockets.clear(); // each Drop cancels + joins its reader
     }
 }
 
 impl Drop for NativeEvents {
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+/// Class C recv parking slot; Drop clears it so a cancelled wait never
+/// wedges the source in the parked state.
+#[cfg(feature = "ws")]
+pub(crate) struct ParkGuard {
+    queue: Arc<Queue>,
+    handle: String,
+}
+
+#[cfg(feature = "ws")]
+impl Drop for ParkGuard {
+    fn drop(&mut self) {
+        if let Some(s) = self.queue.pending.lock().unwrap().sockets.get_mut(&self.handle) {
+            s.parked = false;
+        }
     }
 }
 
@@ -685,6 +1101,8 @@ mod tests {
             filesystem: None,
             children: Vec::new(),
             desktop: BTreeMap::new(),
+            #[cfg(feature = "ws")]
+            sockets: BTreeMap::new(),
         };
         registry.remove_pending("test");
         q.change("test", Some(change("late".into())), true);

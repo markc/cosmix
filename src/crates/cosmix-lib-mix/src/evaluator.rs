@@ -2975,6 +2975,21 @@ pub(crate) const INLINE_SPECIAL_FORMS: &[&str] = &[
     "audio_watch",
     "audio_unwatch",
     "audio_state",
+    // Socket subscriptions (ws_on/tcp_on/ws_unwatch/tcp_unwatch) are
+    // evaluator-special; ws_recv/tcp_recv/tcp_recv_line/ws_send/tcp_send
+    // are hybrids: the string-source Class C recv form is intercepted by
+    // the inline arm, and in a Class C async body (read permit held) the
+    // NUMERIC forms pull non-blocking (recv) or await the owner thread's
+    // completion receipt (send on a subscribed handle) instead of running
+    // call_builtin's blocking sync client path — which stays the path for
+    // Class S and plain evaluation.
+    "ws_on",
+    "tcp_on",
+    "ws_unwatch",
+    "tcp_unwatch",
+    "ws_recv",
+    "tcp_recv",
+    "tcp_recv_line",
 ];
 
 /// Per-evaluator capability gate for the builtin table (the capability
@@ -3134,6 +3149,14 @@ pub const EXPR_MODE_DENIED_BUILTINS: &[&str] = &[
     "write_stderr",
     "print_raw",
     "eprint_raw",
+    // Native socket subscriptions: threads owned by the evaluator
+    // generation. ws_recv/tcp_recv/tcp_recv_line stay allowed BY NAME —
+    // their numeric-handle path is the pre-existing sync client form, and
+    // a string source can only exist where ws_on/tcp_on created it.
+    "ws_on",
+    "tcp_on",
+    "ws_unwatch",
+    "tcp_unwatch",
 ];
 
 /// Evaluate exactly one Mix expression with preset globals, an optional
@@ -11671,6 +11694,138 @@ impl Evaluator {
                             }
                         };
                     }
+                    if matches!(name.as_str(), "ws_on" | "tcp_on" | "ws_unwatch" | "tcp_unwatch") {
+                        self.check_capability(name)?;
+                        self.check_builtin_arity(name, eval_args.len())?;
+                        #[cfg(not(feature = "ws"))]
+                        {
+                            return Err(crate::native_events::refusal(
+                                "WS_FEATURE",
+                                format!("{name}() requires the `ws` feature (tungstenite/rustls)"),
+                            ));
+                        }
+                        #[cfg(feature = "ws")]
+                        {
+                            let mut g = self.globals.borrow_mut();
+                            let ne = &mut g.native_events;
+                            return match name.as_str() {
+                                "ws_on" | "tcp_on" => {
+                                    let id = crate::builtins::socket_sources::client_id_of(
+                                        eval_args.first(),
+                                        name,
+                                    )?;
+                                    let command = crate::builtins::socket_sources::event_command_of(
+                                        eval_args.get(1),
+                                        name,
+                                    )?;
+                                    let h = if name == "ws_on" {
+                                        ne.ws_on(id, command)?
+                                    } else {
+                                        let mode = crate::builtins::socket_sources::parse_tcp_on_opts(
+                                            eval_args.get(2),
+                                        )?;
+                                        ne.tcp_on(id, command, mode)?
+                                    };
+                                    Ok(Value::String(h))
+                                }
+                                "ws_unwatch" | "tcp_unwatch" => {
+                                    let family = if name == "ws_unwatch" { "ws" } else { "tcp" };
+                                    let Some(Value::String(h)) = eval_args.first() else {
+                                        return Err(crate::native_events::refusal(
+                                            "SOCKET_WATCH_ARGUMENT",
+                                            "handle must be the source id string returned by ws_on/tcp_on",
+                                        ));
+                                    };
+                                    ne.socket_unwatch(family, h)?;
+                                    Ok(Value::Nil)
+                                }
+                                _ => unreachable!(),
+                            };
+                        }
+                    }
+                    if matches!(name.as_str(), "ws_recv" | "tcp_recv" | "tcp_recv_line")
+                        && matches!(eval_args.first(), Some(Value::String(_)))
+                    {
+                        self.check_capability(name)?;
+                        self.check_builtin_arity(name, eval_args.len())?;
+                        // Without the `ws` feature this arm falls through to
+                        // call_builtin, whose loud refusal covers the name.
+                        #[cfg(feature = "ws")]
+                        {
+                            let h = match eval_args.first() {
+                                Some(Value::String(s)) => s.clone(),
+                                _ => unreachable!("guarded by the string-argument match"),
+                            };
+                            if self.globals.borrow().serve_runtime.is_some()
+                                || self.globals.borrow().native_events.pumping()
+                            {
+                                return Err(crate::native_events::refusal(
+                                    "SOCKET_RECV_SERVE",
+                                    format!(
+                                        "{name}() on a socket source is unavailable in serve mode; use `on <command>`"
+                                    ),
+                                ));
+                            }
+                            let expect = if name == "ws_recv" {
+                                crate::builtins::socket_sources::KIND_WS
+                            } else if name == "tcp_recv" {
+                                crate::builtins::socket_sources::KIND_TCP_BYTES
+                            } else {
+                                crate::builtins::socket_sources::KIND_TCP_LINE
+                            };
+                            let (timeout_seconds, max) =
+                                crate::builtins::socket_sources::parse_source_recv_opts(
+                                    name,
+                                    eval_args.get(1),
+                                    65536,
+                                )?;
+                            // Frame boundaries survive: only tcp_recv (a raw
+                            // byte stream) may slice a queued chunk; ws
+                            // messages and tcp lines are delivered whole.
+                            let max = if name == "tcp_recv" { max } else { usize::MAX };
+                            // One parked recv per source; the guard clears the
+                            // slot when this future completes OR is cancelled
+                            // (a Class C task abort drops it).
+                            let (queue, _park) = {
+                                let mut g = self.globals.borrow_mut();
+                                let guard = g.native_events.park_socket(&h)?;
+                                (g.native_events.queue.clone(), guard)
+                            };
+                            let h_for_err = h.clone();
+                            let next = async move {
+                                if timeout_seconds == 0.0 {
+                                    queue.next_socket(&h, expect, max).await
+                                } else {
+                                    match tokio::time::timeout(
+                                        std::time::Duration::from_secs_f64(timeout_seconds),
+                                        queue.next_socket(&h, expect, max),
+                                    )
+                                    .await
+                                    {
+                                        Ok(outcome) => outcome,
+                                        // Timeout: nil keeps the source usable.
+                                        Err(_) => Ok(crate::native_events::SocketNext::Idle),
+                                    }
+                                }
+                            };
+                            let out = self.await_with_class_c_yield(next).await??;
+                            return match out {
+                                crate::native_events::SocketNext::Idle => Ok(Value::Nil),
+                                crate::native_events::SocketNext::Frame(rec) => match rec.kind {
+                                    "text" | "line" => Ok(Value::String(
+                                        String::from_utf8_lossy(&rec.data).into_owned(),
+                                    )),
+                                    _ => Ok(Value::bytes(rec.data)),
+                                },
+                                crate::native_events::SocketNext::Closed(closed) => {
+                                    Err(crate::native_events::refusal(
+                                        "SOCKET_CLOSED",
+                                        format!("{name}(): source {h_for_err} closed: {closed}"),
+                                    ))
+                                }
+                            };
+                        }
+                    }
                     if name == "spawn" && matches!(eval_args.first(), Some(Value::List(_))) {
                         self.check_capability(name)?;
                         return crate::builtins::spawn_argv_native(eval_args, Some(&mut self.globals.borrow_mut().native_events))
@@ -11843,6 +11998,20 @@ impl Evaluator {
                                         children: g.handlers.contains_key("proc.exited"),
                                         net: g.handlers.contains_key("net.changed"),
                                         audio: g.handlers.contains_key("audio.changed"),
+                                        // Socket commands are caller-chosen, so
+                                        // the family gate is source presence
+                                        // (a live reader or undelivered
+                                        // records), not a handler-name lookup.
+                                        sockets: {
+                                            #[cfg(feature = "ws")]
+                                            {
+                                                !g.native_events.sockets.is_empty()
+                                            }
+                                            #[cfg(not(feature = "ws"))]
+                                            {
+                                                false
+                                            }
+                                        },
                                     }
                                 };
                                 let outcome: SleepOutcome = tokio::select! {
@@ -12484,6 +12653,101 @@ impl Evaluator {
                             } else {
                                 None
                             };
+                        // Class C numeric socket verbs (`ws` feature). A
+                        // Class C async body holds a read permit and must
+                        // not block on socket I/O: numeric ws_recv/
+                        // tcp_recv/tcp_recv_line become a cancel-safe
+                        // non-blocking pull (the conn leaves the registry
+                        // for the duration, at most one waiter per
+                        // (family, id) handle — ws and tcp ids count
+                        // independently — never shared with the
+                        // subscription event pump), and ws_send/tcp_send
+                        // on a SUBSCRIBED handle route through the owner
+                        // thread's command endpoint and await the
+                        // completion receipt. The pull's AsyncFd
+                        // readiness await is unix-only: on other targets
+                        // this whole arm is compiled out and the sync
+                        // builtin runs instead — honest Class S blocking
+                        // semantics, never a silently claimed yield. All
+                        // Subscribed sends also await receipts for Class S,
+                        // retaining its writer permit. This keeps its serial
+                        // dispatch semantics without blocking Tokio's reactor.
+                        // Other cases — ordinary Class S receives, unknown
+                        // handles, recv on a subscribed handle, a
+                        // non-payload send argument — fall through to the
+                        // sync builtin unchanged (which refuses recv on
+                        // subscribed handles deterministically).
+                        #[cfg(all(feature = "ws", unix))]
+                        if matches!(
+                            name.as_str(),
+                            "ws_recv" | "tcp_recv" | "tcp_recv_line" | "ws_send" | "tcp_send"
+                        ) && (self.ctx.class_c_read_permit.is_some()
+                            || matches!(name.as_str(), "ws_send" | "tcp_send"))
+                            && matches!(eval_args.first(), Some(Value::Number(_)))
+                            && let Ok(id) = crate::builtins::socket_sources::client_id_of(
+                                eval_args.first(),
+                                name,
+                            )
+                        {
+                            // (family, id): ws_connect and tcp_connect count
+                            // ids independently, so the same number is two
+                            // different connections.
+                            let key = crate::builtins::socket_sources::ClientKey::of(name, id);
+                            let is_send = matches!(name.as_str(), "ws_send" | "tcp_send");
+                            if !is_send && self.ctx.class_c_read_permit.is_some()
+                                && !crate::builtins::socket_sources::is_subscribed(key) {
+                                let (timeout_seconds, max) =
+                                    crate::builtins::socket_sources::parse_source_recv_opts(
+                                        name,
+                                        eval_args.get(1),
+                                        65536,
+                                    )?;
+                                let guard =
+                                    crate::builtins::socket_sources::pull_conn(name, id)?;
+                                let fut = crate::builtins::socket_sources::pull_recv(
+                                    name, guard,
+                                    timeout_seconds, max,
+                                );
+                                return self.await_with_class_c_yield(fut).await?;
+                            }
+                            if is_send && crate::builtins::socket_sources::is_subscribed(key) {
+                                let payload: Option<Vec<u8>> = match &eval_args[1] {
+                                    Value::String(s) => Some(s.as_bytes().to_vec()),
+                                    Value::Bytes(b) => Some(b.to_vec()),
+                                    Value::Buffer(b) => Some(b.borrow().clone()),
+                                    _ => None,
+                                };
+                                if let Some(payload) = payload {
+                                    let ws = name == "ws_send";
+                                    let rx = if ws {
+                                        crate::builtins::socket_sources::send_ws(
+                                            id,
+                                            matches!(&eval_args[1], Value::String(_)),
+                                            payload,
+                                        )?
+                                    } else {
+                                        crate::builtins::socket_sources::send_tcp(id, payload)?
+                                    };
+                                    let fut = async move {
+                                        match rx.await {
+                                            Ok(Ok(n)) => Ok(if ws {
+                                                Value::Nil
+                                            } else {
+                                                Value::Number(n as f64)
+                                            }),
+                                            Ok(Err((code, message))) => {
+                                                Err(crate::native_events::refusal(&code, message))
+                                            }
+                                            Err(_) => Err(crate::native_events::refusal(
+                                                "SOCKET_SEND_CLOSED",
+                                                "the socket source was closed before the send completed",
+                                            )),
+                                        }
+                                    };
+                                    return self.await_with_class_c_yield(fut).await?;
+                                }
+                            }
+                        }
                         if let Some(result) = builtins::call_builtin(name, eval_args.clone())
                             .map_err(|e| self.snapshot_builtin_error(name, e))?
                         {

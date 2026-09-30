@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-lib-mix"
-version = "0.103.15"
+version = "0.107.0"
 edition = "2024"
 license = "MIT"
 
@@ -77,7 +77,7 @@ yaml = ["dep:yaml-rust2"]
 # tokio-tungstenite); rustls is pulled directly only for the
 # `{insecure: true}` arm's no-verify TLS config (self-signed device certs
 # — the case that motivated the builtin).
-ws = ["dep:tungstenite", "dep:rustls", "dep:webpki-roots"]
+ws = ["dep:tungstenite", "dep:rustls", "dep:webpki-roots", "tokio/net"]
 
 [dependencies]
 indexmap = "2"
@@ -135,6 +135,7 @@ toml = { version = "0.8", optional = true }
 # than relying on a workspace consumer to unify `rt`/`sync` in — otherwise a
 # standalone build (e.g. the `fuzz/` sub-crate, or `cargo build -p` alone) fails
 # to compile tokio's rt/sync items.
+# Socket AsyncFd readiness enables `net` only through the ws feature above.
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 # Char-aware string ops (P0 of _doc/planned/2026-06-02-mix-char-aware-strings.md).
 # Unconditional external crates (like indexmap/libc/rand) — both no_std + zero
