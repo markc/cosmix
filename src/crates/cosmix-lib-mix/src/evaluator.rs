@@ -9112,7 +9112,14 @@ impl Evaluator {
                             // A coalescing default (`?? / ?:`) may need to parse
                             // and evaluate an expression — that lives on the
                             // async path, so defer the whole interpolation.
-                            if coalesce.is_some() {
+                            // An index/call suffix (`${a[0]}`, `${f()}`) is
+                            // async-only too (the sync walker reads a plain
+                            // dotted name); defer rather than misread it.
+                            if coalesce.is_some()
+                                || path
+                                    .bytes()
+                                    .any(|b| matches!(b, b'[' | b']' | b'(' | b')'))
+                            {
                                 return None;
                             }
                             let mut parts_iter = path.split('.');
@@ -9992,7 +9999,16 @@ impl Evaluator {
             Expr::InterpolatedString(parts) | Expr::Heredoc(parts) => {
                 parts.iter().all(|p| match p {
                     StringPart::Literal(_) | StringPart::EnvVar(_) => true,
-                    StringPart::Variable(spec) => split_interp_coalesce(spec).1.is_none(),
+                    // Sync only when the spec is a plain dotted name — a
+                    // coalescing default or an index/call suffix (${a[0]},
+                    // ${f()}) needs the async resolver.
+                    StringPart::Variable(spec) => {
+                        let (path, coalesce) = split_interp_coalesce(spec);
+                        coalesce.is_none()
+                            && !path
+                                .bytes()
+                                .any(|b| matches!(b, b'[' | b']' | b'(' | b')'))
+                    }
                     _ => false,
                 })
             }
