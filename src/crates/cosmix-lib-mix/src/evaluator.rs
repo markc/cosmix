@@ -2966,6 +2966,7 @@ pub(crate) const INLINE_SPECIAL_FORMS: &[&str] = &[
     "publish",
     "serve_name",
     "script_version",
+    "is_reload_candidate",
     "fs_watch",
     "fs_unwatch",
     "fs_wait",
@@ -2978,6 +2979,21 @@ pub(crate) const INLINE_SPECIAL_FORMS: &[&str] = &[
     "audio_watch",
     "audio_unwatch",
     "audio_state",
+    // Socket subscriptions (ws_on/tcp_on/ws_unwatch/tcp_unwatch) are
+    // evaluator-special; ws_recv/tcp_recv/tcp_recv_line/ws_send/tcp_send
+    // are hybrids: the string-source Class C recv form is intercepted by
+    // the inline arm, and in a Class C async body (read permit held) the
+    // NUMERIC forms pull non-blocking (recv) or await the owner thread's
+    // completion receipt (send on a subscribed handle) instead of running
+    // call_builtin's blocking sync client path — which stays the path for
+    // Class S and plain evaluation.
+    "ws_on",
+    "tcp_on",
+    "ws_unwatch",
+    "tcp_unwatch",
+    "ws_recv",
+    "tcp_recv",
+    "tcp_recv_line",
 ];
 
 /// Per-evaluator capability gate for the builtin table (the capability
@@ -3140,6 +3156,14 @@ pub const EXPR_MODE_DENIED_BUILTINS: &[&str] = &[
     "write_stderr",
     "print_raw",
     "eprint_raw",
+    // Native socket subscriptions: threads owned by the evaluator
+    // generation. ws_recv/tcp_recv/tcp_recv_line stay allowed BY NAME —
+    // their numeric-handle path is the pre-existing sync client form, and
+    // a string source can only exist where ws_on/tcp_on created it.
+    "ws_on",
+    "tcp_on",
+    "ws_unwatch",
+    "tcp_unwatch",
 ];
 
 /// Evaluate exactly one Mix expression with preset globals, an optional
@@ -5093,6 +5117,22 @@ pub(crate) struct EvaluatorGlobals {
     /// `notify_one` stores at most one permit, so a fire that races ahead
     /// of the `notified()` await is not lost.
     quit_notify: Arc<tokio::sync::Notify>,
+    /// True only while this evaluator is a hot-reload candidate executing
+    /// its init body (see [`Evaluator::set_reload_candidate`] and the
+    /// `is_reload_candidate()` builtin). False for the initial boot, plain
+    /// scripts and every committed generation — the serve driver clears it
+    /// before the swap commits.
+    reload_candidate: bool,
+    /// Exactly-once guard for [`Evaluator::queue_lifecycle_commit`]: one
+    /// commit event per generation, refused if a second injection is
+    /// attempted.
+    lifecycle_commit_queued: bool,
+    /// Runtime-synthesized local events (the post-swap `lifecycle.commit`).
+    /// Dispatched by [`Evaluator::run_event_pump`] at the top of every loop
+    /// iteration, BEFORE any transport wait — a local commit must not depend
+    /// on the Bus connection and survives broker loss. Dropped with the
+    /// evaluator on shutdown (drain/close owns the cleanup).
+    pending_local: std::collections::VecDeque<IncomingEvent>,
     /// Exit requested from a serve handler activation. Handler errors are
     /// normally isolated, and Class C activations run in spawned local tasks,
     /// so they cannot return `ExitRequest` directly to the event pump. The
@@ -5192,6 +5232,9 @@ impl EvaluatorGlobals {
             interrupted: Arc::new(AtomicBool::new(false)),
             quit_requested: Arc::new(AtomicBool::new(false)),
             quit_notify: Arc::new(tokio::sync::Notify::new()),
+            reload_candidate: false,
+            lifecycle_commit_queued: false,
+            pending_local: std::collections::VecDeque::new(),
             exit_requested: None,
             reload_requested: false,
             trace: false,
@@ -5896,6 +5939,63 @@ impl Evaluator {
         self.globals.borrow_mut().serve_runtime = Some(runtime);
     }
 
+    /// Mark this evaluator as a hot-reload candidate while its init body
+    /// executes (SPEC 18 RELOAD, post-commit handover). The serve driver
+    /// sets this on the replacement evaluator BEFORE `execute()` and clears
+    /// it once the init body returned — so `is_reload_candidate()` is true
+    /// exactly during candidate preparation, and false for the initial boot,
+    /// plain scripts and every committed generation.
+    pub fn set_reload_candidate(&mut self, candidate: bool) {
+        self.globals.borrow_mut().reload_candidate = candidate;
+    }
+
+    /// Queue the one post-swap `lifecycle.commit` event for this generation.
+    ///
+    /// Called by the serve driver AFTER the swap has committed: the old
+    /// evaluator's managed children were reaped (`close_native_events`), the
+    /// shared identity was bumped (`committed_reload`), and the legacy
+    /// `die_with_parent` children of earlier generations were swept — so a
+    /// handler that starts behaviour here can never overlap the old
+    /// generation's children.
+    ///
+    /// The event is a LOCAL queue injection, not a Bus self-emit: it is
+    /// dispatched by the pump independent of the broker connection, it is
+    /// never visible to other citizens, and an external caller cannot spoof
+    /// it (the serve runtime refuses a wire-delivered `lifecycle.commit`).
+    /// Exactly-once per generation: a second call is a programming error and
+    /// is refused. The event carries `{generation}` — the identity's
+    /// post-bump generation — as `$event.args.generation`.
+    ///
+    /// Contract: call this only BEFORE this evaluator's pump enters its
+    /// transport wait (the serve driver queues immediately after the swap,
+    /// before `run_event_pump` resumes), so no wake mechanism is needed;
+    /// shutdown between queueing and dispatch simply drops the event with
+    /// the evaluator — durable intent re-derives it on the next boot.
+    pub fn queue_lifecycle_commit(&mut self, generation: u64) {
+        let mut g = self.globals.borrow_mut();
+        if g.lifecycle_commit_queued {
+            tracing::error!(
+                generation,
+                "serve: duplicate lifecycle.commit injection refused (one per generation)"
+            );
+            return;
+        }
+        g.lifecycle_commit_queued = true;
+        g.pending_local.push_back(IncomingEvent {
+            command: "lifecycle.commit".to_string(),
+            headers: std::collections::BTreeMap::new(),
+            body: serde_json::json!({ "generation": generation }).to_string(),
+        });
+    }
+
+    /// This evaluator generation's owner id for the process-global legacy
+    /// child registry (`builtins::owned_spawns`): the serve driver sweeps
+    /// `sweep_owned_except(owner)` at a committed swap and
+    /// `sweep_owned_by(owner)` when a candidate is discarded.
+    pub fn native_owner_id(&self) -> u64 {
+        self.globals.borrow().native_events.owner_id()
+    }
+
     /// Retire this generation only AFTER its handler drain. Also called on a
     /// rejected reload candidate; queued records can never enter its successor.
     pub fn close_native_events(&mut self) {
@@ -6583,6 +6683,22 @@ impl Evaluator {
                     g.quit_requested.store(false, Ordering::Relaxed);
                     break "quit";
                 }
+            }
+
+            // Runtime-synthesized local events (the post-swap
+            // `lifecycle.commit`) dispatch BEFORE any transport wait: a
+            // local commit must not depend on the broker connection and is
+            // processed even with no Bus handler or native sources (broker
+            // loss, isolated bootstrap). Exactly one is queued per
+            // committed reload; a shutdown before dispatch drops it with
+            // the evaluator — durable intent re-derives it on the next boot.
+            let local = self.globals.borrow_mut().pending_local.pop_front();
+            if let Some(ev) = local {
+                self.dispatch_event(ev).await?;
+                if self.globals.borrow().handlers.is_empty() {
+                    break "handlers_drained";
+                }
+                continue;
             }
 
             // Await next incoming message. Cancellation safety: the
@@ -12661,6 +12777,304 @@ impl Evaluator {
         }
     }
 
+    /// Keep socket receive state out of the recursive expression future.
+    fn eval_socket<'a>(&'a mut self, name: &'a str, args: &'a [Value]) -> std::pin::Pin<Box<dyn std::future::Future<Output = MixResult<Option<Value>>> + 'a>> {
+        Box::pin(async move {
+            if let Some(result) = self.eval_socket_source(name, args).await? {
+                return Ok(Some(result));
+            }
+            #[cfg(all(feature = "ws", unix))]
+            return self.eval_numeric_socket(name, args).await;
+            #[cfg(not(all(feature = "ws", unix)))]
+            Ok(None)
+        })
+    }
+
+    #[cfg(all(feature = "ws", unix))]
+    fn eval_numeric_socket<'a>(&'a mut self, name: &'a str, eval_args: &'a [Value]) -> std::pin::Pin<Box<dyn std::future::Future<Output = MixResult<Option<Value>>> + 'a>> {
+        Box::pin(async move {
+                        if matches!(
+                            name,
+                            "ws_recv" | "tcp_recv" | "tcp_recv_line" | "ws_send" | "tcp_send"
+                        ) && (self.ctx.class_c_read_permit.is_some()
+                            || matches!(name, "ws_send" | "tcp_send"))
+                            && matches!(eval_args.first(), Some(Value::Number(_)))
+                            && let Ok(id) = crate::builtins::socket_sources::client_id_of(
+                                eval_args.first(),
+                                name,
+                            )
+                        {
+                            // (family, id): ws_connect and tcp_connect count
+                            // ids independently, so the same number is two
+                            // different connections.
+                            let key = crate::builtins::socket_sources::ClientKey::of(name, id);
+                            let is_send = matches!(name, "ws_send" | "tcp_send");
+                            if !is_send && self.ctx.class_c_read_permit.is_some()
+                                && !crate::builtins::socket_sources::is_subscribed(key) {
+                                self.check_capability(name)?;
+                                self.check_builtin_arity(name, eval_args.len())?;
+                                let (timeout_seconds, max) =
+                                    crate::builtins::socket_sources::parse_source_recv_opts(
+                                        name,
+                                        eval_args.get(1),
+                                        65536,
+                                    )?;
+                                let guard =
+                                    crate::builtins::socket_sources::pull_conn(name, id)?;
+                                // Keep the native receive buffer out of the
+                                // recursive evaluator future's inline state.
+                                let fut = Box::pin(crate::builtins::socket_sources::pull_recv(
+                                    name, guard,
+                                    timeout_seconds, max,
+                                ));
+                                return self.await_with_class_c_yield(fut).await?.map(Some);
+                            }
+                            if is_send && crate::builtins::socket_sources::is_subscribed(key) {
+                                self.check_capability(name)?;
+                                self.check_builtin_arity(name, eval_args.len())?;
+                                let payload: Option<Vec<u8>> = match &eval_args[1] {
+                                    Value::String(s) => Some(s.as_bytes().to_vec()),
+                                    Value::Bytes(b) => Some(b.to_vec()),
+                                    Value::Buffer(b) => Some(b.borrow().clone()),
+                                    _ => None,
+                                };
+                                if let Some(payload) = payload {
+                                    let ws = name == "ws_send";
+                                    let rx = if ws {
+                                        crate::builtins::socket_sources::send_ws(
+                                            id,
+                                            matches!(&eval_args[1], Value::String(_)),
+                                            payload,
+                                        )?
+                                    } else {
+                                        crate::builtins::socket_sources::send_tcp(id, payload)?
+                                    };
+                                    let fut = async move {
+                                        match rx.await {
+                                            Ok(Ok(n)) => Ok(if ws {
+                                                Value::Nil
+                                            } else {
+                                                Value::Number(n as f64)
+                                            }),
+                                            Ok(Err((code, message))) => {
+                                                Err(crate::native_events::refusal(&code, message))
+                                            }
+                                            Err(_) => Err(crate::native_events::refusal(
+                                                "SOCKET_SEND_CLOSED",
+                                                "the socket source was closed before the send completed",
+                                            )),
+                                        }
+                                    };
+                                    return self.await_with_class_c_yield(fut).await?.map(Some);
+                                }
+                            }
+                        }
+            Ok(None)
+        })
+    }
+
+    /// Own socket source futures separately from recursive evaluation.
+    fn eval_socket_source<'a>(&'a mut self, name: &'a str, eval_args: &'a [Value]) -> std::pin::Pin<Box<dyn std::future::Future<Output = MixResult<Option<Value>>> + 'a>> {
+        Box::pin(async move {
+                    if matches!(name, "ws_on" | "tcp_on" | "ws_unwatch" | "tcp_unwatch") {
+                        self.check_capability(name)?;
+                        self.check_builtin_arity(name, eval_args.len())?;
+                        #[cfg(not(feature = "ws"))]
+                        {
+                            return Err(crate::native_events::refusal(
+                                "WS_FEATURE",
+                                format!("{name}() requires the `ws` feature (tungstenite/rustls)"),
+                            ));
+                        }
+                        #[cfg(feature = "ws")]
+                        {
+                            let mut g = self.globals.borrow_mut();
+                            let ne = &mut g.native_events;
+                            return match name {
+                                "ws_on" | "tcp_on" => {
+                                    let id = crate::builtins::socket_sources::client_id_of(
+                                        eval_args.first(),
+                                        name,
+                                    )?;
+                                    let command = crate::builtins::socket_sources::event_command_of(
+                                        eval_args.get(1),
+                                        name,
+                                    )?;
+                                    let h = if name == "ws_on" {
+                                        ne.ws_on(id, command)?
+                                    } else {
+                                        let mode = crate::builtins::socket_sources::parse_tcp_on_opts(
+                                            eval_args.get(2),
+                                        )?;
+                                        ne.tcp_on(id, command, mode)?
+                                    };
+                                    Ok(Value::String(h))
+                                }
+                                "ws_unwatch" | "tcp_unwatch" => {
+                                    let family = if name == "ws_unwatch" { "ws" } else { "tcp" };
+                                    let Some(Value::String(h)) = eval_args.first() else {
+                                        return Err(crate::native_events::refusal(
+                                            "SOCKET_WATCH_ARGUMENT",
+                                            "handle must be the source id string returned by ws_on/tcp_on",
+                                        ));
+                                    };
+                                    ne.socket_unwatch(family, h)?;
+                                    Ok(Value::Nil)
+                                }
+                                _ => unreachable!(),
+                            }.map(Some);
+                        }
+                    }
+                    if matches!(name, "ws_recv" | "tcp_recv" | "tcp_recv_line")
+                        && matches!(eval_args.first(), Some(Value::String(_)))
+                    {
+                        self.check_capability(name)?;
+                        self.check_builtin_arity(name, eval_args.len())?;
+                        // Without the `ws` feature this arm falls through to
+                        // call_builtin, whose loud refusal covers the name.
+                        #[cfg(feature = "ws")]
+                        {
+                            let h = match eval_args.first() {
+                                Some(Value::String(s)) => s.clone(),
+                                _ => unreachable!("guarded by the string-argument match"),
+                            };
+                            if self.globals.borrow().serve_runtime.is_some()
+                                || self.globals.borrow().native_events.pumping()
+                            {
+                                return Err(crate::native_events::refusal(
+                                    "SOCKET_RECV_SERVE",
+                                    format!(
+                                        "{name}() on a socket source is unavailable in serve mode; use `on <command>`"
+                                    ),
+                                ));
+                            }
+                            let expect = if name == "ws_recv" {
+                                crate::builtins::socket_sources::KIND_WS
+                            } else if name == "tcp_recv" {
+                                crate::builtins::socket_sources::KIND_TCP_BYTES
+                            } else {
+                                crate::builtins::socket_sources::KIND_TCP_LINE
+                            };
+                            let (timeout_seconds, max) =
+                                crate::builtins::socket_sources::parse_source_recv_opts(
+                                    name,
+                                    eval_args.get(1),
+                                    65536,
+                                )?;
+                            // Frame boundaries survive: only tcp_recv (a raw
+                            // byte stream) may slice a queued chunk; ws
+                            // messages and tcp lines are delivered whole.
+                            let max = if name == "tcp_recv" { max } else { usize::MAX };
+                            // One parked recv per source; the guard clears the
+                            // slot when this future completes OR is cancelled
+                            // (a Class C task abort drops it).
+                            let (queue, _park) = {
+                                let mut g = self.globals.borrow_mut();
+                                let guard = g.native_events.park_socket(&h)?;
+                                (g.native_events.queue.clone(), guard)
+                            };
+                            let h_for_err = h.clone();
+                            let next = async move {
+                                if timeout_seconds == 0.0 {
+                                    queue.next_socket(&h, expect, max).await
+                                } else {
+                                    match tokio::time::timeout(
+                                        std::time::Duration::from_secs_f64(timeout_seconds),
+                                        queue.next_socket(&h, expect, max),
+                                    )
+                                    .await
+                                    {
+                                        Ok(outcome) => outcome,
+                                        // Timeout: nil keeps the source usable.
+                                        Err(_) => Ok(crate::native_events::SocketNext::Idle),
+                                    }
+                                }
+                            };
+                            let out = self.await_with_class_c_yield(next).await??;
+                            return match out {
+                                crate::native_events::SocketNext::Idle => Ok(Value::Nil),
+                                crate::native_events::SocketNext::Frame(rec) => match rec.kind {
+                                    "text" | "line" => Ok(Value::String(
+                                        String::from_utf8_lossy(&rec.data).into_owned(),
+                                    )),
+                                    _ => Ok(Value::bytes(rec.data)),
+                                },
+                                crate::native_events::SocketNext::Closed(closed) => {
+                                    Err(crate::native_events::refusal(
+                                        "SOCKET_CLOSED",
+                                        format!("{name}(): source {h_for_err} closed: {closed}"),
+                                    ))
+                                }
+                            }.map(Some);
+                        }
+                    }
+            Ok(None)
+        })
+    }
+
+    /// Native source waits share one evaluator suspension site.
+    fn eval_native_source<'a>(&'a mut self, name: &'a str, eval_args: &'a [Value]) -> std::pin::Pin<Box<dyn std::future::Future<Output = MixResult<Option<Value>>> + 'a>> {
+        Box::pin(async move {
+                    if matches!(name, "fs_watch" | "fs_unwatch" | "fs_wait") {
+                        self.check_capability(name)?;
+                        self.check_builtin_arity(name, eval_args.len())?;
+                        let Some(Value::String(arg)) = eval_args.first() else {
+                            return Err(crate::native_events::refusal("FS_WATCH_ARGUMENT", "path/handle must be a string"));
+                        };
+                        if name == "fs_watch" {
+                            let opts = crate::fs_watch::Options::parse(eval_args.get(1))?;
+                            let h = self.globals.borrow_mut().native_events.watch(arg, opts)?;
+                            return Ok(Some(Value::String(h)));
+                        }
+                        if name == "fs_unwatch" {
+                            self.globals.borrow_mut().native_events.unwatch(arg)?;
+                            return Ok(Some(Value::Nil));
+                        }
+                        if self.globals.borrow().serve_runtime.is_some()
+                            || self.globals.borrow().native_events.pumping() {
+                            return Err(crate::native_events::refusal("FS_WAIT_SERVE", "fs_wait is unavailable in serve mode; use on fs.changed"));
+                        }
+                        let queue = self.globals.borrow().native_events.queue.clone();
+                        let ev = self.await_with_class_c_yield(queue.next(Some(arg))).await??;
+                        return Ok(Some(parse_event_args(&ev.body)));
+                    }
+                    if matches!(name, "net_watch" | "net_unwatch" | "net_state"
+                        | "audio_watch" | "audio_unwatch" | "audio_state") {
+                        self.check_capability(name)?;
+                        self.check_builtin_arity(name, eval_args.len())?;
+                        return match name {
+                            "net_watch" => {
+                                let groups = crate::desktop_events::net_groups(eval_args.first())?;
+                                let h = self.globals.borrow_mut().native_events.net_watch(groups)?;
+                                Ok(Value::String(h))
+                            }
+                            "audio_watch" => {
+                                let opts = crate::desktop_events::AudioOptions::parse(eval_args.first(), true)?;
+                                let h = self.globals.borrow_mut().native_events.audio_watch(opts)?;
+                                Ok(Value::String(h))
+                            }
+                            "net_unwatch" | "audio_unwatch" => {
+                                let family = if name == "net_unwatch" { "net" } else { "audio" };
+                                let Some(Value::String(h)) = eval_args.first() else {
+                                    return Err(crate::native_events::refusal(
+                                        &format!("{}_WATCH_ARGUMENT", family.to_uppercase()),
+                                        "handle must be a string",
+                                    ));
+                                };
+                                self.globals.borrow_mut().native_events.source_unwatch(family, h)?;
+                                Ok(Value::Nil)
+                            }
+                            "net_state" => Ok(crate::native_events::json_value(crate::desktop_events::net_state()?)),
+                            _ => {
+                                let opts = crate::desktop_events::AudioOptions::parse(eval_args.first(), false)?;
+                                Ok(crate::native_events::json_value(crate::desktop_events::audio_state(&opts)?))
+                            }
+                        }.map(Some);
+                    }
+            self.eval_socket(name, eval_args).await
+        })
+    }
+
     fn eval_expr<'a>(
         &'a mut self,
         expr: &'a Expr,
@@ -12939,61 +13353,9 @@ impl Evaluator {
                             }
                         };
                     }
-                    if matches!(name.as_str(), "fs_watch" | "fs_unwatch" | "fs_wait") {
-                        self.check_capability(name)?;
-                        self.check_builtin_arity(name, eval_args.len())?;
-                        let Some(Value::String(arg)) = eval_args.first() else {
-                            return Err(crate::native_events::refusal("FS_WATCH_ARGUMENT", "path/handle must be a string"));
-                        };
-                        if name == "fs_watch" {
-                            let opts = crate::fs_watch::Options::parse(eval_args.get(1))?;
-                            let h = self.globals.borrow_mut().native_events.watch(arg, opts)?;
-                            return Ok(Value::String(h));
-                        }
-                        if name == "fs_unwatch" {
-                            self.globals.borrow_mut().native_events.unwatch(arg)?;
-                            return Ok(Value::Nil);
-                        }
-                        if self.globals.borrow().serve_runtime.is_some()
-                            || self.globals.borrow().native_events.pumping() {
-                            return Err(crate::native_events::refusal("FS_WAIT_SERVE", "fs_wait is unavailable in serve mode; use on fs.changed"));
-                        }
-                        let queue = self.globals.borrow().native_events.queue.clone();
-                        let ev = self.await_with_class_c_yield(queue.next(Some(arg))).await??;
-                        return Ok(parse_event_args(&ev.body));
-                    }
-                    if matches!(name.as_str(), "net_watch" | "net_unwatch" | "net_state"
-                        | "audio_watch" | "audio_unwatch" | "audio_state") {
-                        self.check_capability(name)?;
-                        self.check_builtin_arity(name, eval_args.len())?;
-                        return match name.as_str() {
-                            "net_watch" => {
-                                let groups = crate::desktop_events::net_groups(eval_args.first())?;
-                                let h = self.globals.borrow_mut().native_events.net_watch(groups)?;
-                                Ok(Value::String(h))
-                            }
-                            "audio_watch" => {
-                                let opts = crate::desktop_events::AudioOptions::parse(eval_args.first(), true)?;
-                                let h = self.globals.borrow_mut().native_events.audio_watch(opts)?;
-                                Ok(Value::String(h))
-                            }
-                            "net_unwatch" | "audio_unwatch" => {
-                                let family = if name == "net_unwatch" { "net" } else { "audio" };
-                                let Some(Value::String(h)) = eval_args.first() else {
-                                    return Err(crate::native_events::refusal(
-                                        &format!("{}_WATCH_ARGUMENT", family.to_uppercase()),
-                                        "handle must be a string",
-                                    ));
-                                };
-                                self.globals.borrow_mut().native_events.source_unwatch(family, h)?;
-                                Ok(Value::Nil)
-                            }
-                            "net_state" => Ok(crate::native_events::json_value(crate::desktop_events::net_state()?)),
-                            _ => {
-                                let opts = crate::desktop_events::AudioOptions::parse(eval_args.first(), false)?;
-                                Ok(crate::native_events::json_value(crate::desktop_events::audio_state(&opts)?))
-                            }
-                        };
+                    if matches!(name.as_str(), "fs_watch" | "fs_unwatch" | "fs_wait" | "net_watch" | "net_unwatch" | "net_state" | "audio_watch" | "audio_unwatch" | "audio_state" | "ws_on" | "tcp_on" | "ws_unwatch" | "tcp_unwatch" | "ws_recv" | "tcp_recv" | "tcp_recv_line" | "ws_send" | "tcp_send")
+                        && let Some(result) = self.eval_native_source(name, &eval_args).await? {
+                        return Ok(result);
                     }
                     if name == "spawn" && matches!(eval_args.first(), Some(Value::List(_))) {
                         self.check_capability(name)?;
@@ -13167,6 +13529,20 @@ impl Evaluator {
                                         children: g.handlers.contains_key("proc.exited"),
                                         net: g.handlers.contains_key("net.changed"),
                                         audio: g.handlers.contains_key("audio.changed"),
+                                        // Socket commands are caller-chosen, so
+                                        // the family gate is source presence
+                                        // (a live reader or undelivered
+                                        // records), not a handler-name lookup.
+                                        sockets: {
+                                            #[cfg(feature = "ws")]
+                                            {
+                                                !g.native_events.sockets.is_empty()
+                                            }
+                                            #[cfg(not(feature = "ws"))]
+                                            {
+                                                false
+                                            }
+                                        },
                                     }
                                 };
                                 let outcome: SleepOutcome = tokio::select! {
@@ -13808,6 +14184,30 @@ impl Evaluator {
                             } else {
                                 None
                             };
+                        // Class C numeric socket verbs (`ws` feature). A
+                        // Class C async body holds a read permit and must
+                        // not block on socket I/O: numeric ws_recv/
+                        // tcp_recv/tcp_recv_line become a cancel-safe
+                        // non-blocking pull (the conn leaves the registry
+                        // for the duration, at most one waiter per
+                        // (family, id) handle — ws and tcp ids count
+                        // independently — never shared with the
+                        // subscription event pump), and ws_send/tcp_send
+                        // on a SUBSCRIBED handle route through the owner
+                        // thread's command endpoint and await the
+                        // completion receipt. The pull's AsyncFd
+                        // readiness await is unix-only: on other targets
+                        // this whole arm is compiled out and the sync
+                        // builtin runs instead — honest Class S blocking
+                        // semantics, never a silently claimed yield. All
+                        // Subscribed sends also await receipts for Class S,
+                        // retaining its writer permit. This keeps its serial
+                        // dispatch semantics without blocking Tokio's reactor.
+                        // Other cases — ordinary Class S receives, unknown
+                        // handles, recv on a subscribed handle, a
+                        // non-payload send argument — fall through to the
+                        // sync builtin unchanged (which refuses recv on
+                        // subscribed handles deterministically).
                         if let Some(result) = builtins::call_builtin(name, eval_args.clone())
                             .map_err(|e| self.snapshot_builtin_error(name, e))?
                         {
@@ -13977,6 +14377,18 @@ impl Evaluator {
                         return Ok(runtime
                             .and_then(|rt| rt.service_name().map(|s| Value::String(s.to_string())))
                             .unwrap_or(Value::Nil));
+                    }
+
+                    // is_reload_candidate() — true only while THIS evaluator
+                    // is a hot-reload candidate executing its init body (set
+                    // by the serve driver around the replacement's execute;
+                    // cleared before the swap commits). False in a plain
+                    // script, the initial boot and committed generations, so
+                    // a loader branches its top-level on it: candidate =
+                    // passive preparation, anything else = full boot.
+                    if name == "is_reload_candidate" {
+                        self.check_capability(name)?; // Knob A
+                        return Ok(Value::Bool(self.globals.borrow().reload_candidate));
                     }
 
                     // script_version() — the entry script's provenance map,

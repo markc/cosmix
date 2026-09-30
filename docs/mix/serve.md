@@ -631,6 +631,45 @@ bad edit can do is a logged revert. Things to know:
 - Like every reserved verb, an author `on RELOAD` handler is unreachable
   and filtered from `HELP`.
 
+### Post-commit handover — `is_reload_candidate()` and `lifecycle.commit`
+
+For a citizen that owns children (a loader), "swap on success" alone is not
+a handover: the old generation's children must be retired BEFORE the new
+generation starts its own, and a failed candidate must leave them running.
+The runtime provides three pieces, and a loader adopts them together:
+
+- **`is_reload_candidate()`** is true only while the replacement's top-level
+  executes (false at initial boot, in plain scripts, and in every committed
+  generation). The candidate must prepare passive state — read and
+  validate, no starts, no spawns, no stopping old behaviour, no persisted
+  writes. A raise reverts to the old evaluator, its state and children
+  intact.
+- **Children are retired before the new behaviour starts.** Managed
+  children (`spawn {exit_event:true}`) live in their evaluator's registry:
+  a failed candidate does not terminate the old generation's, and the
+  committed swap kills and reaps them synchronously before the new pump
+  starts. Legacy `die_with_parent` children (without `exit_event`) are
+  retired per evaluator generation: the committed swap sweeps every owner
+  except the new evaluator's, and a discarded candidate sweeps exactly its
+  own. A candidate that spawns such a helper at init therefore cannot take
+  the old helper's port until the swap commits — move init-time spawns
+  into the commit hook, or use `exit_event:true`.
+- **`on lifecycle.commit`** runs exactly once per committed swap. The serve
+  driver queues it locally after the old evaluator's drain, the child
+  reaping and the `lifecycle.generation` bump; the pump dispatches it
+  independent of the broker connection, so it survives broker loss. The
+  event carries the committed generation as `$event.args.generation`. It
+  is a runtime-native hook: a wire-delivered `lifecycle.commit` is refused
+  (`rc 10`) before any author handler and is filtered from `HELP`, so an
+  external caller cannot run commit behaviour ahead of or behind the real
+  commit. A raising hook is an isolated handler fault — recorded in
+  `lifecycle.handler_faults`, the citizen keeps serving, and recovery is
+  the loader's own business (durable intent plus its restart/reconnect
+  reconciliation). A shutdown that lands between the queue and the
+  dispatch drops the event with the evaluator; the loader re-derives it
+  from durable state on the next boot. There is no rollback after
+  retirement: once the swap commits, the old generation is gone.
+
 ## Supervision, reconnect, and shutdown
 
 Serve mode wraps the pump in a supervised client, so the citizen behaves like a

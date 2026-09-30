@@ -15,7 +15,6 @@ export SCENES_LIB = env("SCENES_LIB", $TEMPLATES .. "/lib")
 $HOST = env("SCENE_HOST", "shell")
 $ME = serve_name()
 if $ME == nil then raise("SCENES_SERVE", "start scenes with mix --serve", {}) end
-$loader.check_loader_epoch(env("SCENES_LOADER_PROCESS"), pid())
 mkdir($ROOT)
 if not stat($ROOT, {follow_symlinks:false}).is_dir then raise("SCENES_FILES", "scene root must be a real directory", {}) end
 if not flock($ROOT .. "/.loader.lock") then raise("SCENES_LOCKED", "another loader owns this scenes directory", {}) end
@@ -140,6 +139,31 @@ on proc.exited
   if $e != nil and $e.enabled and contains(["backoff", "handover"], $e.status) then
     task_start("scenes.restart", json_encode({name:$name, generation:$e.generation}))
   end
+end
+
+-- The runtime's post-swap handover (SPEC 18 hot-reload). Native-only: the
+-- serve driver queues it locally exactly once per committed generation,
+-- AFTER the old managed children were reaped and the old generation's
+-- legacy children swept — so behaviour starts here can never overlap the
+-- old generation. A wire-arrived `lifecycle.commit` is refused by the
+-- runtime, so no external caller can run this before or after the real
+-- commit. Durable desired state (state.conf.mix + .generation) is the only
+-- copy of intent: a fault here is a diagnostic plus the existing
+-- restart/reconnect reconciliation; a missed hook (crash between swap and
+-- dispatch) is re-derived on the next boot.
+on lifecycle.commit
+  if len(keys($event.headers)) != 0 then return end
+  $state.reload_generation = ($event.args ?? {}).generation
+  try
+    -- A full reconcile from durable desired state, then the boot path's
+    -- service reconciliation: mount accepted content, start each enabled
+    -- behaviour exactly once (fresh generations, no retiring tombstones).
+    $state = $loader.rescan($state, true)
+    $state = refresh_services($state, true)
+  catch $message, $error
+    $state.diagnostic = {error_code:$error.code, message:$message, context:$error.details}
+  end
+  $state = $loader.changed($state)
 end
 
 -- One local task: the async phase only waits, then the synchronous phase
@@ -296,12 +320,25 @@ end
 
 -- Defer removing this parent watch: it observes root replacement and shares
 -- the evaluator's inotify instance, so it costs no extra fd or worker.
+-- Watches and subscriptions are per-generational resources: a candidate that
+-- reverts drops its own with its discarded evaluator (the old generation's
+-- stay active), and a committed swap inherits the candidate's. They are
+-- established on both paths so a committed generation always has them; the
+-- reconcile below is the only boot work the candidate defers to the commit.
 $PARENT_WATCH = fs_watch(dirname($ROOT), {recursive:false, events:["created", "modified", "deleted", "moved"]})
 $WATCH = fs_watch($ROOT, {recursive:true, events:["created", "modified", "deleted", "moved"]})
 subscribe("noded.props.changed")
 subscribe($HOST .. ".panel.changed")
 subscribe($HOST .. ".scene.changed")
-$state = $loader.rescan($state, false)
-$state = refresh_services($state, false)
-$state = $loader.changed($state)
-export SCENES_LOADER_PROCESS = to_string(pid())
+if is_reload_candidate() then
+  -- Passive handover preparation: read and validate only — no mounts, no
+  -- behaviour starts, no persisted writes, no recovery-record mutation, no
+  -- Bus RPCs. The still-running old generation keeps serving if this raises
+  -- (a refusal reverts the reload with its children intact). Everything
+  -- that has side effects runs in the lifecycle.commit handler above.
+  $state = $loader.prepare_reload($state)
+else
+  $state = $loader.rescan($state, false)
+  $state = refresh_services($state, false)
+  $state = $loader.changed($state)
+end

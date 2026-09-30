@@ -942,6 +942,44 @@ subscription idempotent on the handler side).</li>
 <li>Like every reserved verb, an author <code>on RELOAD</code> handler is unreachable
 and filtered from <code>HELP</code>.</li>
 </ul>
+<h3 id="post-commit-handover--is_reload_candidate-and-lifecyclecommit">Post-commit handover — <code>is_reload_candidate()</code> and <code>lifecycle.commit</code></h3>
+<p>For a citizen that owns children (a loader), "swap on success" alone is not
+a handover: the old generation's children must be retired BEFORE the new
+generation starts its own, and a failed candidate must leave them running.
+The runtime provides three pieces, and a loader adopts them together:</p>
+<ul>
+<li><strong><code>is_reload_candidate()</code></strong> is true only while the replacement's top-level
+executes (false at initial boot, in plain scripts, and in every committed
+generation). The candidate must prepare passive state — read and
+validate, no starts, no spawns, no stopping old behaviour, no persisted
+writes. A raise reverts to the old evaluator, its state and children
+intact.</li>
+<li><strong>Children are retired before the new behaviour starts.</strong> Managed
+children (<code>spawn {exit_event:true}</code>) live in their evaluator's registry:
+a failed candidate does not terminate the old generation's, and the
+committed swap kills and reaps them synchronously before the new pump
+starts. Legacy <code>die_with_parent</code> children (without <code>exit_event</code>) are
+retired per evaluator generation: the committed swap sweeps every owner
+except the new evaluator's, and a discarded candidate sweeps exactly its
+own. A candidate that spawns such a helper at init therefore cannot take
+the old helper's port until the swap commits — move init-time spawns
+into the commit hook, or use <code>exit_event:true</code>.</li>
+<li><strong><code>on lifecycle.commit</code></strong> runs exactly once per committed swap. The serve
+driver queues it locally after the old evaluator's drain, the child
+reaping and the <code>lifecycle.generation</code> bump; the pump dispatches it
+independent of the broker connection, so it survives broker loss. The
+event carries the committed generation as <code>$event.args.generation</code>. It
+is a runtime-native hook: a wire-delivered <code>lifecycle.commit</code> is refused
+(<code>rc 10</code>) before any author handler and is filtered from <code>HELP</code>, so an
+external caller cannot run commit behaviour ahead of or behind the real
+commit. A raising hook is an isolated handler fault — recorded in
+<code>lifecycle.handler_faults</code>, the citizen keeps serving, and recovery is
+the loader's own business (durable intent plus its restart/reconnect
+reconciliation). A shutdown that lands between the queue and the
+dispatch drops the event with the evaluator; the loader re-derives it
+from durable state on the next boot. There is no rollback after
+retirement: once the swap commits, the old generation is gone.</li>
+</ul>
 <h2 id="supervision-reconnect-and-shutdown">Supervision, reconnect, and shutdown</h2>
 <p>Serve mode wraps the pump in a supervised client, so the citizen behaves like a
 proper daemon across broker churn:</p>

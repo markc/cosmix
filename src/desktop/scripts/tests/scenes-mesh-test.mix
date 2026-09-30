@@ -41,4 +41,12 @@ for each $case in $cases
     raise("SCENES_MESH_TEST", "local and mesh editor-verb refusal differ", {verb:$case[0], expected:$case[2], local:$a, remote:$b})
   end
 end
-print("PASS scenes local/attested-mesh list, templates and all mutation refusals")
+-- lifecycle.commit is the runtime's native post-swap hook, never an ABP
+-- verb: an external caller — even one arriving over an attested mesh
+-- route — must be refused before any loader behaviour can run ahead of or
+-- behind the real commit. The runtime's own injection bypasses the wire.
+for each $target in [$local, $remote]
+  $r = call($target, "lifecycle.commit", {generation:0})
+  if $r.rc == 0 then raise("SCENES_MESH_TEST", "lifecycle.commit was not refused", {target:$target, reply:$r}) end
+end
+print("PASS scenes local/attested-mesh list, templates, all mutation refusals and the native-only lifecycle.commit gate")

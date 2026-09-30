@@ -28,12 +28,50 @@ fn fault($s, $point)
   if contains($s.faults ?? [], $point) then fail("SCENES_FAULT", "injected failure", {point:$point}) end
 end
 
-fn check_loader_epoch($previous, $process)
-  -- Native RELOAD initialises beside the still-running old children and has
-  -- no commit hook. Refuse before side effects; the old evaluator continues.
-  if $previous == to_string($process) then
-    fail("SCENES_RELOAD_RESTART_REQUIRED", "restart the loader process to replace its script; use scenes.reload for a behaviour", {})
+-- Passive hot-reload candidate preparation (the is_reload_candidate()
+-- branch of scenes.mix). Validates everything the committed generation will
+-- need, with NO side effects: no mounts, no behaviour starts, no persisted
+-- writes, no recovery-record mutation — the only Bus traffic is the host's
+-- read-only scene validation, never a load. A raise here reverts the
+-- reload: the old evaluator resumes with its managed children and mounted
+-- content intact.
+--
+-- Only ENABLED scenes are validated: the commit's rescan rebuilds state
+-- from disk, and an enabled scene whose files would not survive the swap
+-- must refuse the swap instead of silently unmounting after it. Disabled or
+-- missing scenes lose nothing and keep boot semantics (load_diagnostic)
+-- for the commit's reconcile.
+fn prepare_reload($s)
+  $s = load_state($s)
+  if not $s.state_ok then
+    fail($s.state_error.error_code, $s.state_error.message, $s.state_error.context)
   end
+  $names = keys($s.scenes)
+  for each $n in $s.desired.enabled
+    if not contains($names, $n) then push($names, $n) end
+  end
+  if is_dir($s.root) then
+    for each $n in ls($s.root)
+      if valid_name($n) and is_dir($s.root .. "/" .. $n) and not contains($names, $n) then push($names, $n) end
+    end
+  end
+  for each $n in $names
+    if $n == "editor" or not contains($s.desired.enabled, $n) then continue end
+    $dir = scene_dir($s, $n)
+    if not is_dir($dir) or not regular($dir .. "/scene.mix") then continue end
+    -- Exactly what the commit's rescan will load, minus the mount/launch:
+    -- document and metadata validation, the behaviour lint gate, and the
+    -- host's own document validation (a validate is a read; the LOAD that
+    -- mounts is the commit's side effect, never the candidate's).
+    $c = candidate($s, $n, $dir)
+    if $c.behaviour_digest != "" then $s.io.check($dir .. "/behaviour.mix", {lint:check_mode($s, $n, $dir)}) end
+    $v = $s.io.rpc($s.host, "shell.scene.validate", $c.source)
+    if type($v) != "map" then fail("SCENES_SNAPSHOT", "missing scene validation receipt", {}) end
+    $s = observe($s, $n, $dir)
+  end
+  -- A reload is not a boot: never re-summon the first-run editor gallery.
+  $s.reload_commit = true
+  return $s
 end
 
 fn bounded_read($path, $cap)
@@ -1462,6 +1500,8 @@ end
 
 fn first_run($s)
   if not $s.first_run_enabled or not $s.state_ok or $s.scenes.editor.dismissed or not needs_setup($s) then return $s end
+  -- A hot-reload commit is not a boot: never re-summon the editor gallery.
+  if $s.reload_commit == true then return $s end
   $response = $s.response
   $rc = $s.rc
   $s = editor_open($s, {view:"gallery", first_run:true})

@@ -161,11 +161,24 @@ name-release event without a timeout loop.
 Each name in a filesystem batch or rescan has its own error boundary,
 so one refused unload does not discard the rest of the batch.
 
-Loader `RELOAD` is refused during candidate initialisation, before filesystem
-or process side effects; the old evaluator continues serving. Restart the
-loader process to update its script. Native Mix currently has no post-commit
-hook for starting replacement children after the old registry retires.
-`scenes.reload {name}` still replaces an individual behaviour normally.
+Loader `RELOAD` is a genuine post-commit handover, not a refusal. The
+candidate branches on `is_reload_candidate()` and prepares passive state:
+it reads and validates the state file and every enabled scene's document,
+metadata and behaviour — local checks plus the host's read-only
+`shell.scene.validate` — and refuses the swap if any of them would not
+survive it. A refused candidate mounts nothing, starts nothing and writes
+nothing; the old evaluator continues serving with its children intact.
+On a successful swap the runtime reaps the old managed children and retires
+the old generation's legacy children BEFORE the commit hook runs, bumps
+`lifecycle.generation`, then queues `on lifecycle.commit` exactly once per
+committed generation: the loader reconciles durable desired state (a full
+rescan plus the service snapshot), mounting accepted content and starting
+each enabled behaviour exactly once, with fresh generation tags so a
+retired generation's `proc.exited` events cannot reach its successors.
+The hook is native-only — a wire-delivered `lifecycle.commit` is refused by
+the runtime — and a fault in it is a diagnostic the existing
+restart/reconnect reconciliation recovers. `scenes.reload {name}` still
+replaces an individual behaviour normally.
 
 Managed spawn uses `{die_with_parent:true,exit_event:true,tag:<JSON string>}`.
 The string encodes `{name,generation}`; `on proc.exited` receives

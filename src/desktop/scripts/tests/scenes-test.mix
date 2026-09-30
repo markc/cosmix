@@ -593,6 +593,8 @@ try
   check($s.scenes.probe.pid != nil and $s.scenes.probe.generation > $e.generation, "reconnect recovers expired backoff without restart event")
   $entry_script = read_file(dirname($0) .. "/../scenes.mix")
   check(not contains($entry_script, "emit $ME scenes.restart_due") and not contains($entry_script, "on proc.exited async") and contains($entry_script, "task_start(\"scenes.restart\""), "synchronous exit bookkeeping starts a local deadline task")
+  check(not contains($entry_script, "SCENES_RELOAD_RESTART_REQUIRED") and not contains($entry_script, "SCENES_LOADER_PROCESS"), "whole-loader reload is adopted: no epoch refusal, no process export")
+  check(contains($entry_script, "on lifecycle.commit") and contains($entry_script, "is_reload_candidate()"), "loader commits behaviour through the native lifecycle.commit hook")
 
   -- #5: pre-existing aliases (including dangling links) never receive writes.
   $recovery_dir = $s.root .. "/.recovery"
@@ -721,15 +723,66 @@ try
   $s = process_exit($s, {pid:$current.pid,tag:{name:"handover",generation:$current.generation},exit_code:0,signal:nil})
   $s = $l.changed($s)
   check($s.scenes.handover == nil, "duplicate removed-scene exit remains harmless and publishable")
-  $refused_reload = false
-  $n = len(calls("launch"))
+  -- Whole-loader reload seam: the candidate (a fresh evaluator generation)
+  -- prepares passive state — no launches, no stops, no loads, no persisted
+  -- writes — and refuses the swap when an enabled scene's files would not
+  -- survive it. The commit path then reconciles durable desired state and
+  -- starts each behaviour exactly once; a retired generation's exit event
+  -- cannot contaminate the successor.
+  $seam_root = $tmp .. "/reload-seam"
+  mkdir($seam_root)
+  install_fixture($seam_root, "probe", true)
+  write_file($seam_root .. "/state.conf.mix", data_encode({schema_version:1, enabled:["probe"], origins:{probe:"probe"}, recovery:{}}, true) .. "\n")
+  -- The seam runs the same commit path the entry script's lifecycle.commit
+  -- handler runs; clear every fault injection a previous section left armed.
+  $host_state.nil_verb = nil
+  $host_state.refuse_verb = nil
+  $host_state.unload_error = nil
+  $host_state.unload_absent = nil
+  $host_state.unload_text = nil
+  $host_state.load_error = nil
+  $host_state.refuse_edge = nil
+  $host_state.rollback_fail = nil
+  $host_state.hosted = nil
+  $host_state.dialog = nil
+  $host_state.panels = {}
+  $before_launch = len(calls("launch"))
+  $before_load = len(calls("shell.scene.load"))
+  $before_stop = len(calls("stop"))
+  $state_bytes = read_file($seam_root .. "/state.conf.mix")
+  $cand = $l.initial($seam_root, $tmp .. "/templates", "test-shell", "test-scenes", $io)
+  $cand.first_run_enabled = false
+  $cand = $l.prepare_reload($cand)
+  check($cand.reload_commit == true, "candidate preparation marks the reload commit")
+  check(len(calls("launch")) == $before_launch and len(calls("stop")) == $before_stop and len(calls("shell.scene.load")) == $before_load, "candidate preparation is passive: no launch, stop or load")
+  check(read_file($seam_root .. "/state.conf.mix") == $state_bytes, "candidate preparation writes nothing")
+  -- An enabled scene the host would refuse must refuse the swap (revert).
+  $good = read_file($seam_root .. "/probe/scene.mix")
+  write_file($seam_root .. "/probe/scene.mix", fixture_source("probe", "BROKEN"))
+  $refused_candidate = false
   try
-    $l.check_loader_epoch(to_string(pid()), pid())
+    $_b = $l.prepare_reload($l.initial($seam_root, $tmp .. "/templates", "test-shell", "test-scenes", $io))
   catch $message, $error
-    $refused_reload = $error.code == "SCENES_RELOAD_RESTART_REQUIRED"
+    $refused_candidate = $error.code == "SCENES_UPSTREAM"
   end
-  check($refused_reload and len(calls("launch")) == $n, "loader hot reload refuses before starting overlapping children")
-  $l.check_loader_epoch("previous-process", pid())
+  write_file($seam_root .. "/probe/scene.mix", $good)
+  check($refused_candidate, "a scene the host refuses rejects the reload candidate")
+  -- The commit path: reconcile durable state, start each behaviour exactly
+  -- once, then fence stale-generation exits from the retired generation.
+  $committed = $l.initial($seam_root, $tmp .. "/templates", "test-shell", "test-scenes", $io)
+  $committed.first_run_enabled = false
+  $committed = $l.prepare_reload($committed)
+  $committed = $l.rescan($committed, true)
+  $committed = $l.services($committed, ["test-shell"], true)
+  $probe_pid = $committed.scenes.probe.pid
+  $probe_gen = $committed.scenes.probe.generation
+  check($probe_pid != nil and $committed.scenes.probe.mounted, "commit mounts and starts the enabled scene once")
+  $after = len(calls("launch"))
+  $committed = $l.rescan($committed, false)
+  $committed = $l.services($committed, ["test-shell"], false)
+  check(len(calls("launch")) == $after, "a second reconcile does not relaunch (starts exactly once per commit)")
+  $committed = $l.exited($committed, {pid:$probe_pid, tag:{name:"probe", generation:$probe_gen - 1}, exit_code:1, signal:nil})
+  check($committed.scenes.probe.pid == $probe_pid and $committed.scenes.probe.status == "starting", "a retired generation's exit cannot contaminate the successor")
 
   -- A failure after issuing stop must still retain its ownership tombstone;
   -- a failure during restart must still consume the old exit exactly once.

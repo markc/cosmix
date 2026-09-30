@@ -799,6 +799,129 @@ async fn test_dispatch_no_handler_is_noop() {
     assert!(!eval.is_dispatching());
 }
 
+// ── SPEC 18 hot-reload post-commit handover: the local lifecycle.commit ──
+
+/// The post-swap `lifecycle.commit` is a LOCAL queue injection: it must
+/// dispatch even with NO Bus handler and NO native sources — a committed
+/// swap whose broker connection is down still runs the hook. Exactly one
+/// event is dispatched per generation (a second injection is refused), and
+/// it carries the identity's generation as `$event.args.generation`.
+#[tokio::test(flavor = "current_thread")]
+async fn queued_lifecycle_commit_dispatches_without_a_broker_connection() {
+    use cosmix_mix::value::Value;
+
+    let source = r#"
+$commits = []
+on lifecycle.commit
+    push($commits, ($event.args ?? {}).generation)
+end
+"#;
+    let mut eval = Evaluator::new();
+    let mut lexer = Lexer::new(source);
+    let stmts = Parser::new(lexer.tokenize().unwrap(), source)
+        .parse_program()
+        .unwrap();
+    eval.execute(&stmts).await.unwrap();
+
+    eval.queue_lifecycle_commit(3);
+    eval.queue_lifecycle_commit(4); // refused: one per generation
+    assert!(
+        matches!(eval.get_global("commits"), Some(Value::List(ref l)) if l.is_empty()),
+        "queueing alone must not dispatch"
+    );
+
+    // The pump dispatches the queued event first, then ends with no bus
+    // handler and no native sources — proving the commit did not need
+    // either transport.
+    eval.run_event_pump().await.unwrap();
+    match eval.get_global("commits").unwrap() {
+        Value::List(ref items) => {
+            assert_eq!(items.len(), 1, "exactly one commit dispatch per generation");
+            assert_eq!(items[0].to_number().unwrap(), 3.0, "$event.args.generation");
+        }
+        other => panic!("unexpected commits value: {other:?}"),
+    }
+}
+
+/// A raising `lifecycle.commit` hook is an isolated handler fault: the
+/// pump survives, and the fault is recorded through the runtime's
+/// `record_handler_fault` (the citizen's health surface), never retried —
+/// durable intent plus the loader's own reconciliation recovers.
+#[tokio::test(flavor = "current_thread")]
+async fn lifecycle_commit_hook_fault_is_isolated_and_recorded() {
+    use cosmix_mix::evaluator::{ReservedOutcome, ServeRuntime};
+
+    struct CountingRuntime(std::cell::Cell<u64>);
+    impl ServeRuntime for CountingRuntime {
+        fn handle_reserved(
+            &self,
+            _command: &str,
+            _args_header: Option<&str>,
+            _req_body: &str,
+            _handler_commands: &[(&str, Option<&str>)],
+            _correlated: bool,
+        ) -> Option<ReservedOutcome> {
+            None
+        }
+        fn record_handler_fault(&self, _summary: &str) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    let source = r#"
+on lifecycle.commit
+    raise("HOOK_FAULT", "commit failed")
+end
+"#;
+    let mut eval = Evaluator::new();
+    let mut lexer = Lexer::new(source);
+    let stmts = Parser::new(lexer.tokenize().unwrap(), source)
+        .parse_program()
+        .unwrap();
+    let counter = std::rc::Rc::new(CountingRuntime(std::cell::Cell::new(0)));
+    eval.set_serve_runtime(counter.clone());
+    eval.execute(&stmts).await.unwrap();
+    eval.queue_lifecycle_commit(1);
+    eval.run_event_pump().await.unwrap();
+    assert_eq!(
+        counter.0.get(),
+        1,
+        "the hook fault is recorded through the runtime, not swallowed blind"
+    );
+}
+
+/// `is_reload_candidate()` is true exactly while the serve driver's
+/// candidate flag is set around the replacement init body; a committed
+/// generation and a plain script read false.
+#[tokio::test]
+async fn is_reload_candidate_reflects_the_serve_driver_flag() {
+    use cosmix_mix::value::Value;
+
+    let source = "$candidate = is_reload_candidate()\n";
+    let mut eval = Evaluator::new();
+    let mut lexer = Lexer::new(source);
+    let stmts = Parser::new(lexer.tokenize().unwrap(), source)
+        .parse_program()
+        .unwrap();
+
+    assert!(
+        eval.get_global("candidate").is_none(),
+        "no read before execution (plain scripts are never candidates)"
+    );
+    eval.set_reload_candidate(true);
+    eval.execute(&stmts).await.unwrap();
+    assert!(
+        matches!(eval.get_global("candidate"), Some(Value::Bool(true))),
+        "true while the candidate prepares"
+    );
+    eval.set_reload_candidate(false);
+    eval.execute(&stmts).await.unwrap();
+    assert!(
+        matches!(eval.get_global("candidate"), Some(Value::Bool(false))),
+        "false once the swap committed"
+    );
+}
+
 #[tokio::test]
 async fn test_dispatch_multiple_handlers_registration_order() {
     // Decision (4): multiple handlers fire in registration order

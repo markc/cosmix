@@ -700,6 +700,13 @@ the props surface. Before 0.63.0 a faulting handler looked exactly like a
 healthy one (noded reported `delivered=1` while its side effects silently
 never happened).
 
+**`lifecycle.commit` is a native hook, never a verb.** After a hot-reload
+swap commits, the runtime queues one local `lifecycle.commit` event into
+the new generation (see [Serve citizens](serve.md) — post-commit
+handover). A wire-delivered `lifecycle.commit` is refused with `rc 10`
+before any author handler and is filtered from `HELP`: an external caller
+cannot run a loader's commit behaviour ahead of or behind the real commit.
+
 A live citizen answers the standard verbs like any Rust daemon:
 
 ```mix

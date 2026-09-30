@@ -59,6 +59,10 @@ pub struct Broker {
     worker: Option<std::thread::JoinHandle<()>>,
     pause: Option<tokio::sync::mpsc::UnboundedSender<PauseRequest>>,
     grant_limit: usize,
+    /// Fixed loopback TCP port for bounce-stable restarts (the serve-reload
+    /// fixture needs the citizen's cached broker URL to come back at the
+    /// SAME address). `None` binds an ephemeral port — the race-free default.
+    tcp_port: Option<u16>,
 }
 
 type PauseRequest = (
@@ -100,7 +104,21 @@ impl Broker {
             worker: None,
             pause: None,
             grant_limit,
+            tcp_port: None,
         };
+        broker.boot();
+        broker
+    }
+
+    /// Like [`Broker::start`], but bound to a caller-reserved loopback TCP
+    /// port that survives [`Broker::bounce`]. The caller reserves the port
+    /// immediately before construction (bind `:0`, note the port, drop the
+    /// listener); a lost race to an unrelated process surfaces as the boot
+    /// bind panic above rather than a silent strand.
+    pub fn with_tcp_port(port: u16) -> Self {
+        let mut broker = Self::with_grant_limit(32);
+        broker.tcp_port = Some(port);
+        broker.stop();
         broker.boot();
         broker
     }
@@ -122,7 +140,16 @@ impl Broker {
         // test's outbound connection, say) take the port first; noded's bind
         // then failed, `run` returned before readiness, and the whole test
         // binary aborted on the fallout — 3 first runs in 8 on cbc2/cbc3.
-        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        // Both the first listener and its replacement need REUSEADDR:
+        // closed connections may retain this address in TIME_WAIT during
+        // a bounce. Live listeners still exclude another broker's bind.
+        let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
+            .expect("test-broker TCP socket");
+        socket.set_reuse_address(true).expect("test-broker reuseaddr");
+        socket.bind(&std::net::SocketAddr::from(([127, 0, 0, 1], self.tcp_port.unwrap_or(0))).into())
+            .expect("test-broker TCP port was taken by another process");
+        socket.listen(128).expect("test-broker TCP listen");
+        let tcp = std::net::TcpListener::from(socket);
         tcp.set_nonblocking(true).unwrap();
         let listen = tcp.local_addr().unwrap().to_string();
         self.url = format!("ws://{listen}/ws");
