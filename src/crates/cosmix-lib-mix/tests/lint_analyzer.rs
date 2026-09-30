@@ -1125,3 +1125,17 @@ fn literal_type_contradictions_are_errors() {
     let out = codes("exists(\".\")\nwrite_file($p, \"x\")\nmkdir($dir)\n");
     assert!(!out.contains(&"MIX-E1203".to_string()), "got: {out:?}");
 }
+
+#[test]
+fn chain_operand_blocks_and_send_commands_are_walked() {
+    // Lint-walker gaps (2026-09-24): a block statement used as a chain
+    // operand, and a send command expression, are now body-walked —
+    // `$nope` inside the if-block and the undefined fn in the command
+    // are no longer invisible.
+    let out = codes("if true then\n  print($nope)\nend && print(2)\n");
+    assert!(out.contains(&"MIX-E1101".to_string()), "got: {out:?}");
+    let out = codes("ssh_mix(\"h\", \"print(1)\")\nif true then\n  ssh_mix(\"h\", \"print(undefinedfn(1))\")\nend && print(2)\n");
+    assert!(out.contains(&"MIX-E1102".to_string()), "got: {out:?}");
+    let out = codes("send \"svc\" $f(1)\n");
+    assert!(out.contains(&"MIX-E1102".to_string()), "got: {out:?}");
+}
