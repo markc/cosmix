@@ -2706,8 +2706,13 @@ fn mozilla_single_seat_keeps_human_motion_buttons_and_drag_delivery() {
     let _ = h.sync();
     assert!(!h.server.state.human.pointer.is_grabbed(), "release ends the drag grab");
 
-    for keyboard in [false, true] {
-        let reply = h.server.state.validate_agent_surface(&surface, keyboard).unwrap_err().wire_json();
+    let record = test_toplevel_record(&h);
+    let (id, generation) = (record.id.0, record.generation);
+    for op in [
+        InputOp::Text("a".into()),
+        InputOp::PointerButton { button: PRIMARY_POINTER_BUTTON, action: PressAction::Press },
+    ] {
+        let reply = h.server.state.service_agent_targeted_input(id, generation, false, &op).wire_json();
         assert_eq!(reply["error_code"], "agent_seat_unbound");
         assert_eq!(reply["hint"]["seat"], "human");
     }
