@@ -22,11 +22,18 @@ pub struct AppDirs {
 }
 
 fn is_valid_component(component: &str) -> bool {
-    if component.is_empty() || component == "." || component == ".." || component.contains(['/', '\\']) {
+    if component.is_empty()
+        || component == "."
+        || component == ".."
+        || component.contains(['/', '\\'])
+    {
         return false;
     }
     let mut comps = Path::new(component).components();
-    matches!((comps.next(), comps.next()), (Some(Component::Normal(_)), None))
+    matches!(
+        (comps.next(), comps.next()),
+        (Some(Component::Normal(_)), None)
+    )
 }
 
 impl AppDirs {
@@ -43,9 +50,21 @@ impl AppDirs {
         let absolute = |p: PathBuf| p.is_absolute().then_some(p);
         let root = get("COSMIX_APP_HOME")
             .and_then(absolute)
-            .or_else(|| get("COSMIX_APPS_HOME").and_then(absolute).map(|b| b.join(component)))
-            .or_else(|| get("XDG_STATE_HOME").and_then(absolute).map(|b| b.join("cosmix/apps").join(component)))
-            .or_else(|| get("HOME").and_then(absolute).map(|h| h.join(".local/state/cosmix/apps").join(component)))?;
+            .or_else(|| {
+                get("COSMIX_APPS_HOME")
+                    .and_then(absolute)
+                    .map(|b| b.join(component))
+            })
+            .or_else(|| {
+                get("XDG_STATE_HOME")
+                    .and_then(absolute)
+                    .map(|b| b.join("cosmix/apps").join(component))
+            })
+            .or_else(|| {
+                get("HOME")
+                    .and_then(absolute)
+                    .map(|h| h.join(".local/state/cosmix/apps").join(component))
+            })?;
         Some(Self { root })
     }
 
@@ -104,26 +123,55 @@ mod tests {
     use super::*;
 
     fn env(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<PathBuf> {
-        move |k| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| PathBuf::from(v))
+        move |k| {
+            pairs
+                .iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| PathBuf::from(v))
+        }
     }
 
     #[test]
     fn resolution_order() {
-        let all = &[("COSMIX_APP_HOME", "/a"), ("COSMIX_APPS_HOME", "/b"), ("XDG_STATE_HOME", "/c"), ("HOME", "/h")];
-        assert_eq!(AppDirs::resolve_with("dopus", env(all)).unwrap().root(), Path::new("/a"));
-        let three = &[("COSMIX_APPS_HOME", "/b"), ("XDG_STATE_HOME", "/c"), ("HOME", "/h")];
-        assert_eq!(AppDirs::resolve_with("dopus", env(three)).unwrap().root(), Path::new("/b/dopus"));
+        let all = &[
+            ("COSMIX_APP_HOME", "/a"),
+            ("COSMIX_APPS_HOME", "/b"),
+            ("XDG_STATE_HOME", "/c"),
+            ("HOME", "/h"),
+        ];
+        assert_eq!(
+            AppDirs::resolve_with("dopus", env(all)).unwrap().root(),
+            Path::new("/a")
+        );
+        let three = &[
+            ("COSMIX_APPS_HOME", "/b"),
+            ("XDG_STATE_HOME", "/c"),
+            ("HOME", "/h"),
+        ];
+        assert_eq!(
+            AppDirs::resolve_with("dopus", env(three)).unwrap().root(),
+            Path::new("/b/dopus")
+        );
         let one = &[("HOME", "/h")];
         let d = AppDirs::resolve_with("dopus", env(one)).unwrap();
         assert_eq!(d.root(), Path::new("/h/.local/state/cosmix/apps/dopus"));
-        assert_eq!(d.keymap_file(), Path::new("/h/.local/state/cosmix/apps/dopus/config/keymap.conf.mix"));
-        assert_eq!(d.theme_override(), Path::new("/h/.local/state/cosmix/apps/dopus/config/theme.conf.mix"));
+        assert_eq!(
+            d.keymap_file(),
+            Path::new("/h/.local/state/cosmix/apps/dopus/config/keymap.conf.mix")
+        );
+        assert_eq!(
+            d.theme_override(),
+            Path::new("/h/.local/state/cosmix/apps/dopus/config/theme.conf.mix")
+        );
     }
 
     #[test]
     fn relative_values_and_bad_slugs_are_refused() {
         let rel = &[("COSMIX_APP_HOME", "rel"), ("HOME", "/h")];
-        assert_eq!(AppDirs::resolve_with("dopus", env(rel)).unwrap().root(), Path::new("/h/.local/state/cosmix/apps/dopus"));
+        assert_eq!(
+            AppDirs::resolve_with("dopus", env(rel)).unwrap().root(),
+            Path::new("/h/.local/state/cosmix/apps/dopus")
+        );
         assert!(AppDirs::resolve_with("../x", env(&[("HOME", "/h")])).is_none());
         assert!(AppDirs::resolve_with("", env(&[("HOME", "/h")])).is_none());
     }

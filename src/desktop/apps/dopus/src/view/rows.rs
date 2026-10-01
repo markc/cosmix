@@ -27,7 +27,7 @@ use iced::advanced::image::{self as aimage, Renderer as _};
 use iced::advanced::text::{self as atext, Paragraph as _};
 use iced::advanced::widget::{Tree, tree};
 use iced::advanced::{Clipboard, Layout, Renderer as _, Shell, Widget, layout, mouse, renderer};
-use iced::{Element, Event, Length, Point, Rectangle, Size, alignment};
+use iced::{Element, Event, Length, Point, Rectangle, Size, alignment, keyboard};
 use iced_tiny_skia::Renderer;
 
 use cosmix_dopus_core::{FileEntry, VisibleRow};
@@ -39,12 +39,16 @@ use crate::view::Look;
 type Para = <Renderer as atext::Renderer>::Paragraph;
 
 /// Widget messages, mapped onto the app's by the caller.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RowsMsg {
     /// Any press in the listing — the pane it belongs to becomes active.
     Press,
     /// A row was clicked — select it.
     Select(PathBuf),
+    /// Ctrl toggles one row; Shift extends selection from its anchor.
+    SelectModified(PathBuf, bool, bool),
+    /// Right-click on a row or empty space, in window coordinates.
+    ContextMenu(Option<PathBuf>, Point),
     /// A directory row's toggle zone (or a double-click) — expand/collapse.
     Toggle(PathBuf),
 }
@@ -280,6 +284,7 @@ struct RowState {
     /// The last completed click: `(when, row)` — a second on the same row
     /// inside [`DOUBLE_CLICK`] is a double-click.
     last_click: Option<(Instant, usize)>,
+    modifiers: keyboard::Modifiers,
     cache: HashMap<PathBuf, Cached>,
 }
 
@@ -295,6 +300,7 @@ impl RowState {
             press: None,
             drag_epoch: 0,
             last_click: None,
+            modifiers: keyboard::Modifiers::empty(),
             cache: HashMap::new(),
         }
     }
@@ -324,6 +330,7 @@ pub struct FileList<'a> {
     columns: Columns,
     rows: &'a [VisibleRow],
     selected: Option<&'a Path>,
+    selected_paths: Option<&'a HashSet<PathBuf>>,
     /// The pane's root path — the listing's identity (a change resets the
     /// scroll state).
     root: &'a Path,
@@ -359,6 +366,7 @@ impl<'a> FileList<'a> {
             columns,
             rows,
             selected,
+            selected_paths: None,
             root,
             expanded,
             icons,
@@ -374,6 +382,17 @@ impl<'a> FileList<'a> {
                 "Open",
             ),
         }
+    }
+
+    /// All selected rows; `selected` remains the focused row for scrolling.
+    pub fn selected_paths(mut self, paths: &'a HashSet<PathBuf>) -> Self {
+        self.selected_paths = Some(paths);
+        self
+    }
+
+    fn is_selected(&self, path: &Path) -> bool {
+        self.selected_paths
+            .map_or(self.selected == Some(path), |paths| paths.contains(path))
     }
 
     fn is_expanded(&self, path: &Path) -> bool {
@@ -654,6 +673,15 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
             );
         }
         let st = tree.state.downcast_mut::<RowState>();
+        match event {
+            Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
+                st.modifiers = *modifiers;
+            }
+            Event::Window(iced::window::Event::Unfocused) => {
+                st.modifiers = keyboard::Modifiers::empty();
+            }
+            _ => {}
+        }
         self.ensure_metrics(st);
         self.reset_on_relist(st);
         self.follow_selection(st, clip.height);
@@ -767,6 +795,17 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
                     st.press = Some((position, index, self.rows[index].entry.path.clone()));
                 }
             }
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right))
+                if cursor.is_over(clip) =>
+            {
+                st.press = None;
+                st.last_click = None;
+                let position = cursor.position().unwrap_or_default();
+                let path = st
+                    .row_at(position.y - bounds.y, self.rows.len())
+                    .map(|index| self.rows[index].entry.path.clone());
+                shell.publish(RowsMsg::ContextMenu(path, position));
+            }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
                 let Some((pressed_at, index, _)) = st.press.take() else {
                     return;
@@ -794,7 +833,14 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
                         .columns
                         .indentation(bounds.width, row.depth, self.look.chrome.icon);
                 let in_toggle = row.entry.is_dir && row_x >= 0.0 && row_x < self.look.chrome.icon;
-                if in_toggle {
+                if st.modifiers.control() || st.modifiers.shift() {
+                    st.last_click = None;
+                    shell.publish(RowsMsg::SelectModified(
+                        row.entry.path.clone(),
+                        st.modifiers.control(),
+                        st.modifiers.shift(),
+                    ));
+                } else if in_toggle {
                     st.last_click = None;
                     shell.publish(RowsMsg::Toggle(row.entry.path.clone()));
                 } else {
@@ -810,7 +856,12 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
                 }
                 shell.capture_event();
             }
-            Event::Window(iced::window::Event::Unfocused | iced::window::Event::Resized(_))
+            Event::Window(iced::window::Event::Unfocused) => {
+                st.press = None;
+                st.last_click = None;
+                st.modifiers = keyboard::Modifiers::empty();
+            }
+            Event::Window(iced::window::Event::Resized(_))
             | Event::Mouse(mouse::Event::CursorLeft) => {
                 st.press = None;
                 st.last_click = None;
@@ -856,14 +907,11 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
                     t.muted_surface,
                 );
             }
-            // The selected row's full-width background, under everything.
-            if let Some(selected) = self.selected
-                && let Some(index) = self
-                    .rows
-                    .iter()
-                    .position(|row| row.entry.path.as_path() == selected)
-                && st.is_visible(index, clip.height)
-            {
+            // Every selected row's full-width background, under everything.
+            for (index, row) in self.rows.iter().enumerate() {
+                if !self.is_selected(&row.entry.path) || !st.is_visible(index, clip.height) {
+                    continue;
+                }
                 let rect = Rectangle {
                     x: bounds.x,
                     y: bounds.y + index as f32 * st.row_h - st.offset,
@@ -956,7 +1004,7 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
 
                     // Name; secondary columns right-aligned, in the mono role.
                     if let Some(cached) = st.cache.get(&row.entry.path) {
-                        let color = if self.selected == Some(row.entry.path.as_path()) {
+                        let color = if self.is_selected(&row.entry.path) {
                             t.selection_text
                         } else {
                             t.text
@@ -997,7 +1045,7 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
                         width,
                         height: clip.height,
                     };
-                    let color = if self.selected == Some(row.entry.path.as_path()) {
+                    let color = if self.is_selected(&row.entry.path) {
                         t.selection_text
                     } else {
                         t.muted_text

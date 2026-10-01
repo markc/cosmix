@@ -88,7 +88,9 @@ impl BusHandle {
     /// [`BusHandle::quit`] and before exiting the process.
     pub fn wait_done(&self, timeout: Duration) {
         let (lock, notified) = &*self.done;
-        let finished = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let finished = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if *finished {
             return;
         }
@@ -145,7 +147,10 @@ pub const THEME_TOPIC: &str = "theme.changed";
 /// Start the bus thread registered as `service`, connecting to `url`
 /// (`cosmix_config::client_helpers::resolve_noded_url()` unless
 /// `--noded-url` overrode it).
-pub fn spawn(service: &str, url: &str) -> Result<(BusHandle, UnboundedReceiver<Delivery>), StartError> {
+pub fn spawn(
+    service: &str,
+    url: &str,
+) -> Result<(BusHandle, UnboundedReceiver<Delivery>), StartError> {
     let (dtx, drx) = unbounded();
     let (etx, erx) = tokio::sync::mpsc::unbounded_channel();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -156,16 +161,22 @@ pub fn spawn(service: &str, url: &str) -> Result<(BusHandle, UnboundedReceiver<D
     std::thread::Builder::new()
         .name(format!("{service}-bus"))
         .spawn(move || {
-            let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
                 Ok(rt) => rt,
                 Err(e) => {
-                    let _ = ready_tx.send(Err(StartError::Unreachable(format!("Bus runtime: {e}"))));
+                    let _ =
+                        ready_tx.send(Err(StartError::Unreachable(format!("Bus runtime: {e}"))));
                     return;
                 }
             };
             runtime.block_on(run(service, url, dtx, erx, ready_tx));
             let (lock, notified) = &*done_thread;
-            *lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            *lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
             notified.notify_all();
         })
         .map_err(|e| StartError::Unreachable(format!("Bus thread: {e}")))?;
@@ -183,7 +194,9 @@ async fn run(
     mut erx: tokio::sync::mpsc::UnboundedReceiver<Effect>,
     ready: std::sync::mpsc::Sender<Result<(), StartError>>,
 ) {
-    let connect = SupervisedClient::connect_options(&service, &url).fatal_on_registration_rejection(true).connect();
+    let connect = SupervisedClient::connect_options(&service, &url)
+        .fatal_on_registration_rejection(true)
+        .connect();
     let client = match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
         Ok(Ok(c)) => Arc::new(c),
         Ok(Err(e)) => {
@@ -292,12 +305,24 @@ async fn run(
 }
 
 /// One anonymous request to `service`, bounded by `limit`.
-fn anonymous_call(url: &str, service: &str, verb: &str, body: &serde_json::Value, limit: Duration) -> Option<(u8, String)> {
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().ok()?;
+fn anonymous_call(
+    url: &str,
+    service: &str,
+    verb: &str,
+    body: &serde_json::Value,
+    limit: Duration,
+) -> Option<(u8, String)> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
     runtime.block_on(async {
         let call = async {
             let client = NodedClient::connect_anonymous(url).await.ok()?;
-            let reply = client.call_with_headers_raw(service, verb, &BTreeMap::new(), &body.to_string()).await.ok();
+            let reply = client
+                .call_with_headers_raw(service, verb, &BTreeMap::new(), &body.to_string())
+                .await
+                .ok();
             client.close().await;
             reply.map(|(rc, body, _)| (rc, body))
         };
@@ -308,14 +333,29 @@ fn anonymous_call(url: &str, service: &str, verb: &str, body: &serde_json::Value
 /// Single-instance probe: an anonymous `dopus.ping` with a 500 ms deadline;
 /// `true` when an instance answered.
 pub fn probe_running(url: &str, service: &str) -> bool {
-    matches!(anonymous_call(url, service, "dopus.ping", &serde_json::json!({}), PROBE_TIMEOUT), Some((0, _)))
+    matches!(
+        anonymous_call(
+            url,
+            service,
+            "dopus.ping",
+            &serde_json::json!({}),
+            PROBE_TIMEOUT
+        ),
+        Some((0, _))
+    )
 }
 
 /// Single-instance forward: send the argv paths as `dopus.open`. The running
 /// instance routes them into its panes (first → left, second → right), and
 /// this reports success — the forward worked.
 pub fn forward_open(url: &str, service: &str, paths: &[String]) -> Result<(), String> {
-    match anonymous_call(url, service, "dopus.open", &serde_json::json!({ "paths": paths }), Duration::from_secs(5)) {
+    match anonymous_call(
+        url,
+        service,
+        "dopus.open",
+        &serde_json::json!({ "paths": paths }),
+        Duration::from_secs(5),
+    ) {
         Some((0, _)) => Ok(()),
         Some((rc, body)) => Err(format!("dopus.open refused (rc {rc}): {body}")),
         None => Err(format!("no answer from {service}")),
@@ -333,16 +373,29 @@ mod tests {
             id: Some("1".into()),
             args: serde_json::Value::Null,
             body: String::new(),
-            headers: headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
         }
     }
 
     #[test]
     fn caller_keys_follow_editd_rules() {
-        assert_eq!(caller_key(&cmd("ctl-90", &[("broker_origin", "local")])), "local:ctl-90");
+        assert_eq!(
+            caller_key(&cmd("ctl-90", &[("broker_origin", "local")])),
+            "local:ctl-90"
+        );
         assert_eq!(caller_key(&cmd("", &[("broker_origin", "local")])), "anon");
         assert_eq!(
-            caller_key(&cmd("x", &[("broker_origin", "mesh"), ("broker_service", "svc"), ("broker_peer", "beta")])),
+            caller_key(&cmd(
+                "x",
+                &[
+                    ("broker_origin", "mesh"),
+                    ("broker_service", "svc"),
+                    ("broker_peer", "beta")
+                ]
+            )),
             "mesh:svc@beta"
         );
         assert_eq!(caller_key(&cmd("x", &[])), "anon");

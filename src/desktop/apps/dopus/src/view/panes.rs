@@ -60,20 +60,23 @@ pub fn pane_column<'a>(
         column![
             pane_header(look, first_row, pane, pane_id, active, editing),
             sort_header(look, pane, pane_id, actions, columns),
-            Element::new(rows::FileList::new(
-                pane_rows,
-                pane.selected.as_deref(),
-                &pane.path,
-                &pane.expanded,
-                icons,
-                tint,
-                look,
-                actions,
-                columns,
-                pane_id,
-                drag,
-                busy,
-            ))
+            Element::new(
+                rows::FileList::new(
+                    pane_rows,
+                    pane.selected.as_deref(),
+                    &pane.path,
+                    &pane.expanded,
+                    icons,
+                    tint,
+                    look,
+                    actions,
+                    columns,
+                    pane_id,
+                    drag,
+                    busy,
+                )
+                .selected_paths(&pane.selected_paths)
+            )
             .map(move |m| Msg::PaneRows(pane_id, m)),
             summary_footer(look, footer),
         ]

@@ -13,12 +13,13 @@ pub fn navigation<'a>(
     icons: &Icons,
     tint: &str,
     active: &PaneModel,
+    busy: bool,
     panels_open: [bool; 2],
     actions: &[crate::verbs::ActionRow],
 ) -> Element<'a, Msg> {
     let disabled_tint = crate::icons::hex(look.tokens.muted_text);
     let control = |icon, action, label| {
-        let enabled = enabled(active, action);
+        let enabled = enabled(active, busy, action);
         let tint = if enabled { tint } else { &disabled_tint };
         let button = button(super::image_widget(look, icons, tint, icon))
             .padding(look.chrome.small)
@@ -36,6 +37,16 @@ pub fn navigation<'a>(
         control(Icon::ArrowUp, filemgr::NAV_PARENT, "Up"),
         control(Icon::House, filemgr::NAV_HOME, "Home"),
         control(Icon::Refresh, filemgr::VIEW_REFRESH, "Refresh"),
+        control(Icon::FolderOpen, filemgr::FILE_OPEN, "Open"),
+        control(Icon::Folder, filemgr::FILE_NEW_FOLDER, "New folder"),
+        control(Icon::FileText, filemgr::FILE_RENAME, "Rename"),
+        control(Icon::Copy, filemgr::FILE_COPY, "Copy to other pane"),
+        control(
+            Icon::MoveHorizontal,
+            filemgr::FILE_MOVE,
+            "Move to other pane"
+        ),
+        control(Icon::Trash, filemgr::FILE_DELETE, "Delete"),
         control(
             if active.show_hidden {
                 Icon::EyeOff
@@ -101,13 +112,21 @@ pub fn navigation<'a>(
     .into()
 }
 
-fn enabled(pane: &PaneModel, action: ActionId) -> bool {
+pub fn enabled(pane: &PaneModel, busy: bool, action: ActionId) -> bool {
     if action == filemgr::NAV_BACK {
         !pane.history.back.is_empty()
     } else if action == filemgr::NAV_FORWARD {
         !pane.history.forward.is_empty()
     } else if action == filemgr::NAV_PARENT {
         pane.path.parent().is_some()
+    } else if action == filemgr::FILE_NEW_FOLDER {
+        !busy
+    } else if action == filemgr::FILE_OPEN {
+        !pane.listing && pane.selected.is_some()
+    } else if action == filemgr::FILE_RENAME {
+        !busy && !pane.listing && pane.selected_paths.len() == 1
+    } else if [filemgr::FILE_COPY, filemgr::FILE_MOVE, filemgr::FILE_DELETE].contains(&action) {
+        !busy && !pane.listing && !pane.selected_paths.is_empty()
     } else {
         true
     }
@@ -125,18 +144,30 @@ mod tests {
         config.left.path = dir.path().to_owned();
         config.right.path = dir.path().to_owned();
         let (mut core, _events) = DopusCore::new(config, None);
-        assert!(!enabled(core.pane(core.active()), filemgr::NAV_BACK));
+        assert!(!enabled(core.pane(core.active()), false, filemgr::NAV_BACK));
         core.go_parent_in(PaneId::Left);
-        assert!(enabled(core.pane(core.active()), filemgr::NAV_BACK));
+        assert!(enabled(core.pane(core.active()), false, filemgr::NAV_BACK));
         core.switch_pane();
-        assert!(!enabled(core.pane(core.active()), filemgr::NAV_BACK));
+        assert!(!enabled(core.pane(core.active()), false, filemgr::NAV_BACK));
         core.set_active_pane(PaneId::Left);
         core.go_back();
-        assert!(!enabled(core.pane(core.active()), filemgr::NAV_BACK));
-        assert!(enabled(core.pane(core.active()), filemgr::NAV_FORWARD));
+        assert!(!enabled(core.pane(core.active()), false, filemgr::NAV_BACK));
+        assert!(enabled(
+            core.pane(core.active()),
+            false,
+            filemgr::NAV_FORWARD
+        ));
         core.navigate(PaneId::Right, "/".into());
         core.set_active_pane(PaneId::Right);
-        assert!(!enabled(core.pane(core.active()), filemgr::NAV_PARENT));
-        assert!(enabled(core.pane(core.active()), filemgr::VIEW_REFRESH));
+        assert!(!enabled(
+            core.pane(core.active()),
+            false,
+            filemgr::NAV_PARENT
+        ));
+        assert!(enabled(
+            core.pane(core.active()),
+            false,
+            filemgr::VIEW_REFRESH
+        ));
     }
 }

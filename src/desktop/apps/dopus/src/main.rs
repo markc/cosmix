@@ -49,8 +49,14 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
             "--print-config" => out.print_config = true,
             "--service" => {
                 let name = args.next().ok_or("--service needs a name")?;
-                if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)) {
-                    return Err(format!("--service {name:?}: use letters, digits, '-', '_' or '.'"));
+                if name.is_empty()
+                    || !name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+                {
+                    return Err(format!(
+                        "--service {name:?}: use letters, digits, '-', '_' or '.'"
+                    ));
                 }
                 out.service = name;
             }
@@ -61,7 +67,9 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
                 }
                 out.noded_url = Some(url);
             }
-            flag if flag.starts_with("--") => return Err(format!("unknown option {flag} (see --help)")),
+            flag if flag.starts_with("--") => {
+                return Err(format!("unknown option {flag} (see --help)"));
+            }
             _ => out.paths.push(a),
         }
     }
@@ -75,7 +83,9 @@ fn absolute(paths: Vec<String>) -> Vec<String> {
     paths
         .into_iter()
         .map(|p| match &cwd {
-            Some(cwd) if !std::path::Path::new(&p).is_absolute() => cwd.join(&p).to_string_lossy().into_owned(),
+            Some(cwd) if !std::path::Path::new(&p).is_absolute() => {
+                cwd.join(&p).to_string_lossy().into_owned()
+            }
             _ => p,
         })
         .collect()
@@ -97,12 +107,16 @@ fn main() {
         }
     };
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_env("DOPUS_LOG").unwrap_or_else(|_| "warn".into()))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_env("DOPUS_LOG")
+                .unwrap_or_else(|_| "warn".into()),
+        )
         .with_writer(std::io::stderr)
         .init();
 
     let dirs = AppDirs::resolve(COMPONENT);
-    let (config, config_file) = cosmix_dopus::config::load(dirs.as_ref().map(AppDirs::config_dir).as_deref());
+    let (config, config_file) =
+        cosmix_dopus::config::load(dirs.as_ref().map(AppDirs::config_dir).as_deref());
     if args.print_config {
         if let Some(d) = &dirs {
             println!("-- {}", d.config_dir().join("config.conf.mix").display());
@@ -110,7 +124,10 @@ fn main() {
         println!("{}", cosmix_dopus::config::to_json(&config));
         return;
     }
-    let noded_url = args.noded_url.clone().unwrap_or_else(cosmix_config::client_helpers::resolve_noded_url);
+    let noded_url = args
+        .noded_url
+        .clone()
+        .unwrap_or_else(cosmix_config::client_helpers::resolve_noded_url);
     let paths = absolute(args.paths);
     let result = if args.headless {
         // Headless dopus IS the Bus port: no broker, no process.
@@ -126,7 +143,9 @@ fn main() {
             match cosmix_dopus::bus::forward_open(&noded_url, &args.service, &paths) {
                 Ok(()) => return,
                 Err(e) => {
-                    eprintln!("cosmix-dopus: a running instance answered but refused the paths: {e}");
+                    eprintln!(
+                        "cosmix-dopus: a running instance answered but refused the paths: {e}"
+                    );
                     std::process::exit(1);
                 }
             }
@@ -159,6 +178,12 @@ mod tests {
         assert!(p(&["--frobnicate"]).is_err());
         assert!(p(&["--noded-url"]).is_err());
         assert!(p(&["--noded-url", "http://x"]).is_err());
-        assert_eq!(p(&["--noded-url", "ws://h:1/ws"]).unwrap().noded_url.as_deref(), Some("ws://h:1/ws"));
+        assert_eq!(
+            p(&["--noded-url", "ws://h:1/ws"])
+                .unwrap()
+                .noded_url
+                .as_deref(),
+            Some("ws://h:1/ws")
+        );
     }
 }

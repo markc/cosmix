@@ -214,6 +214,7 @@ pub fn root<'a>(
             icons,
             tint,
             active_pane,
+            busy,
             [places_config.open, properties_config.open],
             actions
         ),

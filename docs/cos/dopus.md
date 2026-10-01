@@ -6,7 +6,9 @@ The window is a Wayland client (`dev.cosmix.dopus`) drawn with tiny-skia and
 the shared design tokens. Only dopus consumes the extracted core.
 
 Each pane has its own directory, history, sort, hidden-file setting, lazy
-directory tree and single selection. Tab or F6 switches the active pane. Places is
+directory tree and selection. Click selects one item, Ctrl-click toggles an
+individual item, Shift-click selects a range in visible row order, and
+Ctrl+Shift-click adds a range to the selection. Tab or F6 switches the active pane. Places is
 a plain sidebar, with Home, Filesystem and existing user directories.
 Pane relists invalidate its cached directory checks; Refresh rechecks Places.
 Both sidebars start directly with content, without Places or Properties headings,
@@ -15,7 +17,8 @@ account for button padding, icon centring and the shaped UI/mono font metrics.
 The divider persists its position; double-click centres it.
 
 One navigation icon strip is centred across the top of the window: Back,
-Forward, Up, Home, Refresh and Show/Hide hidden files. It always acts on the
+Forward, Up, Home, Refresh, Open, New folder, Rename, Copy, Move, Delete and
+Show/Hide hidden files. It always acts on the
 active pane and follows Tab, F6 or a pane click; Back/Forward are disabled when
 that pane's corresponding history is empty, and Up is disabled at the root.
 Disabled icons use the theme's muted foreground, matching disabled dialog buttons.
@@ -119,8 +122,15 @@ dopus, ced and inputd's defaults, and work on standard keyboards.
 Widths are fractions of the available window width, clamped to 10–30% each
 to leave room for the panes. Hidden panels and their dividers take no space.
 
-File operations are local keyboard/dialog actions: new folder, rename,
+Right-click opens the shared iced context menu. Clicking a selected item keeps
+the whole group selected; clicking another item selects that item before
+showing the menu. Arrow keys, Enter and Escape navigate or dismiss the menu.
+
+File operations are local toolbar, menu and keyboard/dialog actions: new folder, rename,
 copy or move to the other pane, and permanent delete with confirmation.
+Copy, Move and Delete act on the full selection; selected descendants of a
+selected directory are processed with their parent once. Rename requires one
+selected item. Multi-item deletion uses one confirmation for the captured group.
 Operations run one at a time, never overwrite a destination, and relist both
 panes exactly once after every operation reply, including failures.
 Opening a directory navigates; opening a file spawns `xdg-open`.
@@ -199,7 +209,9 @@ Unknown verbs return `UNKNOWN_VERB`. `NOT_FOUND`, `CONFLICT` and
 appear in pane status after an asynchronous navigation reply.
 
 `PaneState` is identical in `info.pane_states` and `state.panes`:
-`{pane, path, active, show_hidden, sort, ascending, selected, rows, status, summary}`.
+`{pane, path, active, show_hidden, sort, ascending, selected, selected_paths, rows, status, summary}`.
+`selected_paths` contains the selected paths in visible row order; `selected`
+retains the focused item for existing callers.
 `summary` is the pane footer text, added in 0.3.1; `status` keeps its existing meaning.
 Rows are ordered left then right; `pane` is 0 or 1, `selected` is a path
 or null, `sort` is `name`, `size` or `modified`, and paths are sanitised
@@ -340,7 +352,6 @@ the pending drop. Self, descendant and same-directory destinations are refused.
 ## Not in v1
 
 - OS drag and drop to or from other applications.
-- Multi-selection.
 - Previews.
 - Listing virtualisation (drawing is limited to visible rows).
 - Filemgr config import.

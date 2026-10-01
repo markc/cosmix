@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.0
+
+- Add Ctrl toggles, Shift ranges in visible row order and additive Ctrl+Shift
+  ranges, retaining a focused selection for Open and Properties.
+- Copy, move and confirm deletion of the complete selection; recursive
+  operations omit selected descendants of selected folders. Delete reservations
+  pin their complete source list and batch operations validate every source
+  before mutation. Rename requires exactly one selected item.
+- Clear selection on navigation/refresh and remove hidden descendants when a
+  tree branch collapses. Expose selection counts and ordered source snapshots.
+
 ## 0.3.2
 
 - Add `transfer_paths` for an explicit Copy or Move on pinned gesture paths,

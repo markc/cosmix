@@ -17,6 +17,7 @@ pub enum FileOpKind {
     Rename,
     BatchCopy,
     BatchMove,
+    BatchDelete,
 }
 
 #[derive(Clone, Debug)]
@@ -79,6 +80,19 @@ impl FileOperation {
 
     pub fn move_batch(sources: Vec<PathBuf>, destination_dir: PathBuf) -> Result<Self, String> {
         Self::batch(FileOpKind::BatchMove, sources, destination_dir)
+    }
+
+    pub fn delete_batch(sources: Vec<PathBuf>) -> Result<Self, String> {
+        let source = sources
+            .first()
+            .cloned()
+            .ok_or_else(|| "a batch delete needs at least one source".to_owned())?;
+        Ok(Self {
+            kind: FileOpKind::BatchDelete,
+            source,
+            destination_dir: None,
+            batch_sources: sources,
+        })
     }
 
     fn batch(
@@ -152,6 +166,7 @@ impl FileOperation {
                 let destination = self.destination()?;
                 execute_batch(self.kind, &self.batch_sources, destination)
             }
+            FileOpKind::BatchDelete => execute_delete_batch(&self.batch_sources),
         }
     }
 
@@ -165,6 +180,45 @@ impl FileOperation {
         }
         Ok(destination)
     }
+}
+
+/// Validate every source before deleting anything, then report partial failures
+/// honestly. Confirmation has already pinned this entire source list.
+fn execute_delete_batch(sources: &[PathBuf]) -> Result<String, String> {
+    if sources.is_empty() {
+        return Err("a batch delete needs at least one source".into());
+    }
+    let mut seen = HashSet::new();
+    for source in sources {
+        fs::symlink_metadata(source)
+            .map_err(|error| format!("delete preflight reading {}: {error}", source.display()))?;
+        if !seen.insert(source) {
+            return Err(format!(
+                "delete preflight found duplicate source: {}",
+                source.display()
+            ));
+        }
+        if sources
+            .iter()
+            .any(|parent| parent != source && source.starts_with(parent))
+        {
+            return Err(format!(
+                "delete preflight found overlapping source: {}",
+                source.display()
+            ));
+        }
+    }
+    let total = sources.len();
+    for (index, source) in sources.iter().enumerate() {
+        if let Err(error) = remove_entry(source) {
+            let remaining = total.saturating_sub(index + 1);
+            return Err(format!(
+                "delete batch partially failed after {index}/{total} completed: {error}; \
+                 {remaining} item(s) not attempted"
+            ));
+        }
+    }
+    Ok(format!("Deleted {total} item(s)"))
 }
 
 #[derive(Debug)]
@@ -476,6 +530,67 @@ mod tests {
     }
 
     #[test]
+    fn batch_delete_removes_files_folders_and_symlinks_without_following_links() {
+        let root = TestRoot::new("batch-delete");
+        let first = root.0.join("first.txt");
+        let folder = root.0.join("folder");
+        let retained = root.0.join("retained.txt");
+        fs::write(&first, b"delete").unwrap();
+        fs::create_dir(&folder).unwrap();
+        fs::write(folder.join("child.txt"), b"delete recursively").unwrap();
+        fs::write(&retained, b"retain").unwrap();
+        let mut sources = vec![first.clone(), folder.clone()];
+        #[cfg(unix)]
+        {
+            let link = root.0.join("link");
+            std::os::unix::fs::symlink(&retained, &link).unwrap();
+            sources.push(link);
+        }
+        FileOperation::delete_batch(sources)
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert!(!first.exists());
+        assert!(!folder.exists());
+        assert_eq!(fs::read(retained).unwrap(), b"retain");
+    }
+
+    #[test]
+    fn batch_delete_preflights_every_source_before_mutation() {
+        let root = TestRoot::new("batch-delete-preflight");
+        let first = root.0.join("first.txt");
+        fs::write(&first, b"retain on refusal").unwrap();
+        let missing = root.0.join("missing.txt");
+        let error = FileOperation::delete_batch(vec![first.clone(), missing])
+            .unwrap()
+            .execute()
+            .unwrap_err();
+        assert!(error.contains("preflight"));
+        assert_eq!(fs::read(&first).unwrap(), b"retain on refusal");
+
+        let folder = root.0.join("folder");
+        fs::create_dir(&folder).unwrap();
+        let child = folder.join("child.txt");
+        fs::write(&child, b"retain overlap").unwrap();
+        assert!(
+            FileOperation::delete_batch(vec![folder.clone(), child.clone()])
+                .unwrap()
+                .execute()
+                .unwrap_err()
+                .contains("overlapping")
+        );
+        assert_eq!(fs::read(child).unwrap(), b"retain overlap");
+        assert!(
+            FileOperation::delete_batch(vec![first.clone(), first.clone()])
+                .unwrap()
+                .execute()
+                .unwrap_err()
+                .contains("duplicate")
+        );
+        assert!(first.exists());
+    }
+
+    #[test]
     fn moves_and_deletes_files_and_folders() {
         let root = TestRoot::new("move-delete");
         let source_dir = root.0.join("source");
@@ -515,9 +630,11 @@ mod tests {
         assert!(renamed.is_dir());
 
         fs::create_dir(root.0.join("Existing")).unwrap();
-        assert!(FileOperation::rename(renamed, root.0.join("Existing"))
-            .execute()
-            .is_err());
+        assert!(
+            FileOperation::rename(renamed, root.0.join("Existing"))
+                .execute()
+                .is_err()
+        );
     }
 
     #[test]
@@ -542,9 +659,11 @@ mod tests {
         fs::write(&source, b"source").unwrap();
         fs::write(&existing, b"existing").unwrap();
 
-        assert!(FileOperation::move_to(source.clone(), destination)
-            .execute()
-            .is_err());
+        assert!(
+            FileOperation::move_to(source.clone(), destination)
+                .execute()
+                .is_err()
+        );
         assert_eq!(fs::read(source).unwrap(), b"source");
         assert_eq!(fs::read(existing).unwrap(), b"existing");
     }

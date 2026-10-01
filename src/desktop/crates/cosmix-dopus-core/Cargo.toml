@@ -2,7 +2,7 @@
 # ported verbatim from desktop/apps/filemgr (Bevy/ctk); see desktop/APPS.md.
 [package]
 name = "cosmix-dopus-core"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"

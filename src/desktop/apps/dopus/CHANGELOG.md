@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.0
+
+- Restore the right-click menu using the shared iced menu widget, with Open,
+  Copy, Move, Rename, Delete, New folder, Refresh and hidden-file controls.
+- Add file actions to the top icon row, with availability and shortcut tips.
+- Ctrl-click toggles individual items; Shift-click selects a visible range;
+  Ctrl+Shift-click adds a range. Copy, Move and Delete use the whole selection.
+- Right-click preserves an existing group, or selects the clicked item.
+
 ## 0.3.3
 
 - Drag files or directories between the panes with a floating icon, filename and

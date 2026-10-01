@@ -17,14 +17,18 @@ pub fn load(dir: Option<&Path>) -> (DOpusConfig, Option<ConfigFile>) {
     match dir {
         Some(dir) => {
             if let Err(error) = std::fs::create_dir_all(dir) {
-                eprintln!("cosmix-dopus: cannot create config dir {}: {error}", dir.display());
+                eprintln!(
+                    "cosmix-dopus: cannot create config dir {}: {error}",
+                    dir.display()
+                );
             }
             let (mut config, file) = ConfigFile::load(dir);
             // A stale or hand-edited ratio clamps at load to the divider
             // drag contract: the view clamps at render too, but the app
             // caches the raw value at boot and `dopus.state` reports it.
-            config.split_ratio =
-                config.split_ratio.clamp(crate::view::panes::SPLIT_MIN, crate::view::panes::SPLIT_MAX);
+            config.split_ratio = config
+                .split_ratio
+                .clamp(crate::view::panes::SPLIT_MIN, crate::view::panes::SPLIT_MAX);
             (config, Some(file))
         }
         None => (DOpusConfig::default(), None),

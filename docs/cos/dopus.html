@@ -447,7 +447,9 @@ It replaces the deprecated Bevy filemgr; retirement of that app is separate.
 The window is a Wayland client (<code>dev.cosmix.dopus</code>) drawn with tiny-skia and
 the shared design tokens. Only dopus consumes the extracted core.</p>
 <p>Each pane has its own directory, history, sort, hidden-file setting, lazy
-directory tree and single selection. Tab or F6 switches the active pane. Places is
+directory tree and selection. Click selects one item, Ctrl-click toggles an
+individual item, Shift-click selects a range in visible row order, and
+Ctrl+Shift-click adds a range to the selection. Tab or F6 switches the active pane. Places is
 a plain sidebar, with Home, Filesystem and existing user directories.
 Pane relists invalidate its cached directory checks; Refresh rechecks Places.
 Both sidebars start directly with content, without Places or Properties headings,
@@ -455,7 +457,8 @@ aligning their first text baselines with the pane location headers. Insets
 account for button padding, icon centring and the shaped UI/mono font metrics.
 The divider persists its position; double-click centres it.</p>
 <p>One navigation icon strip is centred across the top of the window: Back,
-Forward, Up, Home, Refresh and Show/Hide hidden files. It always acts on the
+Forward, Up, Home, Refresh, Open, New folder, Rename, Copy, Move, Delete and
+Show/Hide hidden files. It always acts on the
 active pane and follows Tab, F6 or a pane click; Back/Forward are disabled when
 that pane's corresponding history is empty, and Up is disabled at the root.
 Disabled icons use the theme's muted foreground, matching disabled dialog buttons.
@@ -553,8 +556,14 @@ all plain F1–F12. The sidebar shortcuts use ordinary Ctrl chords, free in
 dopus, ced and inputd's defaults, and work on standard keyboards.
 Widths are fractions of the available window width, clamped to 10–30% each
 to leave room for the panes. Hidden panels and their dividers take no space.</p>
-<p>File operations are local keyboard/dialog actions: new folder, rename,
+<p>Right-click opens the shared iced context menu. Clicking a selected item keeps
+the whole group selected; clicking another item selects that item before
+showing the menu. Arrow keys, Enter and Escape navigate or dismiss the menu.</p>
+<p>File operations are local toolbar, menu and keyboard/dialog actions: new folder, rename,
 copy or move to the other pane, and permanent delete with confirmation.
+Copy, Move and Delete act on the full selection; selected descendants of a
+selected directory are processed with their parent once. Rename requires one
+selected item. Multi-item deletion uses one confirmation for the captured group.
 Operations run one at a time, never overwrite a destination, and relist both
 panes exactly once after every operation reply, including failures.
 Opening a directory navigates; opening a file spawns <code>xdg-open</code>.</p>
@@ -620,7 +629,9 @@ permission. No verb performs file operations or opens a confirmation dialog.</p>
 <code>INTERNAL</code> are reserved refusal codes; filesystem listing errors currently
 appear in pane status after an asynchronous navigation reply.</p>
 <p><code>PaneState</code> is identical in <code>info.pane_states</code> and <code>state.panes</code>:
-<code>{pane, path, active, show_hidden, sort, ascending, selected, rows, status, summary}</code>.
+<code>{pane, path, active, show_hidden, sort, ascending, selected, selected_paths, rows, status, summary}</code>.
+<code>selected_paths</code> contains the selected paths in visible row order; <code>selected</code>
+retains the focused item for existing callers.
 <code>summary</code> is the pane footer text, added in 0.3.1; <code>status</code> keeps its existing meaning.
 Rows are ordered left then right; <code>pane</code> is 0 or 1, <code>selected</code> is a path
 or null, <code>sort</code> is <code>name</code>, <code>size</code> or <code>modified</code>, and paths are sanitised
@@ -742,7 +753,6 @@ the pending drop. Self, descendant and same-directory destinations are refused.<
 <h2 id="not-in-v1">Not in v1</h2>
 <ul>
 <li>OS drag and drop to or from other applications.</li>
-<li>Multi-selection.</li>
 <li>Previews.</li>
 <li>Listing virtualisation (drawing is limited to visible rows).</li>
 <li>Filemgr config import.</li>

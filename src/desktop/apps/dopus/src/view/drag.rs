@@ -183,6 +183,13 @@ impl Widget<Msg, iced::Theme, Renderer> for Layer<'_> {
                 state.cancel();
                 shell.request_redraw();
                 shell.capture_event();
+                if matches!(event, Event::Window(iced::window::Event::Unfocused)) {
+                    // Lists must clear held modifiers even when cancelling a drag.
+                    drop(state);
+                    self.content.as_widget_mut().update(
+                        tree, event, layout, cursor, renderer, clipboard, shell, viewport,
+                    );
+                }
                 return;
             }
             if let Some(pending) = state.pending.as_ref() {
@@ -213,7 +220,9 @@ impl Widget<Msg, iced::Theme, Renderer> for Layer<'_> {
                     shell.request_redraw();
                 }
                 // No underlying action, click or shortcut may mutate the snapshots.
-                if matches!(event, Event::Mouse(_) | Event::Keyboard(_)) {
+                if matches!(event, Event::Mouse(_) | Event::Keyboard(_))
+                    && !matches!(event, Event::Keyboard(keyboard::Event::ModifiersChanged(_)))
+                {
                     if matches!(event, Event::Mouse(mouse::Event::CursorMoved { .. })) {
                         shell.request_redraw();
                     }
@@ -221,7 +230,10 @@ impl Widget<Msg, iced::Theme, Renderer> for Layer<'_> {
                     return;
                 }
             }
-            if state.active.is_some() && matches!(event, Event::Keyboard(_)) {
+            if state.active.is_some()
+                && matches!(event, Event::Keyboard(_))
+                && !matches!(event, Event::Keyboard(keyboard::Event::ModifiersChanged(_)))
+            {
                 shell.capture_event();
                 return;
             }
@@ -589,6 +601,243 @@ mod tests {
         ))
         .map(|msg| Msg::PaneRows(PaneId::Left, msg));
         Layer::new(content, shared, look, icons, "")
+    }
+
+    #[test]
+    fn row_clicks_publish_modifiers_and_right_click_targets_without_toggling() {
+        use crate::view::rows::RowsMsg;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("folder");
+        let rows = vec![cosmix_dopus_core::VisibleRow {
+            entry: cosmix_dopus_core::FileEntry {
+                path: path.clone(),
+                name: "folder".into(),
+                is_dir: true,
+                size: None,
+                modified: None,
+                child_count: None,
+            },
+            depth: 0,
+        }];
+        let look = look();
+        let icons = Icons::new();
+        let expanded = Default::default();
+        let shared: Shared = Default::default();
+        let renderer = Renderer::new(look.ui_font, iced::Pixels(look.px));
+        let mut layer = single_list(&rows, dir.path(), &icons, &expanded, shared.clone(), look);
+        let mut tree = Tree::new(&layer as &dyn Widget<Msg, iced::Theme, Renderer>);
+        // The chevron normally toggles a directory; modifiers must select it.
+        let point = Point::new(5.0, 10.0);
+        for modifiers in [
+            keyboard::Modifiers::CTRL,
+            keyboard::Modifiers::SHIFT,
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+        ] {
+            send(
+                &mut layer,
+                &mut tree,
+                &renderer,
+                Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)),
+                point,
+            );
+            // Repeated clicks must never become directory double-clicks.
+            for _ in 0..2 {
+                send(
+                    &mut layer,
+                    &mut tree,
+                    &renderer,
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                    point,
+                );
+                let messages = send(
+                    &mut layer,
+                    &mut tree,
+                    &renderer,
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                    point,
+                );
+                assert!(matches!(messages.as_slice(), [Msg::PaneRows(PaneId::Left,
+                    RowsMsg::SelectModified(selected, ctrl, shift))]
+                    if *selected == path && *ctrl == modifiers.control()
+                        && *shift == modifiers.shift()));
+            }
+        }
+        send(
+            &mut layer,
+            &mut tree,
+            &renderer,
+            Event::Window(iced::window::Event::Unfocused),
+            point,
+        );
+        // Focus loss clears stale held modifiers; the next plain click selects.
+        let plain = Point::new(100.0, 10.0);
+        send(
+            &mut layer,
+            &mut tree,
+            &renderer,
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            plain,
+        );
+        assert!(matches!(send(
+            &mut layer,
+            &mut tree,
+            &renderer,
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            plain,
+        ).as_slice(), [Msg::PaneRows(PaneId::Left, RowsMsg::Select(selected))]
+            if *selected == path));
+        for (pending, lose_focus) in [(false, false), (true, false), (false, true)] {
+            send(
+                &mut layer,
+                &mut tree,
+                &renderer,
+                Event::Keyboard(keyboard::Event::ModifiersChanged(keyboard::Modifiers::CTRL)),
+                plain,
+            );
+            let gesture = Gesture {
+                pane: PaneId::Left,
+                source_root: dir.path().to_path_buf(),
+                source: path.clone(),
+                is_dir: true,
+                pointer: plain,
+                target: None,
+            };
+            if pending {
+                lock(&shared).pending = Some(gesture);
+            } else {
+                lock(&shared).active = Some(gesture);
+            }
+            send(
+                &mut layer,
+                &mut tree,
+                &renderer,
+                if lose_focus {
+                    Event::Window(iced::window::Event::Unfocused)
+                } else {
+                    Event::Keyboard(keyboard::Event::ModifiersChanged(
+                        keyboard::Modifiers::empty(),
+                    ))
+                },
+                plain,
+            );
+            if !lose_focus {
+                lock(&shared).cancel();
+            }
+            send(
+                &mut layer,
+                &mut tree,
+                &renderer,
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                plain,
+            );
+            assert!(matches!(send(
+                &mut layer,
+                &mut tree,
+                &renderer,
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                plain,
+            ).as_slice(), [Msg::PaneRows(PaneId::Left, RowsMsg::Select(selected))]
+                if *selected == path));
+        }
+        for (point, expected) in [(plain, Some(path)), (Point::new(100.0, 250.0), None)] {
+            let messages = send(
+                &mut layer,
+                &mut tree,
+                &renderer,
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)),
+                point,
+            );
+            assert!(matches!(messages.as_slice(), [Msg::PaneRows(PaneId::Left,
+                RowsMsg::ContextMenu(selected, position))]
+                if *selected == expected && *position == point));
+            assert!(lock(&shared).active.is_none());
+        }
+    }
+
+    #[test]
+    fn multiple_selected_rows_draw_their_own_backgrounds() {
+        use crate::view::rows::{Columns, FileList, RowsMsg};
+        let dir = tempfile::tempdir().unwrap();
+        let rows: Vec<_> = ["first", "middle", "last"]
+            .into_iter()
+            .map(|name| cosmix_dopus_core::VisibleRow {
+                entry: cosmix_dopus_core::FileEntry {
+                    path: dir.path().join(name),
+                    name: name.into(),
+                    is_dir: false,
+                    size: Some(1),
+                    modified: None,
+                    child_count: None,
+                },
+                depth: 0,
+            })
+            .collect();
+        let selected = [rows[0].entry.path.clone(), rows[2].entry.path.clone()]
+            .into_iter()
+            .collect();
+        let look = look();
+        let icons = Icons::new();
+        let expanded = Default::default();
+        let shared: Shared = Default::default();
+        let mut renderer = Renderer::new(look.ui_font, iced::Pixels(look.px));
+        let mut list = FileList::new(
+            &rows,
+            Some(&rows[2].entry.path),
+            dir.path(),
+            &expanded,
+            &icons,
+            "",
+            look,
+            &[],
+            Columns {
+                name_min: 50.0,
+                size: 30.0,
+                modified: 40.0,
+                gap: 4.0,
+                pad: 4.0,
+            },
+            PaneId::Left,
+            shared,
+            false,
+        )
+        .selected_paths(&selected);
+        let mut tree = Tree::new(&list as &dyn Widget<RowsMsg, iced::Theme, Renderer>);
+        let viewport = Rectangle::with_size(Size::new(600.0, 300.0));
+        let node = list.layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        let mut messages = Vec::new();
+        list.update(
+            &mut tree,
+            &Event::Window(iced::window::Event::Focused),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &viewport,
+        );
+        list.draw(
+            &tree,
+            &mut renderer,
+            &iced::Theme::Light,
+            &renderer::Style::default(),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &viewport,
+        );
+        let backgrounds: Vec<_> = renderer
+            .layers()
+            .iter()
+            .flat_map(|layer| layer.quads.iter())
+            .filter(|(_, background)| *background == iced::Background::Color(look.tokens.selection))
+            .map(|(quad, _)| quad.bounds)
+            .collect();
+        assert_eq!(backgrounds.len(), 2);
+        assert_eq!(backgrounds[0].y, 0.0);
+        assert_eq!(backgrounds[1].y, 2.0 * backgrounds[0].height);
     }
 
     #[test]

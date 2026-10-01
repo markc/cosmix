@@ -570,6 +570,19 @@ impl Dopus {
                 self.core.set_active_pane(pane);
             }
             rows::RowsMsg::Select(path) => self.core.select_path(pane, Some(path)),
+            rows::RowsMsg::SelectModified(path, ctrl, shift) => {
+                self.core.select_modified(pane, path, ctrl, shift);
+            }
+            rows::RowsMsg::ContextMenu(path, _) => {
+                self.stop_editing();
+                self.core.set_active_pane(pane);
+                if path
+                    .as_ref()
+                    .is_none_or(|path| !self.core.pane(pane).selected_paths.contains(path))
+                {
+                    self.core.select_path(pane, path);
+                }
+            }
             rows::RowsMsg::Toggle(path) => self.core.toggle_expand(pane, &path),
         }
         Task::none()
@@ -1146,6 +1159,43 @@ impl Dopus {
         self.core.toggle_sidebar(sidebar);
     }
 
+    fn context_items(&self) -> Vec<cosmix_iced_widgets::menu::Item<Msg>> {
+        use cosmix_actions::filemgr;
+        use cosmix_iced_widgets::menu::Item;
+        let pane = self.core.pane(self.core.active());
+        let busy = self.core.availability().operation_running;
+        let item = |action: ActionId, label: &str| {
+            let keys = self
+                .action_table
+                .iter()
+                .find(|row| row.id == action.as_str())
+                .map(|row| row.keys.join(" / "))
+                .unwrap_or_default();
+            Item::action(label, Msg::Actions(vec![action]))
+                .accelerator(keys)
+                .enabled(view::toolbar::enabled(pane, busy, action))
+        };
+        vec![
+            item(filemgr::FILE_OPEN, "Open"),
+            Item::separator(),
+            item(filemgr::FILE_COPY, "Copy to other pane"),
+            item(filemgr::FILE_MOVE, "Move to other pane"),
+            item(filemgr::FILE_RENAME, "Rename"),
+            item(filemgr::FILE_DELETE, "Delete"),
+            Item::separator(),
+            item(filemgr::FILE_NEW_FOLDER, "New folder"),
+            item(filemgr::VIEW_REFRESH, "Refresh"),
+            item(
+                filemgr::VIEW_TOGGLE_HIDDEN,
+                if pane.show_hidden {
+                    "Hide hidden files"
+                } else {
+                    "Show hidden files"
+                },
+            ),
+        ]
+    }
+
     fn view(&self) -> Element<'_, Msg, iced::Theme, Renderer> {
         let info = self.status.as_deref().unwrap_or(self.core.info());
         let editing = self
@@ -1192,8 +1242,15 @@ impl Dopus {
         } else if let Some((pane, _)) = self.editing.as_ref() {
             routed = routed.on_edit_cancel(view::location::location_id(*pane), Msg::LocationCancel);
         }
+        let content: Element<'_, Msg, iced::Theme, Renderer> = if self.dialog.is_none() {
+            cosmix_iced_widgets::menu::Menu::context(routed, self.context_items())
+                .style(self.look().tokens.menu_style())
+                .into()
+        } else {
+            routed.into()
+        };
         Element::new(view::drag::Layer::new(
-            routed.into(),
+            content,
             self.drag.clone(),
             self.look(),
             &self.icons,
@@ -1353,6 +1410,66 @@ mod tests {
                 highlight: bounds,
             }),
         });
+    }
+
+    #[test]
+    fn right_click_preserves_a_group_and_retargets_an_unselected_item() {
+        let (dir, mut app) = fixture();
+        let paths: Vec<_> = ["a", "b", "c"].map(|name| dir.path().join(name)).into();
+        let pane = PaneId::Right;
+        app.core.on_event(CoreEvent::ListingArrived {
+            pane,
+            generation: app.core.pane(pane).generation,
+            path: dir.path().to_owned(),
+            root: true,
+            result: Ok(paths
+                .iter()
+                .map(|path| cosmix_dopus_core::FileEntry {
+                    name: path.file_name().unwrap().to_string_lossy().into_owned(),
+                    path: path.clone(),
+                    is_dir: false,
+                    size: Some(1),
+                    child_count: None,
+                    modified: None,
+                })
+                .collect()),
+        });
+        let _ = app.on_rows(pane, rows::RowsMsg::Select(paths[0].clone()));
+        let _ = app.on_rows(
+            pane,
+            rows::RowsMsg::SelectModified(paths[1].clone(), true, false),
+        );
+        let right_click = |path| rows::RowsMsg::ContextMenu(path, iced::Point::ORIGIN);
+        let _ = app.on_rows(pane, right_click(Some(paths[0].clone())));
+        assert_eq!(app.core.active(), pane);
+        assert_eq!(app.core.selected_paths(pane), paths[..2]);
+        let items = app.context_items();
+        assert!(
+            items
+                .iter()
+                .find(|item| item.label() == "Delete")
+                .unwrap()
+                .is_enabled()
+        );
+        assert!(
+            !items
+                .iter()
+                .find(|item| item.label() == "Rename")
+                .unwrap()
+                .is_enabled()
+        );
+        assert!(verbs::apply_action(cosmix_actions::filemgr::FILE_RENAME, &mut app.core).is_err());
+        let _ = app.on_rows(pane, right_click(Some(paths[2].clone())));
+        assert_eq!(app.core.selected_paths(pane), vec![paths[2].clone()]);
+        let _ = app.on_rows(pane, right_click(None));
+        assert!(app.core.selected_paths(pane).is_empty());
+        assert!(
+            !app.context_items()
+                .iter()
+                .find(|item| item.label() == "Delete")
+                .unwrap()
+                .is_enabled()
+        );
     }
 
     #[test]

@@ -125,7 +125,11 @@ pub struct PaneModel {
     pub children: HashMap<PathBuf, Vec<FileEntry>>,
     pub expanded: HashSet<PathBuf>,
     pub pending_children: HashSet<PathBuf>,
+    /// Focused member of the selection, used by Open and Properties.
     pub selected: Option<PathBuf>,
+    /// Selected rows. Use `DopusCore::selected_paths` for visible ordering.
+    pub selected_paths: HashSet<PathBuf>,
+    selection_anchor: Option<PathBuf>,
     pub history: NavigationHistory,
     pub show_hidden: bool,
     pub sort: SortColumn,
@@ -163,6 +167,8 @@ impl PaneModel {
             expanded: HashSet::new(),
             pending_children: HashSet::new(),
             selected: None,
+            selected_paths: HashSet::new(),
+            selection_anchor: None,
             history: NavigationHistory::default(),
             show_hidden,
             sort,
@@ -175,7 +181,7 @@ impl PaneModel {
 
     /// `action_selection_available` (browser.rs:251-253).
     fn action_selection_available(&self) -> bool {
-        !self.listing && self.selected.is_some()
+        !self.listing && !self.selected_paths.is_empty()
     }
 
     /// `action_rows_available` (browser.rs:255-257).
@@ -204,7 +210,7 @@ enum OpState {
 /// 422-427 plus `NameEditKind` 454-457).
 enum Reservation {
     Delete {
-        source: PathBuf,
+        sources: Vec<PathBuf>,
         source_pane: PaneId,
     },
     NewFolder {
@@ -402,6 +408,7 @@ impl DopusCore {
             can_go_forward: !pane.history.forward.is_empty(),
             can_go_parent: pane.path.parent().is_some(),
             has_selection: pane.action_selection_available(),
+            selection_count: pane.selected_paths.len(),
             selection_is_dir: pane
                 .selected
                 .as_deref()
@@ -669,6 +676,16 @@ impl DopusCore {
     /// Move the selection over [`DopusCore::visible_rows`] (browser.rs
     /// `select_relative`, 3208-3227).
     pub fn select_relative(&mut self, pane: PaneId, delta: isize) {
+        self.select_relative_modified(pane, delta, false, false);
+    }
+
+    pub fn select_relative_modified(
+        &mut self,
+        pane: PaneId,
+        delta: isize,
+        ctrl: bool,
+        shift: bool,
+    ) {
         let rows = self.visible_rows(pane);
         if rows.is_empty() {
             return;
@@ -677,17 +694,19 @@ impl DopusCore {
             .selected
             .as_ref()
             .and_then(|selected| rows.iter().position(|row| &row.entry.path == selected));
-        let index = if delta > 0 {
-            current.map_or(0, |index| (index + 1).min(rows.len().saturating_sub(1)))
-        } else {
-            current.unwrap_or(0).saturating_sub(1)
-        };
-        self.select_index(pane, &rows, index);
+        let index = current
+            .map_or(0, |index| index.saturating_add_signed(delta))
+            .min(rows.len() - 1);
+        self.select_modified(pane, rows[index].entry.path.clone(), ctrl, shift);
     }
 
     /// Jump to the first or last visible row (browser.rs `select_edge`,
     /// 3229-3241).
     pub fn select_edge(&mut self, pane: PaneId, last: bool) {
+        self.select_edge_modified(pane, last, false, false);
+    }
+
+    pub fn select_edge_modified(&mut self, pane: PaneId, last: bool, ctrl: bool, shift: bool) {
         let rows = self.visible_rows(pane);
         let index = if last {
             rows.len().checked_sub(1)
@@ -697,7 +716,7 @@ impl DopusCore {
             Some(0)
         };
         if let Some(index) = index {
-            self.select_index(pane, &rows, index);
+            self.select_modified(pane, rows[index].entry.path.clone(), ctrl, shift);
         }
     }
 
@@ -713,17 +732,101 @@ impl DopusCore {
         {
             self.properties[pane.index()].cached = None;
         }
-        self.panes[pane.index()].selected = path;
+        let model = &mut self.panes[pane.index()];
+        model.selected_paths = path.iter().cloned().collect();
+        model.selection_anchor = path.clone();
+        model.selected = path;
         self.active = pane;
         self.emit(CoreEvent::SelectionChanged { pane });
         self.emit(CoreEvent::InfoChanged);
     }
 
-    fn select_index(&mut self, pane: PaneId, rows: &[VisibleRow], index: usize) {
-        let Some(row) = rows.get(index) else {
+    /// Apply desktop selection modifiers against the current visible row order.
+    /// Shift retains the last plain/Ctrl click as its anchor; Ctrl+Shift adds
+    /// the range to existing selection. Ctrl alone toggles one row.
+    pub fn select_modified(&mut self, pane: PaneId, path: PathBuf, ctrl: bool, shift: bool) {
+        let rows = self.visible_rows(pane);
+        let Some(target) = rows.iter().position(|row| row.entry.path == path) else {
             return;
         };
-        self.select_path(pane, Some(row.entry.path.clone()));
+        if !ctrl && !shift {
+            self.select_path(pane, Some(path));
+            return;
+        }
+        if self.properties[pane.index()]
+            .cached
+            .as_ref()
+            .is_some_and(|(_, _, result)| result.is_err())
+        {
+            self.properties[pane.index()].cached = None;
+        }
+        let model = &mut self.panes[pane.index()];
+        if shift {
+            let anchor = model
+                .selection_anchor
+                .as_ref()
+                .and_then(|path| rows.iter().position(|row| &row.entry.path == path))
+                .unwrap_or(target);
+            if !ctrl {
+                model.selected_paths.clear();
+            }
+            model.selected_paths.extend(
+                rows[anchor.min(target)..=anchor.max(target)]
+                    .iter()
+                    .map(|row| row.entry.path.clone()),
+            );
+            if model.selection_anchor.is_none() {
+                model.selection_anchor = Some(path.clone());
+            }
+            model.selected = Some(path);
+        } else {
+            model.selection_anchor = Some(path.clone());
+            if model.selected_paths.remove(&path) {
+                model.selected = rows
+                    .iter()
+                    .find(|row| model.selected_paths.contains(&row.entry.path))
+                    .map(|row| row.entry.path.clone());
+            } else {
+                model.selected_paths.insert(path.clone());
+                model.selected = Some(path);
+            }
+        }
+        self.active = pane;
+        self.emit(CoreEvent::SelectionChanged { pane });
+        self.emit(CoreEvent::InfoChanged);
+    }
+
+    /// Selection in visible order, followed by any pinned paths not in the
+    /// projection. No filesystem work is performed by this snapshot.
+    pub fn selected_paths(&self, pane: PaneId) -> Vec<PathBuf> {
+        let model = self.pane(pane);
+        let mut remaining = model.selected_paths.clone();
+        let mut selected = self
+            .visible_rows(pane)
+            .into_iter()
+            .filter_map(|row| remaining.remove(&row.entry.path).then_some(row.entry.path))
+            .collect::<Vec<_>>();
+        let mut remaining = remaining.into_iter().collect::<Vec<_>>();
+        remaining.sort();
+        selected.extend(remaining);
+        selected
+    }
+
+    /// Top-level selected paths for recursive operations and drag payloads.
+    /// Selecting a folder and its child transfers/deletes the folder once.
+    pub fn operation_sources(&self, pane: PaneId) -> Vec<PathBuf> {
+        let sources = self.selected_paths(pane);
+        sources
+            .iter()
+            .filter(|source| {
+                !sources.iter().any(|parent| {
+                    parent != *source
+                        && source.starts_with(parent)
+                        && find_entry(self.pane(pane), parent).is_some_and(|entry| entry.is_dir)
+                })
+            })
+            .cloned()
+            .collect()
     }
 
     // -- tree ---------------------------------------------------------------
@@ -733,6 +836,7 @@ impl DopusCore {
     /// generation; a later reply is accepted only if that generation still
     /// governs the pane.
     pub fn toggle_expand(&mut self, pane: PaneId, path: &Path) {
+        let mut collapsed = false;
         {
             let pane = &mut self.panes[pane.index()];
             // Only directories expand (browser.rs:2443-2445).
@@ -742,13 +846,44 @@ impl DopusCore {
             }
             if pane.expanded.contains(path) {
                 pane.expanded.remove(path);
-                return;
+                collapsed = true;
+            } else {
+                pane.expanded.insert(path.to_path_buf());
             }
-            pane.expanded.insert(path.to_path_buf());
-            if pane.children.contains_key(path) {
+            if !collapsed && pane.children.contains_key(path) {
                 // Already listed: the flatten projection picks it up.
                 return;
             }
+        }
+        if collapsed {
+            let visible = self.visible_rows(pane);
+            let model = &mut self.panes[pane.index()];
+            let count = model.selected_paths.len();
+            model
+                .selected_paths
+                .retain(|path| visible.iter().any(|row| &row.entry.path == path));
+            if model
+                .selected
+                .as_ref()
+                .is_some_and(|path| !model.selected_paths.contains(path))
+            {
+                model.selected = visible
+                    .iter()
+                    .find(|row| model.selected_paths.contains(&row.entry.path))
+                    .map(|row| row.entry.path.clone());
+            }
+            if model
+                .selection_anchor
+                .as_ref()
+                .is_some_and(|path| !visible.iter().any(|row| &row.entry.path == path))
+            {
+                model.selection_anchor = model.selected.clone();
+            }
+            if count != model.selected_paths.len() {
+                self.emit(CoreEvent::SelectionChanged { pane });
+                self.emit(CoreEvent::InfoChanged);
+            }
+            return;
         }
         self.start_child_listing(pane, path.to_path_buf());
     }
@@ -795,16 +930,19 @@ impl DopusCore {
     /// `transfer_selection` (browser.rs:3283-3305).
     fn transfer_selection(&mut self, copy: bool) {
         let pane_id = self.active;
-        let Some(source) = self.panes[pane_id.index()].selected.clone() else {
+        let sources = self.operation_sources(pane_id);
+        if sources.is_empty() {
             return;
-        };
+        }
         let destination = self.panes[pane_id.other().index()].path.clone();
-        let operation = if copy {
-            FileOperation::copy(source, destination)
+        let action = if copy {
+            DropAction::Copy
         } else {
-            FileOperation::move_to(source, destination)
+            DropAction::Move
         };
-        self.start_operation(operation, pane_id);
+        if let Ok(operation) = transfer_operation(action, sources, destination) {
+            self.start_operation(operation, pane_id);
+        }
     }
 
     /// Transfer the gesture's pinned paths through the normal single-flight worker.
@@ -838,15 +976,23 @@ impl DopusCore {
             return;
         }
         let pane_id = self.active;
-        let Some(source) = self.panes[pane_id.index()].selected.clone() else {
+        let sources = self.operation_sources(pane_id);
+        if sources.is_empty() {
             return;
+        }
+        let subject = if sources.len() == 1 {
+            "this item".to_owned()
+        } else {
+            format!("these {} items", sources.len())
         };
-        let message = format!(
-            "Permanently delete this item?\n\n{}\n\nThis cannot be undone.",
-            sanitise_display_path(&source)
-        );
+        let paths = sources
+            .iter()
+            .map(|source| sanitise_display_path(source))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let message = format!("Permanently delete {subject}?\n\n{paths}\n\nThis cannot be undone.");
         let token = self.confirms.insert(Reservation::Delete {
-            source,
+            sources,
             source_pane: pane_id,
         });
         self.emit(CoreEvent::ConfirmRequested { token, message });
@@ -864,14 +1010,19 @@ impl DopusCore {
             _ => return,
         }
         let Some(Reservation::Delete {
-            source,
+            sources,
             source_pane,
         }) = self.confirms.entries.remove(&token)
         else {
             unreachable!("reservation kind guarded above");
         };
         if answer == ConfirmAnswer::Yes {
-            self.start_operation(FileOperation::delete(source), source_pane);
+            let operation = if sources.len() == 1 {
+                FileOperation::delete(sources[0].clone())
+            } else {
+                FileOperation::delete_batch(sources).expect("reserved delete has sources")
+            };
+            self.start_operation(operation, source_pane);
         }
     }
 
@@ -903,6 +1054,9 @@ impl DopusCore {
             return;
         }
         let pane = self.active;
+        if self.panes[pane.index()].selected_paths.len() != 1 {
+            return;
+        }
         let Some(source) = self.panes[pane.index()].selected.clone() else {
             return;
         };
@@ -986,6 +1140,7 @@ impl DopusCore {
             FileOpKind::Rename => "Renaming",
             FileOpKind::BatchCopy => "Copying batch",
             FileOpKind::BatchMove => "Moving batch",
+            FileOpKind::BatchDelete => "Deleting batch",
         };
         self.set_status(
             Some(source_pane),
@@ -1158,6 +1313,8 @@ impl DopusCore {
                         // clear_pane_rows (browser.rs:1352-1357): an error
                         // leaves the pane empty with no selection.
                         pane.selected = None;
+                        pane.selected_paths.clear();
+                        pane.selection_anchor = None;
                         pane.root.clear();
                         selection_cleared = true;
                     }
@@ -1265,6 +1422,7 @@ impl DopusCore {
                     FileOpKind::Rename => "Rename",
                     FileOpKind::BatchCopy => "Batch copy",
                     FileOpKind::BatchMove => "Batch move",
+                    FileOpKind::BatchDelete => "Batch delete",
                 };
                 self.set_status(Some(source_pane), &format!("{label} failed: {error}"));
             }
@@ -1359,6 +1517,8 @@ impl DopusCore {
             self.count_queue.retain(|job| job.pane != pane_id);
             // clear_pane_rows (browser.rs:1352-1357).
             pane.selected = None;
+            pane.selected_paths.clear();
+            pane.selection_anchor = None;
             pane.listing = true;
             pane.listing_failed = false;
             pane.root.clear();
@@ -1923,6 +2083,7 @@ pub struct AvailabilitySnapshot {
     pub can_go_forward: bool,
     pub can_go_parent: bool,
     pub has_selection: bool,
+    pub selection_count: usize,
     pub selection_is_dir: bool,
     pub rows_available: bool,
     pub operation_running: bool,
@@ -2109,6 +2270,196 @@ mod tests {
         };
         let (core, rx) = DopusCore::new(config, None);
         (dir, core, rx)
+    }
+
+    fn selection_fixture(core: &mut DopusCore, paths: &[PathBuf]) {
+        let pane = &mut core.panes[PaneId::Left.index()];
+        pane.listing = false;
+        pane.root = paths
+            .iter()
+            .map(|path| {
+                let mut row = entry(&path.to_string_lossy(), false);
+                row.path = path.clone();
+                row.name = path.file_name().unwrap().to_string_lossy().into_owned();
+                row
+            })
+            .collect();
+    }
+
+    #[test]
+    fn ctrl_toggles_and_shift_ranges_retain_the_anchor_in_visible_order() {
+        let (_dir, mut core, _rx) = core_fixture();
+        let pane = PaneId::Left;
+        let paths = ["a", "b", "c", "d", "e"].map(PathBuf::from);
+        selection_fixture(&mut core, &paths);
+        core.select_modified(pane, paths[1].clone(), false, false);
+        core.select_modified(pane, paths[4].clone(), true, false);
+        assert_eq!(
+            core.selected_paths(pane),
+            vec![paths[1].clone(), paths[4].clone()]
+        );
+        core.select_modified(pane, paths[4].clone(), true, false);
+        assert_eq!(core.pane(pane).selected, Some(paths[1].clone()));
+        // A toggled-off row remains the range anchor.
+        core.select_modified(pane, paths[2].clone(), false, true);
+        assert_eq!(core.selected_paths(pane), paths[2..].to_vec());
+        core.select_modified(pane, paths[3].clone(), false, true);
+        assert_eq!(core.selected_paths(pane), paths[3..].to_vec());
+        core.select_modified(pane, paths[0].clone(), true, true);
+        assert_eq!(core.selected_paths(pane), paths.to_vec());
+        assert_eq!(core.availability().selection_count, 5);
+        core.begin_rename();
+        assert!(core.outstanding_reservations().is_empty());
+        core.select_modified(pane, paths[2].clone(), false, false);
+        assert_eq!(core.selected_paths(pane), vec![paths[2].clone()]);
+        core.select_modified(pane, paths[2].clone(), true, false);
+        assert!(core.selected_paths(pane).is_empty());
+        assert!(core.pane(pane).selected.is_none());
+        assert!(!core.availability().has_selection);
+    }
+
+    #[test]
+    fn shift_keyboard_and_sorted_ranges_use_the_current_projection() {
+        let (_dir, mut core, _rx) = core_fixture();
+        let pane = PaneId::Left;
+        let paths = ["a", "b", "c", "d"].map(PathBuf::from);
+        selection_fixture(&mut core, &paths);
+        core.select_modified(pane, paths[1].clone(), false, false);
+        core.set_sort_in(pane, SortColumn::Name, true);
+        assert_eq!(core.visible_rows(pane)[0].entry.path, paths[3]);
+        core.select_relative_modified(pane, -1, false, true);
+        assert_eq!(
+            core.selected_paths(pane),
+            vec![paths[2].clone(), paths[1].clone()]
+        );
+        core.select_edge_modified(pane, false, false, true);
+        assert_eq!(
+            core.selected_paths(pane),
+            vec![paths[3].clone(), paths[2].clone(), paths[1].clone()]
+        );
+        core.select_edge_modified(pane, true, false, true);
+        assert_eq!(
+            core.selected_paths(pane),
+            vec![paths[1].clone(), paths[0].clone()]
+        );
+        core.refresh_in(pane);
+        assert!(core.pane(pane).selected_paths.is_empty());
+        assert!(core.pane(pane).selection_anchor.is_none());
+    }
+
+    #[test]
+    fn expanded_children_participate_in_ranges_and_collapse_prunes_hidden_selection() {
+        let (_dir, mut core, _rx) = core_fixture();
+        let pane = PaneId::Left;
+        let folder = PathBuf::from("folder");
+        let child = folder.join("child");
+        let last = PathBuf::from("last");
+        selection_fixture(&mut core, &[folder.clone(), last.clone()]);
+        let model = &mut core.panes[pane.index()];
+        model.root[0].is_dir = true;
+        model.expanded.insert(folder.clone());
+        model
+            .children
+            .insert(folder.clone(), vec![entry("folder/child", false)]);
+        core.select_modified(pane, folder.clone(), false, false);
+        core.select_modified(pane, last.clone(), false, true);
+        assert_eq!(
+            core.selected_paths(pane),
+            vec![folder.clone(), child.clone(), last.clone()]
+        );
+        assert_eq!(
+            core.operation_sources(pane),
+            vec![folder.clone(), last.clone()]
+        );
+        core.select_modified(pane, child.clone(), false, false);
+        core.toggle_expand(pane, &folder);
+        assert!(core.selected_paths(pane).is_empty());
+        assert!(core.pane(pane).selected.is_none());
+        assert!(core.pane(pane).selection_anchor.is_none());
+        core.toggle_expand(pane, &folder);
+        assert!(core.selected_paths(pane).is_empty());
+        core.select_modified(pane, child, false, true);
+        assert_eq!(core.selected_paths(pane), vec![folder.join("child")]);
+    }
+
+    fn wait_for_operation(core: &mut DopusCore, rx: &mpsc::Receiver<CoreEvent>) {
+        loop {
+            let event = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("operation reply");
+            let completed = if let CoreEvent::OperationArrived { ref result, .. } = event {
+                assert!(result.is_ok(), "{result:?}");
+                true
+            } else {
+                false
+            };
+            core.on_event(event);
+            if completed {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn selection_copy_and_move_pin_all_sources_through_the_worker() {
+        for copy in [true, false] {
+            let (dir, mut core, rx) = core_fixture();
+            let paths = [dir.path().join("left/a.txt"), dir.path().join("left/b.txt")];
+            for path in &paths {
+                std::fs::write(path, path.file_name().unwrap().as_encoded_bytes()).unwrap();
+            }
+            selection_fixture(&mut core, &paths);
+            core.select_modified(PaneId::Left, paths[0].clone(), false, false);
+            core.select_modified(PaneId::Left, paths[1].clone(), true, false);
+            if copy {
+                core.copy_selection_to_other_pane();
+            } else {
+                core.move_selection_to_other_pane();
+            }
+            core.select_path(PaneId::Left, None);
+            wait_for_operation(&mut core, &rx);
+            for path in &paths {
+                let name = path.file_name().unwrap();
+                assert_eq!(
+                    std::fs::read(dir.path().join("right").join(name)).unwrap(),
+                    name.as_encoded_bytes()
+                );
+                assert_eq!(path.exists(), copy);
+            }
+            assert!(!core.availability().operation_running);
+        }
+    }
+
+    #[test]
+    fn delete_confirmation_pins_the_complete_selection_and_survives_selection_changes() {
+        let (dir, mut core, rx) = core_fixture();
+        let paths = ["a.txt", "b.txt", "keep.txt"].map(|name| dir.path().join("left").join(name));
+        for path in &paths {
+            std::fs::write(path, b"contents").unwrap();
+        }
+        selection_fixture(&mut core, &paths);
+        core.select_modified(PaneId::Left, paths[0].clone(), false, false);
+        core.select_modified(PaneId::Left, paths[1].clone(), true, false);
+        core.delete_selection();
+        let (token, message) = core
+            .pending
+            .iter()
+            .find_map(|event| match event {
+                CoreEvent::ConfirmRequested { token, message } => Some((*token, message.clone())),
+                _ => None,
+            })
+            .expect("complete selection confirmation");
+        assert!(message.contains("these 2 items"));
+        assert!(message.contains("a.txt"));
+        assert!(message.contains("b.txt"));
+        core.select_path(PaneId::Left, Some(paths[2].clone()));
+        core.confirm(token, ConfirmAnswer::Yes);
+        wait_for_operation(&mut core, &rx);
+        assert!(!paths[0].exists());
+        assert!(!paths[1].exists());
+        assert!(paths[2].exists());
+        core.confirm(token, ConfirmAnswer::Yes);
+        assert!(!core.availability().operation_running);
     }
 
     #[test]

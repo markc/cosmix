@@ -111,6 +111,9 @@ pub struct PaneState {
     pub sort: String,
     pub ascending: bool,
     pub selected: Option<String>,
+    /// All selected paths in visible row order; `selected` remains the focused item.
+    #[serde(default)]
+    pub selected_paths: Vec<String>,
     pub rows: usize,
     /// Relative or absolute, as the status line renders it.
     pub status: String,
@@ -512,6 +515,9 @@ pub fn apply_action_in(
         if !availability.has_selection {
             return Err(gated("Nothing is selected"));
         }
+        if availability.selection_count != 1 {
+            return Err(gated("Select one item to rename"));
+        }
         if availability.operation_running {
             return Err(busy());
         }
@@ -654,9 +660,8 @@ pub fn apply_availability(
         row.enabled = match row.id.as_str() {
             "file.open" => selection,
             "file.new-folder" => idle,
-            "file.rename" | "file.copy-other-pane" | "file.move-other-pane" | "file.delete" => {
-                selection && idle
-            }
+            "file.rename" => selection && idle && availability.selection_count == 1,
+            "file.copy-other-pane" | "file.move-other-pane" | "file.delete" => selection && idle,
             _ => true,
         };
     }
@@ -744,6 +749,11 @@ fn pane_state(core: &DopusCore, pane_id: PaneId) -> PaneState {
             .selected
             .as_ref()
             .map(|p| cosmix_dopus_core::sanitise_display_path(p)),
+        selected_paths: core
+            .selected_paths(pane_id)
+            .iter()
+            .map(|path| cosmix_dopus_core::sanitise_display_path(path))
+            .collect(),
         rows: core.visible_rows(pane_id).len(),
         status: pane.status.clone(),
         summary: pane.footer_summary(),
