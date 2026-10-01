@@ -2664,6 +2664,12 @@ fn mozilla_peer_credentials_filter_the_registry() {
 #[test]
 fn mozilla_single_seat_keeps_human_motion_buttons_and_drag_delivery() {
     let mut h = KeybindingHarness::new(false);
+    let serial = u32::from(test_toplevel_record(&h).required_configure.unwrap());
+    send_request(&mut h.client, TEST_XDG_SURFACE_ID, 4, &words(&[serial]));
+    let buffer = h.create_dmabuf_buffer_sized(320, 240);
+    send_request(&mut h.client, TEST_TOPLEVEL_SURFACE_ID, 1, &words(&[buffer, 0, 0]));
+    send_request(&mut h.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    h.dispatch_client();
     let surface = h.subsurface();
     let client = surface.client().unwrap();
     // Use the same connection policy as the real executable fixture above.
