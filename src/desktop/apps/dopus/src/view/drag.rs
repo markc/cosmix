@@ -352,7 +352,14 @@ impl Widget<Msg, iced::Theme, Renderer> for Layer<'_> {
                 let title = pending
                     .target
                     .as_ref()
-                    .map(|target| sanitise_display_path(&target.path))
+                    .map(|target| {
+                        let name = target
+                            .path
+                            .file_name()
+                            .map(std::path::Path::new)
+                            .unwrap_or(&target.path);
+                        sanitise_display_path(name)
+                    })
                     .unwrap_or_default();
                 for (index, label) in [title.as_str(), "Move here", "Copy here", "Cancel"]
                     .iter()
@@ -435,22 +442,26 @@ impl Widget<Msg, iced::Theme, Renderer> for Layer<'_> {
 }
 
 fn draw_text(renderer: &mut Renderer, content: &str, position: Point, clip: Rectangle, look: Look) {
-    renderer.fill_text(
-        iced::advanced::text::Text {
-            content: content.to_owned(),
-            bounds: clip.size(),
-            size: iced::Pixels(look.px),
-            line_height: iced::advanced::text::LineHeight::Absolute(iced::Pixels(look.px * 1.4)),
-            font: look.ui_font,
-            align_x: iced::advanced::text::Alignment::Left,
-            align_y: iced::alignment::Vertical::Top,
-            shaping: iced::advanced::text::Shaping::Advanced,
-            wrapping: iced::advanced::text::Wrapping::None,
-        },
-        position,
-        look.tokens.popover_text,
-        clip,
-    );
+    renderer.with_layer(clip, |renderer| {
+        renderer.fill_text(
+            iced::advanced::text::Text {
+                content: content.to_owned(),
+                bounds: clip.size(),
+                size: iced::Pixels(look.px),
+                line_height: iced::advanced::text::LineHeight::Absolute(iced::Pixels(
+                    look.px * 1.4,
+                )),
+                font: look.ui_font,
+                align_x: iced::advanced::text::Alignment::Left,
+                align_y: iced::alignment::Vertical::Top,
+                shaping: iced::advanced::text::Shaping::Advanced,
+                wrapping: iced::advanced::text::Wrapping::None,
+            },
+            position,
+            look.tokens.popover_text,
+            clip,
+        )
+    });
 }
 
 #[cfg(test)]
