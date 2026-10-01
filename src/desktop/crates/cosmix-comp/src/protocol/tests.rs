@@ -2663,6 +2663,8 @@ fn mozilla_peer_credentials_filter_the_registry() {
 #[cfg(feature = "bus")]
 #[test]
 fn mozilla_single_seat_keeps_human_motion_buttons_and_drag_delivery() {
+    use crate::port::{InputOp, PressAction};
+
     let mut h = KeybindingHarness::new(false);
     let serial = u32::from(test_toplevel_record(&h).required_configure.unwrap());
     send_request(&mut h.client, TEST_XDG_SURFACE_ID, 4, &words(&[serial]));
