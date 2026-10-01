@@ -2969,7 +2969,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-actions"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "cosmix-lib-config",
  "serde",
@@ -3134,7 +3134,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-dopus"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3606,7 +3606,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-term"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "bytes",
  "cosmix-design",

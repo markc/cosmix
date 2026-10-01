@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.3 — 2026-10-01
+
+- Allow DOpus's Tab pane switch while editing the location bar; modal dialogs
+  retain their keyboard scope.
+
 ## 0.4.2 — 2026-09-27
 
 - Add `view.toggle-places` and `view.toggle-properties`, with Ctrl+B/Ctrl+I dopus defaults.

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.2
+
+- Tab switches panes from the location editor too, dismissing the draft
+  without navigating. Dialogs retain Tab for their own controls.
+
 ## 0.3.1
 
 - Remove the Places and Properties headings; align first-content baselines

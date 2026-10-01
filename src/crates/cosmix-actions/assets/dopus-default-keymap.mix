@@ -19,7 +19,7 @@
     { action: "nav.parent", chord: ["Backspace"], scope: "global", repeat: "ignore", allow_in_editable: false },
     { action: "nav.home", chord: ["Alt+Home"], scope: "global", repeat: "ignore", allow_in_editable: false },
     { action: "nav.switch-pane", chord: ["F6"], scope: "global", repeat: "ignore", allow_in_editable: false },
-    { action: "nav.switch-pane", chord: ["Tab"], scope: "global", repeat: "ignore", allow_in_editable: false },
+    { action: "nav.switch-pane", chord: ["Tab"], scope: "global", repeat: "ignore", allow_in_editable: true },
 
     { action: "view.refresh", chord: ["F5"], scope: "global", repeat: "ignore", allow_in_editable: false },
     { action: "view.refresh", chord: ["Ctrl+R"], scope: "global", repeat: "ignore", allow_in_editable: false },

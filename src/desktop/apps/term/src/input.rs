@@ -94,7 +94,8 @@ pub fn action_for(
     if matches!(key, Key::Named(Named::Tab)) {
         return Some(Action::CyclePane { forward: !shift });
     }
-    let is = |candidate: &Key, text: &str| matches!(candidate.as_ref(), Key::Character(c) if c == text);
+    let is =
+        |candidate: &Key, text: &str| matches!(candidate.as_ref(), Key::Character(c) if c == text);
     if is(modified, "+") || is(modified, "=") || is(key, "+") || is(key, "=") {
         return Some(Action::FontIncrease);
     }
@@ -144,10 +145,59 @@ pub fn action_on_screen(action: Option<Action>, alternate: bool) -> Option<Actio
     action.filter(|action| !alternate || !matches!(action, Action::Scroll(_)))
 }
 
+/// Right Shift switches tabs; the left key retains shell arrow behaviour.
+pub fn navigation_action(
+    key: &Key,
+    modifiers: Modifiers,
+    right_shift: bool,
+) -> Option<Action> {
+    if modifiers.control() || modifiers.alt() || modifiers.logo() {
+        return None;
+    }
+    if right_shift && modifiers.shift() {
+        return match key {
+            Key::Named(Named::ArrowLeft) => Some(Action::Cycle { forward: false }),
+            Key::Named(Named::ArrowRight) => Some(Action::Cycle { forward: true }),
+            _ => None,
+        };
+    }
+    None
+}
+
+/// iced's modifier mask merges both Shift keys. Track the physical right
+/// key on the lossless widget path, and clear it when Shift is released.
+pub fn right_shift_after(event: &iced::keyboard::Event, held: bool) -> bool {
+    use iced::keyboard::{Event, Location};
+    match event {
+        Event::KeyPressed {
+            key,
+            physical_key,
+            location,
+            ..
+        }
+        | Event::KeyReleased {
+            key,
+            physical_key,
+            location,
+            ..
+        } if *physical_key == Physical::Code(Code::ShiftRight)
+            || (matches!(key, Key::Named(Named::Shift)) && *location == Location::Right) =>
+        {
+            matches!(event, Event::KeyPressed { .. })
+        }
+        Event::ModifiersChanged(modifiers) if !modifiers.shift() => false,
+        _ => held,
+    }
+}
+
 /// Layout order is the pane tree's first-child/second-child traversal.
 pub fn cycle_pane(ids: &[u64], active: u64, forward: bool) -> Option<u64> {
     let current = ids.iter().position(|id| *id == active)?;
-    let next = if forward { (current + 1) % ids.len() } else { (current + ids.len() - 1) % ids.len() };
+    let next = if forward {
+        (current + 1) % ids.len()
+    } else {
+        (current + ids.len() - 1) % ids.len()
+    };
     Some(ids[next])
 }
 

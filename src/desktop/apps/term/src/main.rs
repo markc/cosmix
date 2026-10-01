@@ -82,14 +82,15 @@ fn main() {
              Keys: Ctrl+Shift+T/W new/close tab, Ctrl+PageUp/PageDown change tab,\n\
              \x20     Ctrl+Shift+E/O split side by side/stacked, Ctrl+Shift+X close pane,\n\
              \x20     Ctrl+Shift+arrows move focus, Ctrl+Shift+Q quit,\n\
-             \x20     Ctrl+Tab / Ctrl+Shift+Tab next / previous pane (wrap),\n\
+             \x20     Tab / Shift+Tab switch split panes; Ctrl+Tab / Ctrl+Shift+Tab also cycle,\n\
+             \x20     Right Shift+Left/Right previous / next tab (wrap),\n\
              \x20     Ctrl+Shift+C copy; Ctrl+Shift+V or Shift+Insert paste clipboard\n\
              \x20     Drag selects; double/triple click word/line; middle click pastes primary\n\
              \x20     Shift+mouse overrides application mouse reporting\n\
              \x20     Ctrl+plus/equal/minus/0 (and Ctrl+wheel) font size\n\
              \x20     Wheel scrolls; Shift forces history; Shift+PageUp/PageDown page history\n\
              \x20     Shift+Home/End history top/bottom (primary screen only)\n\
-             \x20     Input returns to bottom; bare Tab goes to the shell\n\
+             \x20     Input returns to bottom; single-pane Tab or Ctrl+I goes to the shell\n\
              TERM_NOTIFY=0: no desktop notification when a pane's shell exits\n\
              --version: print version and build hash, and nothing else\n\
              --print-config: print resolved startup settings and exit\n\
@@ -194,6 +195,7 @@ fn run(settings: config::Settings) -> Result<(), String> {
         shape: Shape::default(),
         grids: HashMap::new(),
         modifiers: iced::keyboard::Modifiers::empty(),
+        right_shift: std::cell::Cell::new(false),
         wheel: 0.0,
         scroll_wheel: 0.0,
         scroll_pane: None,
@@ -329,6 +331,7 @@ struct State {
     grids: HashMap<u64, (u16, u16)>,
     /// Tracked for Ctrl+wheel: a mouse event carries no modifier state.
     modifiers: iced::keyboard::Modifiers,
+    right_shift: std::cell::Cell<bool>,
     /// Fractional Ctrl+wheel travel not yet worth a font step.
     wheel: f32,
     /// History and zoom gestures never share fractional travel.
@@ -358,6 +361,7 @@ enum Message {
     Ime(iced::advanced::input_method::Event),
     /// A chord the terminal answers itself (tabs, panes, font size).
     Action(Action),
+    Tab { forward: bool, repeat: bool },
     Modifiers(iced::keyboard::Modifiers),
     SelectTab(u64),
     Mouse(iced::mouse::Event, iced::Point, Instant),
@@ -497,6 +501,24 @@ fn update_message(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::Scale(scale) => state.rescale(scale),
         Message::Keys(keys) => state.send_keys(keys),
+        Message::Tab { forward, repeat } => {
+            // Widget events can be batched before messages are applied. The
+            // preceding message may have switched tabs or changed the split.
+            let split = {
+                let tabs = state.tabs.lock().expect("tabs");
+                if tabs.is_empty() {
+                    return Task::none();
+                }
+                tabs.leaves().len() > 1
+            };
+            if split {
+                if !repeat {
+                    return state.act(Action::CyclePane { forward });
+                }
+            } else {
+                state.send_keys(vec![cosmix_term_core::terminal::Key::Tab]);
+            }
+        }
         Message::Ime(event) => {
             use iced::advanced::input_method::{Event, Preedit};
             // Closed acknowledges the disable even after window focus loss.
@@ -597,6 +619,7 @@ fn update_message(state: &mut State, message: Message) -> Task<Message> {
             // into a zoom.
             iced::window::Event::Unfocused => {
                 state.keyboard_focus = false;
+                state.right_shift.set(false);
                 state.ime.cancel();
                 state.ime_preedit = None;
                 state.cancel_mouse_gesture();
@@ -614,11 +637,21 @@ fn update_message(state: &mut State, message: Message) -> Task<Message> {
 /// The keyboard, routed from the widget tree. A terminal chord wins over the
 /// shell encoder — without that order, Ctrl+Shift+T would reach the PTY as a
 /// Ctrl-T (`input::tests::a_tab_chord_would_otherwise_reach_the_shell_as_a_control_code`).
+#[cfg(test)]
 fn on_key(event: &iced::keyboard::Event) -> Option<Message> {
     on_key_screen(event, false)
 }
 
+#[cfg(test)]
 fn on_key_screen(event: &iced::keyboard::Event, alternate: bool) -> Option<Message> {
+    on_key_context(event, alternate, false)
+}
+
+fn on_key_context(
+    event: &iced::keyboard::Event,
+    alternate: bool,
+    right_shift: bool,
+) -> Option<Message> {
     match event {
         iced::keyboard::Event::KeyPressed {
             key,
@@ -629,8 +662,16 @@ fn on_key_screen(event: &iced::keyboard::Event, alternate: bool) -> Option<Messa
             repeat,
             ..
         } => {
+            if matches!(key, iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab))
+                && !modifiers.control()
+                && !modifiers.alt()
+                && !modifiers.logo()
+            {
+                return Some(Message::Tab { forward: !modifiers.shift(), repeat: *repeat });
+            }
             if let Some(action) = input::action_on_screen(
-                input::action_for(key, modified_key, *physical_key, *modifiers),
+                input::navigation_action(key, *modifiers, right_shift)
+                    .or_else(|| input::action_for(key, modified_key, *physical_key, *modifiers)),
                 alternate,
             ) {
                 // A repeat of a non-repeating chord is swallowed, not passed
@@ -699,7 +740,10 @@ fn view(state: &State) -> Element<'_, Message> {
     let last = std::cell::Cell::new(state.pointer.get().and_then(&hovered));
     let mouse = clipboard::MouseEvents::new(state);
     let mut content = keys::keys(column![tab_strip(state, scale), panes], move |event| {
-        let message = on_key(event);
+        state
+            .right_shift
+            .set(input::right_shift_after(event, state.right_shift.get()));
+        let message = on_key_context(event, false, state.right_shift.get());
         // Ordinary typing must not acquire an extra terminal/grid lock just
         // to decide who owns a scrollback chord.
         if matches!(message, Some(Message::Action(Action::Scroll(_)))) {
@@ -711,7 +755,7 @@ fn view(state: &State) -> Element<'_, Message> {
                     .expect("terminal")
                     .alternate_screen()
             {
-                return on_key_screen(event, true);
+                return on_key_context(event, true, state.right_shift.get());
             }
         }
         message
@@ -1299,6 +1343,118 @@ mod tests {
     }
 
     #[test]
+    fn tab_is_deferred_and_right_shift_arrows_win_before_pty_encoding() {
+        use iced::keyboard::{Key, Modifiers, key::Named};
+        for alternate in [false, true] {
+            for (key, modifiers, right_shift, action) in [
+                (
+                    Named::ArrowLeft,
+                    Modifiers::SHIFT,
+                    true,
+                    Action::Cycle { forward: false },
+                ),
+                (
+                    Named::ArrowRight,
+                    Modifiers::SHIFT,
+                    true,
+                    Action::Cycle { forward: true },
+                ),
+            ] {
+                let key = Key::Named(key);
+                let event = press(key.clone(), key.clone(), modifiers, None, false);
+                assert!(
+                    matches!(on_key_context(&event, alternate, right_shift),
+                    Some(Message::Action(found)) if found == action)
+                );
+                let event = press(key.clone(), key, modifiers, None, true);
+                assert!(on_key_context(&event, alternate, right_shift).is_none());
+            }
+        }
+        let key = Key::Named(Named::Tab);
+        let event = press(key.clone(), key, Modifiers::empty(), Some("\t"), false);
+        assert!(matches!(
+            on_key_context(&event, false, false),
+            Some(Message::Tab { forward: true, repeat: false })
+        ));
+        let key = Key::Named(Named::ArrowRight);
+        let event = press(key.clone(), key, Modifiers::SHIFT, None, false);
+        assert!(matches!(
+            on_key_context(&event, false, false),
+            Some(Message::Keys(_))
+        ));
+        let event = press(character("i"), character("i"), Modifiers::CTRL, None, false);
+        let Some(Message::Keys(keys)) = on_key_context(&event, false, false) else {
+            panic!("Ctrl+I must send a literal tab in a split");
+        };
+        assert_eq!(
+            keys.into_iter()
+                .flat_map(cosmix_term_core::terminal::encode)
+                .collect::<Vec<_>>(),
+            b"\t"
+        );
+    }
+
+    #[test]
+    fn right_shift_tracks_physical_press_release_and_modifier_reset() {
+        use iced::keyboard::{
+            Event, Key, Location, Modifiers,
+            key::{Code, Named, Physical},
+        };
+        let mut event = press(
+            Key::Named(Named::Shift),
+            Key::Named(Named::Shift),
+            Modifiers::SHIFT,
+            None,
+            false,
+        );
+        if let Event::KeyPressed {
+            physical_key,
+            location,
+            ..
+        } = &mut event
+        {
+            *physical_key = Physical::Code(Code::ShiftRight);
+            *location = Location::Right;
+        }
+        assert!(input::right_shift_after(&event, false));
+        let left = press(
+            Key::Named(Named::Shift),
+            Key::Named(Named::Shift),
+            Modifiers::SHIFT,
+            None,
+            false,
+        );
+        assert!(!input::right_shift_after(&left, false));
+        assert!(input::right_shift_after(&left, true));
+        let release = Event::KeyReleased {
+            key: Key::Named(Named::Shift),
+            modified_key: Key::Named(Named::Shift),
+            physical_key: Physical::Code(Code::ShiftRight),
+            location: Location::Right,
+            modifiers: Modifiers::SHIFT, // left Shift is still down
+        };
+        assert!(!input::right_shift_after(&release, true));
+        assert!(!input::right_shift_after(
+            &Event::ModifiersChanged(Modifiers::empty()),
+            true
+        ));
+        for extra in [Modifiers::CTRL, Modifiers::ALT, Modifiers::LOGO] {
+            assert_eq!(
+                input::navigation_action(
+                    &Key::Named(Named::ArrowRight),
+                    Modifiers::SHIFT | extra,
+                    true
+                ),
+                None
+            );
+            assert_eq!(
+                input::navigation_action(&Key::Named(Named::Tab), extra, false),
+                None
+            );
+        }
+    }
+
+    #[test]
     fn clipboard_chords_win_before_pty_encoding_and_swallow_repeats() {
         use iced::keyboard::{Key, Modifiers, key::Named};
         for (key, mods, expected) in [
@@ -1528,6 +1684,7 @@ mod tests {
             shape: Shape::default(),
             grids: HashMap::new(),
             modifiers: iced::keyboard::Modifiers::empty(),
+            right_shift: std::cell::Cell::new(false),
             wheel: 0.0,
             scroll_wheel: 0.0,
             scroll_pane: None,
@@ -1567,11 +1724,53 @@ mod tests {
         assert_eq!(read().as_deref(), Some(text.as_bytes()));
         assert_eq!(read(), None);
         assert!(state.ime_preedit.is_none());
+        state.right_shift.set(true);
         let _ = update(&mut state, Message::Window(iced::window::Event::Unfocused));
+        assert!(!state.right_shift.get());
         let _ = update(&mut state, Message::Ime(Event::Commit(text.into())));
         assert_eq!(read(), None);
         let removed = state.tabs.lock().unwrap().shutdown();
         state.cleanup.submit(removed);
+        drop(state);
+        reaper.join().unwrap();
+    }
+
+    #[test]
+    fn tab_uses_live_panes_after_a_tab_switch_without_a_layout_wake() {
+        use cosmix_term_core::{panes::SplitDir, terminal::Terminal};
+        let (mut state, reaper) = test_state();
+        let _ = state.sync();
+        let _ = state.act(Action::Split(SplitDir::Vertical));
+        let _ = state.sync();
+        assert_eq!(state.shape.visible().len(), 2);
+        let _ = state.act(Action::NewTab);
+        let terminal = state.tabs.lock().unwrap().active_terminal();
+        *terminal.lock().unwrap() = Terminal::from_test_vt(8, 3, b"");
+        let read = terminal.lock().unwrap().listener.test_input_reader();
+        // Shape still describes the split tab, but this tab has one pane.
+        for repeat in [false, true] {
+            let _ = update(&mut state, Message::Tab { forward: true, repeat });
+            assert_eq!(read().as_deref(), Some(&b"\t"[..]));
+        }
+        let _ = state.sync();
+        assert_eq!(state.shape.visible().len(), 1);
+        let _ = state.act(Action::Cycle { forward: false });
+        let ids: Vec<_> = state.tabs.lock().unwrap().leaves().iter().map(|pane| pane.id).collect();
+        assert_eq!(ids.len(), 2);
+        let before = state.tabs.lock().unwrap().active_tab().active_pane;
+        let _ = update(&mut state, Message::Tab { forward: true, repeat: false });
+        let after = state.tabs.lock().unwrap().active_tab().active_pane;
+        assert_eq!(Some(after), input::cycle_pane(&ids, before, true));
+        assert_ne!(after, before);
+        let _ = update(&mut state, Message::Tab { forward: true, repeat: true });
+        assert_eq!(state.tabs.lock().unwrap().active_tab().active_pane, after);
+        let _ = update(&mut state, Message::Tab { forward: false, repeat: false });
+        assert_eq!(state.tabs.lock().unwrap().active_tab().active_pane, before);
+        assert!(read().is_none());
+        let removed = state.tabs.lock().unwrap().shutdown();
+        let _ = update(&mut state, Message::Tab { forward: true, repeat: false });
+        state.cleanup.submit(removed);
+        drop(terminal);
         drop(state);
         reaper.join().unwrap();
     }

@@ -917,6 +917,9 @@ impl Dopus {
         let mut quit = false;
         let mut tasks = Vec::new();
         for action in actions {
+            if *action == cosmix_actions::filemgr::NAV_SWITCH_PANE {
+                self.stop_editing();
+            }
             if *action == cosmix_actions::theme::MODE_TOGGLE {
                 let mode = match self
                     .theme_override
@@ -1286,6 +1289,19 @@ mod tests {
         ]));
         assert_eq!(app.core.pane(PaneId::Left).show_hidden, !left_hidden);
         assert_eq!(app.core.pane(PaneId::Right).show_hidden, !right_hidden);
+    }
+
+    #[test]
+    fn switching_panes_dismisses_location_editing_without_submitting_the_draft() {
+        let (_dir, mut app) = fixture();
+        let original = app.core.pane(PaneId::Left).path.clone();
+        let _ = app.begin_edit(PaneId::Left);
+        let _ = app.update(Msg::LocationInput("unsubmitted-draft".into()));
+        let _ = app.update(Msg::Actions(vec![cosmix_actions::filemgr::NAV_SWITCH_PANE]));
+        assert_eq!(app.core.active(), PaneId::Right);
+        assert_eq!(app.core.pane(PaneId::Left).path, original);
+        assert!(app.editing.is_none());
+        assert!(!app.router.lock().unwrap().focus_editable);
     }
 
     #[test]

@@ -472,12 +472,14 @@ closes the tab, and closing the last tab quits. A shell that exits on its own
 raises a desktop notification, as in bterm. Set <code>TERM_NOTIFY=0</code> to turn that
 off.</p>
 <h2 id="keys">Keys</h2>
-<p>Tab and pane chords need Ctrl and Shift, or Ctrl alone where shown.
-Any chord that also holds Alt or Super is left alone.</p>
+<p>Tab and pane chords use the modifiers shown below. Any chord that also
+holds Alt or Super is left alone.</p>
 <table><thead><tr><th>Keys</th><th>Action</th></tr></thead><tbody>
 <tr><td>Ctrl+Shift+T</td><td>new tab</td></tr>
 <tr><td>Ctrl+Shift+W</td><td>close the active tab</td></tr>
 <tr><td>Ctrl+PageDown / Ctrl+PageUp</td><td>next / previous tab</td></tr>
+<tr><td>Right Shift+Right / Right Shift+Left</td><td>next / previous tab</td></tr>
+<tr><td>Tab / Shift+Tab (with split panes)</td><td>next / previous pane in layout order, wrapping at either end</td></tr>
 <tr><td>Ctrl+Tab / Ctrl+Shift+Tab</td><td>next / previous pane in the current tab, in layout order, wrapping at either end</td></tr>
 <tr><td>Ctrl+Shift+E</td><td>split the focused pane side by side</td></tr>
 <tr><td>Ctrl+Shift+O</td><td>split the focused pane top and bottom</td></tr>
@@ -488,8 +490,11 @@ Any chord that also holds Alt or Super is left alone.</p>
 <p>Held, these chords do not repeat. A held Ctrl+Shift+T opens one tab, and
 the repeats are dropped rather than sent to the shell.</p>
 <p>Pane cycling changes only keyboard focus within the current tab, following
-the split tree's first pane before its second pane. Bare Tab still goes to
-the shell.</p>
+the split tree's first pane before its second pane. Bare Tab goes to the
+shell when the tab has one pane; with splits it switches pane focus.
+Ctrl+I sends a literal tab to the shell, including for completion in a split.
+Left Shift+arrows retain their shell behaviour. Right Shift tab switching
+wraps and resets on key release or window focus loss.</p>
 <p>Everything else goes to the focused pane's shell. That means printable text
 in any keyboard layout, Enter, Backspace, Tab, Escape, the arrows, Home, End,
 Delete, PageUp, PageDown and Ctrl+A through Ctrl+Z.</p>

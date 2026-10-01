@@ -39,14 +39,16 @@ off.
 
 ## Keys
 
-Tab and pane chords need Ctrl and Shift, or Ctrl alone where shown.
-Any chord that also holds Alt or Super is left alone.
+Tab and pane chords use the modifiers shown below. Any chord that also
+holds Alt or Super is left alone.
 
 | Keys | Action |
 |---|---|
 | Ctrl+Shift+T | new tab |
 | Ctrl+Shift+W | close the active tab |
 | Ctrl+PageDown / Ctrl+PageUp | next / previous tab |
+| Right Shift+Right / Right Shift+Left | next / previous tab |
+| Tab / Shift+Tab (with split panes) | next / previous pane in layout order, wrapping at either end |
 | Ctrl+Tab / Ctrl+Shift+Tab | next / previous pane in the current tab, in layout order, wrapping at either end |
 | Ctrl+Shift+E | split the focused pane side by side |
 | Ctrl+Shift+O | split the focused pane top and bottom |
@@ -58,8 +60,11 @@ Held, these chords do not repeat. A held Ctrl+Shift+T opens one tab, and
 the repeats are dropped rather than sent to the shell.
 
 Pane cycling changes only keyboard focus within the current tab, following
-the split tree's first pane before its second pane. Bare Tab still goes to
-the shell.
+the split tree's first pane before its second pane. Bare Tab goes to the
+shell when the tab has one pane; with splits it switches pane focus.
+Ctrl+I sends a literal tab to the shell, including for completion in a split.
+Left Shift+arrows retain their shell behaviour. Right Shift tab switching
+wraps and resets on key release or window focus loss.
 
 Everything else goes to the focused pane's shell. That means printable text
 in any keyboard layout, Enter, Backspace, Tab, Escape, the arrows, Home, End,

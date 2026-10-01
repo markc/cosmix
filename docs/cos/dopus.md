@@ -272,11 +272,12 @@ open/width values even headless; a refusal never changes them.
 
 Clicking a location bar also edits it. Enter submits the real path text,
 Escape cancels, and clicking a listing or another control dismisses the
-edit. While editing, default browse/file shortcuts are suppressed by
+edit. Tab also dismisses the draft and switches panes without submitting it.
+While editing, other default browse/file shortcuts are suppressed by
 `FocusContext`; clipboard and undo keys belong to the field.
 Dialogs own Enter/Escape and suppress browse actions. Tab passes through to
-editors and dialogs instead of switching panes. Ctrl+R and Ctrl+E also remain
-suppressed there. These alternates avoid desktop grabs of plain function keys;
+dialogs instead of switching panes. Ctrl+R and Ctrl+E remain suppressed in
+editors and dialogs. These alternates avoid desktop grabs of plain function keys;
 tooltips include all effective bindings. Location bars use the quiet `input`
 border role at rest and the accent `ring` only while the editor is focused.
 

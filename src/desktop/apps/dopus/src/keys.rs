@@ -803,7 +803,7 @@ mod tests {
         router.focus_editable = true;
         let context = focus_context(&router);
         let mut state = ResolveState::default();
-        for text in ["Tab", "Ctrl+R", "Ctrl+E"] {
+        for text in ["Ctrl+R", "Ctrl+E"] {
             let resolved = resolve(
                 press(text).unwrap(),
                 &context,
@@ -813,6 +813,14 @@ mod tests {
             );
             assert!(resolved.actions.is_empty(), "{text} fired while editing");
         }
+        let resolved = resolve(
+            press("Tab").unwrap(),
+            &context,
+            &router.keymap,
+            &mut state,
+            tick(),
+        );
+        assert_eq!(resolved.actions, [filemgr::NAV_SWITCH_PANE]);
     }
 
     #[test]
