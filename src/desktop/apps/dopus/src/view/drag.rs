@@ -899,7 +899,7 @@ mod tests {
             is_dir: false,
             pointer: Point::new(100.0, 10.0),
             target: Some(Target {
-                path: target,
+                path: target.clone(),
                 root: dir.path().to_path_buf(),
                 bounds: viewport,
                 highlight: Rectangle {

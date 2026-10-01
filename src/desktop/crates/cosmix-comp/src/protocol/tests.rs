@@ -24415,9 +24415,11 @@ fn drag_icon_source_and_icon_destruction_retire_artwork() {
 fn drag_icon_subsurface_tree_moves_and_unmaps_with_root() {
     let (mut harness, icon, root_object, _) = start_precommitted_drag_icon();
     let subcompositor = harness.bind_test_global("wl_subcompositor", 1);
+    // The buffer helper dispatches immediately: create its object IDs before
+    // reserving unsent child IDs, so the wire never creates an ID across a gap.
+    let child_buffer = harness.create_dmabuf_buffer_sized(16, 8);
     let child = harness.allocate_object_id();
     let subsurface = harness.allocate_object_id();
-    let child_buffer = harness.create_dmabuf_buffer_sized(16, 8);
     send_request(&mut harness.client, TEST_COMPOSITOR_ID, 0, &words(&[child]));
     send_request(
         &mut harness.client,
