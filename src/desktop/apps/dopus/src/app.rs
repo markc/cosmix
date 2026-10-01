@@ -581,6 +581,8 @@ impl Dopus {
                     .is_none_or(|path| !self.core.pane(pane).selected_paths.contains(path))
                 {
                     self.core.select_path(pane, path);
+                } else if let Some(path) = path {
+                    self.core.focus_selected_path(pane, path);
                 }
             }
             rows::RowsMsg::Toggle(path) => self.core.toggle_expand(pane, &path),
@@ -1443,6 +1445,14 @@ mod tests {
         let _ = app.on_rows(pane, right_click(Some(paths[0].clone())));
         assert_eq!(app.core.active(), pane);
         assert_eq!(app.core.selected_paths(pane), paths[..2]);
+        assert_eq!(app.core.pane(pane).selected.as_ref(), Some(&paths[0]));
+        app.core.open_selection();
+        let events = app.core.tick(Instant::now());
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, CoreEvent::OpenFile(path) if path == &paths[0]))
+        );
         let items = app.context_items();
         assert!(
             items
@@ -1470,6 +1480,107 @@ mod tests {
                 .unwrap()
                 .is_enabled()
         );
+    }
+
+    #[test]
+    fn context_popup_survives_pane_retarget_and_owns_navigation_keys() {
+        use iced::{Event, keyboard, mouse};
+        let (dir, mut app) = fixture();
+        for sidebar in [
+            cosmix_dopus_core::config::Sidebar::Places,
+            cosmix_dopus_core::config::Sidebar::Properties,
+        ] {
+            if app.core.sidebar(sidebar).open {
+                app.core.toggle_sidebar(sidebar);
+            }
+        }
+        let paths: Vec<_> = ["a", "b"].map(|name| dir.path().join(name)).into();
+        app.core.on_event(CoreEvent::ListingArrived {
+            pane: PaneId::Right,
+            generation: app.core.pane(PaneId::Right).generation,
+            path: dir.path().to_owned(),
+            root: true,
+            result: Ok(paths
+                .iter()
+                .map(|path| cosmix_dopus_core::FileEntry {
+                    name: path.file_name().unwrap().to_string_lossy().into_owned(),
+                    path: path.clone(),
+                    is_dir: false,
+                    size: Some(1),
+                    child_count: None,
+                    modified: None,
+                })
+                .collect()),
+        });
+        app.core.select_path(PaneId::Right, Some(paths[0].clone()));
+        app.core
+            .select_modified(PaneId::Right, paths[1].clone(), true, false);
+        app.core.set_active_pane(PaneId::Left);
+        app.refresh_panes();
+        let mut renderer = Renderer::new(app.look().ui_font, iced::Pixels(app.look().px));
+        let cursor = mouse::Cursor::Available(iced::Point::new(450.0, 110.0));
+        let size = iced::Size::new(600.0, 300.0);
+        let mut ui = iced_runtime::UserInterface::build(
+            app.view(),
+            size,
+            iced_runtime::user_interface::Cache::new(),
+            &mut renderer,
+        );
+        let mut messages = Vec::new();
+        ui.update(
+            &[Event::Mouse(mouse::Event::ButtonPressed(
+                mouse::Button::Right,
+            ))],
+            cursor,
+            &mut renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        let cache = ui.into_cache();
+        assert!(messages.iter().any(|message| matches!(
+            message,
+            Msg::PaneRows(PaneId::Right, rows::RowsMsg::ContextMenu(Some(_), _))
+        )));
+        for message in messages.drain(..) {
+            let _ = app.update(message);
+        }
+        assert_eq!(app.core.active(), PaneId::Right);
+        assert_eq!(app.core.selected_paths(PaneId::Right), paths);
+        let focused = app.core.pane(PaneId::Right).selected.clone();
+        let mut ui = iced_runtime::UserInterface::build(app.view(), size, cache, &mut renderer);
+        let key = |named| {
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(named),
+                modified_key: keyboard::Key::Named(named),
+                physical_key: keyboard::key::Physical::Unidentified(
+                    keyboard::key::NativeCode::Unidentified,
+                ),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            })
+        };
+        let (_, statuses) = ui.update(
+            &[
+                key(keyboard::key::Named::ArrowDown),
+                key(keyboard::key::Named::Enter),
+            ],
+            cursor,
+            &mut renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        assert!(
+            statuses
+                .iter()
+                .all(|status| *status == iced::event::Status::Captured)
+        );
+        assert!(matches!(messages.as_slice(), [Msg::Actions(actions)]
+            if actions == &[cosmix_actions::filemgr::FILE_OPEN]));
+        drop(ui);
+        assert_eq!(app.core.pane(PaneId::Right).selected, focused);
+        assert_eq!(app.core.selected_paths(PaneId::Right), paths);
     }
 
     #[test]

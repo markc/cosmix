@@ -3147,6 +3147,7 @@ dependencies = [
  "cosmix-lib-client",
  "cosmix-lib-config",
  "iced",
+ "iced_runtime",
  "iced_tiny_skia",
  "resvg",
  "serde",

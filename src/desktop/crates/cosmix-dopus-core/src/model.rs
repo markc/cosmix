@@ -796,6 +796,19 @@ impl DopusCore {
         self.emit(CoreEvent::InfoChanged);
     }
 
+    /// Focus a selected member without changing the group or range anchor.
+    pub fn focus_selected_path(&mut self, pane: PaneId, path: PathBuf) -> bool {
+        let model = &mut self.panes[pane.index()];
+        if !model.selected_paths.contains(&path) {
+            return false;
+        }
+        model.selected = Some(path);
+        self.active = pane;
+        self.emit(CoreEvent::SelectionChanged { pane });
+        self.emit(CoreEvent::InfoChanged);
+        true
+    }
+
     /// Selection in visible order, followed by any pinned paths not in the
     /// projection. No filesystem work is performed by this snapshot.
     pub fn selected_paths(&self, pane: PaneId) -> Vec<PathBuf> {

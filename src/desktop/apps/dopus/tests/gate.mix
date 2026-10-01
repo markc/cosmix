@@ -1,10 +1,10 @@
 -- Focused DOpus gates. Run from the repository src directory on a build worker.
 for $command in [
-  ["cargo", "fmt", "--manifest-path", "desktop/Cargo.toml", "-p", "cosmix-dopus", "-p", "cosmix-dopus-core", "--", "--check"],
-  ["cargo", "test", "--manifest-path", "desktop/Cargo.toml", "-p", "cosmix-dopus", "-p", "cosmix-dopus-core", "-p", "cosmix-iced-widgets"],
-  ["cargo", "clippy", "--manifest-path", "desktop/Cargo.toml", "-p", "cosmix-dopus", "-p", "cosmix-dopus-core", "--all-targets", "--", "-D", "warnings"],
-  ["cargo", "build", "--manifest-path", "desktop/Cargo.toml", "-p", "cosmix-dopus", "--release"]
+  ["cargo", "fmt", "-p", "cosmix-dopus", "-p", "cosmix-dopus-core", "--", "--check"],
+  ["cargo", "test", "-p", "cosmix-dopus", "-p", "cosmix-dopus-core", "-p", "cosmix-iced-widgets"],
+  ["cargo", "clippy", "-p", "cosmix-dopus", "-p", "cosmix-dopus-core", "--all-targets", "--", "-D", "warnings"],
+  ["cargo", "build", "-p", "cosmix-dopus", "--release"]
 ]
   print(join($command, " "))
-  print(run_argv_must($command, {timeout: 7200, stderr: "stdout"}))
+  print(run_argv_must($command, {cwd: "desktop", timeout: 7200, stderr: "stdout"}))
 end
