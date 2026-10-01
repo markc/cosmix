@@ -2116,7 +2116,7 @@ impl SeatHandler for WaylandState {
         let focused_root = focused_surface
             .as_ref()
             .map(|surface| canonical_root_surface(&self.popup_manager, surface));
-        // Data-device focus is still withheld from X11 targets, but the reason
+        // Clipboard and primary focus are still withheld from X11 targets, but the reason
         // CHANGED with X-2b and the old one ("comp refuses to bridge") is no
         // longer true. Xwayland is itself a Wayland client, so granting it
         // data-device focus would give it a second, independent route to the
@@ -2124,7 +2124,7 @@ impl SeatHandler for WaylandState {
         // racing to own the same clipboard. The bridge serves X pastes through
         // `request_*_client_selection`, which needs no data-device focus for
         // Xwayland at all.
-        let data_device_client = (!self.session_lock_active())
+        let selection_client = (!self.session_lock_active())
             .then(|| match focused {
                 Some(SeatFocusTarget::Wayland(surface)) => surface.client(),
                 #[cfg(feature = "xwayland")]
@@ -2132,7 +2132,8 @@ impl SeatHandler for WaylandState {
                 None => None,
             })
             .flatten();
-        set_data_device_focus(&self.display_handle, seat, data_device_client);
+        set_data_device_focus(&self.display_handle, seat, selection_client.clone());
+        set_primary_focus(&self.display_handle, seat, selection_client);
         // Keep text-input bookkeeping on the supplied seat. Smithay also
         // updates it from WlSurface keyboard enter/leave; this assignment is
         // idempotent and uses the same resolved surface as data-device focus.

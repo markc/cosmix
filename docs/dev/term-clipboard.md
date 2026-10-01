@@ -89,7 +89,11 @@ disables IME until the runtime acknowledges the reset. A commit is accepted
 only for the active owner, so queued commits cannot reach another pane.
 The Bus `encode_text` contract remains ASCII-only.
 PRIMARY requires compositor primary-selection
-support; missing clipboard offers produce no input. Clipboard writes have no
+support and primary-selection focus on the terminal's client. CosMix Comp
+updates both selection foci with keyboard focus on each seat. New selection
+offers reach the focused Wayland client and are withheld from normal clients
+while the session is locked. PRIMARY and CLIPBOARD remain independent.
+Missing clipboard offers produce no input. Clipboard writes have no
 success acknowledgement in iced, so end-to-end Wayland delivery still needs a
 live compositor check.
 
@@ -98,6 +102,8 @@ capture colours/damage, paste encoding/admission, a 1 MiB paste delivered
 through Rio's FIFO followed by a key and a VT reply, control queue limits,
 chord precedence, cancelled gestures and click counting. See also the
 [key and scrollback reference](../cos/term.md).
+Compositor wire regressions exercise ordinary PRIMARY offers and byte transfers
+on both seats, CLIPBOARD independence, focus loss/restoration and session lock.
 
 ## Known limits
 

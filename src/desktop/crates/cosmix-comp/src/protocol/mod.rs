@@ -195,7 +195,7 @@ use smithay::{
                 DataControlHandler as ExtDataControlHandler,
                 DataControlState as ExtDataControlState,
             },
-            primary_selection::{PrimarySelectionHandler, PrimarySelectionState},
+            primary_selection::{PrimarySelectionHandler, PrimarySelectionState, set_primary_focus},
             wlr_data_control::{
                 DataControlHandler as WlrDataControlHandler,
                 DataControlState as WlrDataControlState,
