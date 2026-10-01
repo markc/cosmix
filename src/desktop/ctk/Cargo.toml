@@ -3,7 +3,7 @@
 # consumed by apps over a `../../ctk` path dependency. See desktop/APPS.md.
 [package]
 name = "ctk"
-version = "0.58.1"
+version = "0.58.2"
 description = "Cosmix Tool Kit — reusable, Bus-citizen Bevy widgets for dense desktop surfaces"
 edition = "2021"
 rust-version = "1.95"
@@ -93,6 +93,7 @@ body-view = [
 system-clipboard = ["bevy/system_clipboard"]
 
 [dependencies]
+cosmix-bevy-assets = { path = "../crates/cosmix-bevy-assets" }
 # CTK follows Feathers rather than copying it. Keep this exact: every Bevy
 # release is a deliberate compatibility pass because the widget APIs churn.
 bevy = { version = "=0.19.0", default-features = false, features = [

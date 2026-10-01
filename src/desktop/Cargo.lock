@@ -2981,6 +2981,15 @@ name = "cosmix-app-identity"
 version = "0.2.0"
 
 [[package]]
+name = "cosmix-bevy-assets"
+version = "0.1.0"
+dependencies = [
+ "bevy_text",
+ "cosmix-lib-assets",
+ "fontique",
+]
+
+[[package]]
 name = "cosmix-bg-boing"
 version = "0.1.0"
 dependencies = [
@@ -3007,7 +3016,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-bterm"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "bevy",
  "cosmix-actions",
@@ -3055,7 +3064,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-ced"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3083,10 +3092,11 @@ dependencies = [
 
 [[package]]
 name = "cosmix-comp"
-version = "0.72.4"
+version = "0.72.5"
 dependencies = [
  "bevy",
  "chrono",
+ "cosmix-bevy-assets",
  "cosmix-bg-boing",
  "cosmix-deco",
  "cosmix-design",
@@ -3134,7 +3144,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-dopus"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3213,9 +3223,10 @@ version = "0.1.0"
 
 [[package]]
 name = "cosmix-iced-widgets"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "cosmix-design",
+ "cosmix-lib-assets",
  "iced",
  "iced_core",
  "iced_graphics",
@@ -3257,6 +3268,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cosmix-lib-assets"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "cosmix-lib-config",
+ "hex",
+ "serde",
+ "sha2",
+]
+
+[[package]]
 name = "cosmix-lib-buildinfo"
 version = "0.3.0"
 
@@ -3295,7 +3318,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-config"
-version = "0.8.6"
+version = "0.8.7"
 dependencies = [
  "anyhow",
  "cosmix-lib-bus",
@@ -3495,7 +3518,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-quoin"
-version = "0.20.2"
+version = "0.20.3"
 dependencies = [
  "bevy",
  "cosmix-lib-buildinfo",
@@ -3607,7 +3630,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-term"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "bytes",
  "cosmix-design",
@@ -3628,9 +3651,10 @@ dependencies = [
 
 [[package]]
 name = "cosmix-term-core"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "cosmix-design",
+ "cosmix-lib-assets",
  "cosmix-lib-buildinfo",
  "cosmix-lib-bus",
  "cosmix-lib-client",
@@ -3939,7 +3963,7 @@ dependencies = [
 
 [[package]]
 name = "ctk"
-version = "0.58.1"
+version = "0.58.2"
 dependencies = [
  "accesskit",
  "ammonia",
@@ -3948,6 +3972,7 @@ dependencies = [
  "bevy_resvg",
  "cosmix-actions",
  "cosmix-app-identity",
+ "cosmix-bevy-assets",
  "cosmix-design",
  "cosmix-lib-buildinfo",
  "cosmix-lib-bus",

@@ -18,10 +18,12 @@
 //! | Src  | COSMIX_SRC   | `$COSMIX/src`     | `~/Projects/cosmix/src`              |
 //! | Etc  | COSMIX_ETC   | `$COSMIX/etc`     | `~/.config/cosmix/` · `/etc/cosmix/` |
 //! | Bin  | COSMIX_BIN   | `$COSMIX/bin`     | `~/.local/bin/` · `/usr/local/bin/`  |
+//! | Share | COSMIX_SHARE | `/opt/cosmix/share` | `/opt/cosmix/share` (both)         |
 //!
 //! A system install (`/opt/cosmix/bin/mix`, no `$COSMIX`, no checkout
 //! above it) therefore keeps the FHS defaults it always had. Mix keeps
-//! only Src/Etc/Bin from the parent's full enum.
+//! only Src/Etc/Bin/Share from the parent's full enum. Share deliberately does
+//! not depend on the checkout root or user ID.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -31,6 +33,9 @@ pub enum CosmixDir {
     Src,
     Etc,
     Bin,
+    // Mirror the shared path contract even before a Mix caller needs this kind.
+    #[allow(dead_code)]
+    Share,
 }
 
 struct ResolvedPaths {
@@ -38,6 +43,7 @@ struct ResolvedPaths {
     src: PathBuf,
     etc: PathBuf,
     bin: PathBuf,
+    share: PathBuf,
 }
 
 static PATHS: OnceLock<ResolvedPaths> = OnceLock::new();
@@ -48,6 +54,7 @@ pub fn cosmix_path(kind: CosmixDir) -> PathBuf {
         CosmixDir::Src => paths.src.clone(),
         CosmixDir::Etc => paths.etc.clone(),
         CosmixDir::Bin => paths.bin.clone(),
+        CosmixDir::Share => paths.share.clone(),
     }
 }
 
@@ -118,12 +125,22 @@ fn resolve_all() -> ResolvedPaths {
         None => PathBuf::from("/usr/local/bin"),
     });
 
+    let share = resolve_share(std::env::var_os("COSMIX_SHARE").map(PathBuf::from));
+
     ResolvedPaths {
         root,
         src,
         etc,
         bin,
+        share,
     }
+}
+
+/// Installed resources have the same root for every user and service.
+pub fn resolve_share(override_path: Option<PathBuf>) -> PathBuf {
+    override_path
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| PathBuf::from("/opt/cosmix/share"))
 }
 
 fn env_or(var: &str, fallback: impl FnOnce() -> PathBuf) -> PathBuf {
@@ -204,6 +221,20 @@ fn home_without_environment() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_resources_use_an_absolute_installation_override() {
+        assert_eq!(resolve_share(None), PathBuf::from("/opt/cosmix/share"));
+        assert_eq!(resolve_share(Some(PathBuf::from(""))), resolve_share(None));
+        assert_eq!(
+            resolve_share(Some(PathBuf::from("relative"))),
+            resolve_share(None)
+        );
+        assert_eq!(
+            resolve_share(Some(PathBuf::from("/srv/resources"))),
+            PathBuf::from("/srv/resources")
+        );
+    }
 
     #[test]
     fn captured_etc_environment_preserves_override_and_root_precedence() {

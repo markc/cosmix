@@ -609,6 +609,20 @@ fn export_label_fonts() -> &'static Arc<usvg::fontdb::Database> {
     EXPORT_LABEL_FONTS.get_or_init(|| {
         let mut fonts = usvg::fontdb::Database::new();
         fonts.load_system_fonts();
+        match crate::assets::installed_set() {
+            Ok(Some(set)) => {
+                for path in set.font_paths() {
+                    if let Err(error) = fonts.load_font_file(&path) {
+                        bevy::log::warn!("export label static font {}: {error}", path.display());
+                    }
+                }
+                if let Some(family) = set.family("sans") {
+                    fonts.set_sans_serif_family(family);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => bevy::log::warn!("export label static assets: {error}"),
+        }
         Arc::new(fonts)
     })
 }

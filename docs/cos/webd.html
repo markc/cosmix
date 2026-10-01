@@ -476,6 +476,36 @@ the SPEC-10 sysusers fragment). Shared node settings load from
 tree come from <code>/etc/cosmix/webd/config.toml</code> plus the property store. A
 loopback-only dev listener (default <code>127.0.0.1:8080</code>) offers a zero-config
 local preview fenced to localhost.</p>
+<h2 id="shared-fonts-icons-and-emoji">Shared fonts, icons and emoji</h2>
+<p>Shared asset publication is opt-in. Set <code>webd.shared_assets_dir</code> in
+<code>node.conf.mix</code>, or pass <code>serve --assets-dir /srv/cosmix-assets</code>. The value
+is an absolute installation root containing <code>sets/&lt;set-id&gt;/</code>; it is never
+discovered from the server account's XDG user data. Installers normally use
+<code>cosmix_path("share")/assets</code>, with user overrides kept separate.</p>
+<p>Known vhosts then serve the same installed bytes at
+<code>/_cos/assets/&lt;set-id&gt;/&lt;manifest-path&gt;</code>. For example, a page can load
+<code>/_cos/assets/2026-10-01-core-2/fonts.css</code>; its relative font URLs stay bound
+to that retained set. The existing per-vhost <code>/assets/</code> route keeps its own
+meaning. There is no <code>current</code> URL or directory listing, and only files in
+the manifest plus <code>fonts.css</code> and <code>manifest.conf.mix</code> are public.</p>
+<p>At startup, webd verifies both locked hashes for each published set, up to
+32 retained sets. New installations become available after a webd restart.
+Modified or symlinked files are refused until the installation is corrected
+and reverified. Versioned responses have correct font/CSS MIME types,
+<code>nosniff</code>, SHA-256 ETags and a one-year immutable cache policy; failed
+responses use <code>no-store</code>. HEAD, byte ranges and Last-Modified revalidation
+are supported. Fonts are served on the page's own origin; cross-origin
+access is not enabled by default.</p>
+<p>For pages on another node or origin, explicitly enable
+<code>webd.shared_assets_cross_origin: true</code> or <code>serve --assets-cross-origin</code> alongside
+the asset directory. Shared asset responses then allow anonymous cross-origin
+reads with <code>Access-Control-Allow-Origin: *</code>; credentials are never enabled.</p>
+<p>For an isolated loopback preview, combine the two explicit roots:</p>
+<pre><code class="language-sh">cosmix-webd serve --static-dir /srv/preview --assets-dir /srv/cosmix-assets
+</code></pre>
+<p>webd supplies read-only HTTP access to these local files. Each mesh node
+still installs its own local set for native applications and offline use;
+the directory path itself does not become a shared mesh filesystem.</p>
 <h2 id="interfaces">Interfaces</h2>
 <p>Listeners:</p>
 <ul>

@@ -42,6 +42,45 @@ tree come from `/etc/cosmix/webd/config.toml` plus the property store. A
 loopback-only dev listener (default `127.0.0.1:8080`) offers a zero-config
 local preview fenced to localhost.
 
+## Shared fonts, icons and emoji
+
+Shared asset publication is opt-in. Set `webd.shared_assets_dir` in
+`node.conf.mix`, or pass `serve --assets-dir /srv/cosmix-assets`. The value
+is an absolute installation root containing `sets/<set-id>/`; it is never
+discovered from the server account's XDG user data. Installers normally use
+`cosmix_path("share")/assets`, with user overrides kept separate.
+
+Known vhosts then serve the same installed bytes at
+`/_cos/assets/<set-id>/<manifest-path>`. For example, a page can load
+`/_cos/assets/2026-10-01-core-2/fonts.css`; its relative font URLs stay bound
+to that retained set. The existing per-vhost `/assets/` route keeps its own
+meaning. There is no `current` URL or directory listing, and only files in
+the manifest plus `fonts.css` and `manifest.conf.mix` are public.
+
+At startup, webd verifies both locked hashes for each published set, up to
+32 retained sets. New installations become available after a webd restart.
+Modified or symlinked files are refused until the installation is corrected
+and reverified. Versioned responses have correct font/CSS MIME types,
+`nosniff`, SHA-256 ETags and a one-year immutable cache policy; failed
+responses use `no-store`. HEAD, byte ranges and Last-Modified revalidation
+are supported. Fonts are served on the page's own origin; cross-origin
+access is not enabled by default.
+
+For pages on another node or origin, explicitly enable
+`webd.shared_assets_cross_origin: true` or `serve --assets-cross-origin` alongside
+the asset directory. Shared asset responses then allow anonymous cross-origin
+reads with `Access-Control-Allow-Origin: *`; credentials are never enabled.
+
+For an isolated loopback preview, combine the two explicit roots:
+
+```sh
+cosmix-webd serve --static-dir /srv/preview --assets-dir /srv/cosmix-assets
+```
+
+webd supplies read-only HTTP access to these local files. Each mesh node
+still installs its own local set for native applications and offline use;
+the directory path itself does not become a shared mesh filesystem.
+
 ## Interfaces
 
 Listeners:

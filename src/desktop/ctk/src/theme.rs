@@ -26,7 +26,7 @@ use bevy::log::warn;
 use bevy::prelude::IntoScheduleConfigs;
 use bevy::prelude::{App, Entity, Plugin, Update};
 use bevy::text::{
-    detect_text_needs_rerender, FontCx, FontSize, FontSource, FontWeight, TextFont, TextPipeline,
+    FontCx, FontSize, FontSource, FontWeight, TextFont, TextPipeline, detect_text_needs_rerender,
 };
 use bevy::ui::UiSystems;
 #[cfg(feature = "theme")]
@@ -42,7 +42,7 @@ const AUTHORED_BODY_PX: f32 = 13.0;
 /// `TypographySpec` — is clamped where the value is consumed.
 const MIN_BODY_PX: f32 = 6.0;
 const MAX_BODY_PX: f32 = 96.0;
-use cosmix_design::{default_typography, TypographyRole};
+use cosmix_design::{TypographyRole, default_typography};
 
 /// The CTK design-token vocabulary. Names are stable; values live in
 /// [`ThemeSpec`] and are installed through [`apply_theme`].
@@ -231,6 +231,7 @@ pub struct CtkTypography {
     pub last_warning: Option<String>,
     small: cosmix_design::ResolvedTypeRecord,
     mono: cosmix_design::ResolvedTypeRecord,
+    mono_builtin: bool,
     small_family: Option<String>,
     small_weight: u16,
     mono_weight: u16,
@@ -239,6 +240,11 @@ pub struct CtkTypography {
     environment_body_px: Option<f32>,
     system_families: Option<Vec<String>>,
     system_mono_families: Option<Vec<String>>,
+    asset_fonts_initialised: bool,
+    asset_fonts: cosmix_bevy_assets::RegisteredAssets,
+    asset_sans: Option<String>,
+    asset_mono: Option<String>,
+    asset_emoji: Option<String>,
 }
 
 impl Default for CtkTypography {
@@ -280,6 +286,7 @@ impl CtkTypography {
             },
             small: default_typography(TypographyRole::Small).clone(),
             mono: default_typography(TypographyRole::Mono).clone(),
+            mono_builtin: true,
             small_family: None,
             small_weight: default_typography(TypographyRole::Small).weight,
             mono_weight: default_typography(TypographyRole::Mono).weight,
@@ -293,6 +300,11 @@ impl CtkTypography {
             environment_body_px,
             system_families: None,
             system_mono_families: None,
+            asset_fonts_initialised: false,
+            asset_fonts: Default::default(),
+            asset_sans: None,
+            asset_mono: None,
+            asset_emoji: None,
         }
     }
 }
@@ -1232,6 +1244,22 @@ fn configure_typography(
     typography: &mut CtkTypography,
     font_cx: &mut FontCx,
 ) -> bool {
+    if !typography.asset_fonts_initialised {
+        typography.asset_fonts_initialised = true;
+        match cosmix_bevy_assets::RegisteredAssets::discover_and_register(font_cx) {
+            Ok(assets) => {
+                typography.asset_sans = assets.family("sans").map(str::to_owned);
+                typography.asset_mono = assets.family("mono").map(str::to_owned);
+                typography.asset_emoji = assets.family("emoji").map(str::to_owned);
+                typography.asset_fonts = assets;
+            }
+            Err(error) => {
+                warn!("CTK static assets: {error}");
+                typography.last_warning = Some(format!("static assets: {error}"));
+            }
+        }
+    }
+    typography.asset_fonts.register_missing(font_cx);
     // The shared cache locates the strong handles retained by CTK even after
     // Bevy prunes its local entries and Parley clears the sole text layout.
     font_cx.source_cache.make_shared();
@@ -1268,6 +1296,11 @@ fn configure_typography(
     let requested_family = typography
         .environment_family
         .as_deref()
+        .or_else(|| {
+            (state.typography_family_provenance == TypographyProvenance::BuiltIn)
+                .then_some(typography.asset_sans.as_deref())
+                .flatten()
+        })
         .unwrap_or(state.typography.family.trim());
     typography.requested_family = requested_family.to_string();
     let requested_body_px = typography
@@ -1361,6 +1394,7 @@ fn configure_typography(
     for family in typography
         .effective_family
         .iter()
+        .chain(typography.asset_emoji.iter())
         .chain(state.typography.fallbacks.iter())
         .chain(
             typography
@@ -1398,14 +1432,24 @@ fn configure_typography(
         );
     }
     let mut mono_chain = Vec::new();
-    for family in typography.mono.families().chain(
-        typography
-            .system_mono_families
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .map(String::as_str),
-    ) {
+    let default_mono = default_typography(TypographyRole::Mono);
+    let asset_mono = (typography.mono_builtin
+        && typography.mono.family == default_mono.family
+        && typography.mono.fallbacks == default_mono.fallbacks)
+        .then_some(typography.asset_mono.as_deref())
+        .flatten();
+    for family in asset_mono
+        .into_iter()
+        .chain(typography.mono.families())
+        .chain(
+            typography
+                .system_mono_families
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(String::as_str),
+        )
+    {
         if let Some(id) = font_cx.collection.family_id(family) {
             if !mono_chain.contains(&id) {
                 mono_chain.push(id);
@@ -1556,11 +1600,18 @@ fn apply_ctk_typography(
         .as_deref()
         .and_then(|design| design.live())
         .map(|design| design.typography());
+    let mono_builtin = design
+        .as_deref()
+        .is_none_or(crate::design::CtkDesign::uses_embedded_source);
     let small = cosmix_design::active_typography(active, TypographyRole::Small);
     let mono = cosmix_design::active_typography(active, TypographyRole::Mono);
-    if typography.small != *small || typography.mono != *mono {
+    if typography.small != *small
+        || typography.mono != *mono
+        || typography.mono_builtin != mono_builtin
+    {
         typography.small = small.clone();
         typography.mono = mono.clone();
+        typography.mono_builtin = mono_builtin;
         typography.small_weight = small.weight;
         typography.mono_weight = mono.weight;
         typography.revision = typography.revision.saturating_add(1);
@@ -2749,8 +2800,8 @@ pub(crate) fn theme_file_watcher(
 
 #[cfg(feature = "theme")]
 fn theme_event_requests_reload(event: &notify::Event, paths: &ThemeWatchPaths) -> bool {
-    use notify::event::{AccessKind, AccessMode, ModifyKind, RenameMode};
     use notify::EventKind;
+    use notify::event::{AccessKind, AccessMode, ModifyKind, RenameMode};
 
     if theme_event_rechecks_watches(event, paths) {
         return true;
@@ -2790,8 +2841,8 @@ fn theme_event_rechecks_watches(event: &notify::Event, paths: &ThemeWatchPaths) 
 #[cfg(feature = "theme")]
 mod file {
     use super::{
-        contrast_checked, dimmed_on, legible_away, Color, CtkThemeMetrics, Mode, Scheme, ThemeSpec,
-        TypographyProvenance, MAX_BODY_PX, MIN_BODY_PX,
+        Color, CtkThemeMetrics, MAX_BODY_PX, MIN_BODY_PX, Mode, Scheme, ThemeSpec,
+        TypographyProvenance, contrast_checked, dimmed_on, legible_away,
     };
     use std::fs::{File, OpenOptions};
     use std::path::Path;
@@ -3259,12 +3310,59 @@ mod file {
 
 #[cfg(feature = "theme")]
 pub use file::{
-    load_theme_file, resolve_app_theme, resolve_app_theme_with_selection, resolve_theme,
-    resolve_theme_with_selection, shared_theme_path, ThemeFile, TypographyFile, THEME_FILE,
+    THEME_FILE, ThemeFile, TypographyFile, load_theme_file, resolve_app_theme,
+    resolve_app_theme_with_selection, resolve_theme, resolve_theme_with_selection,
+    shared_theme_path,
 };
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires a bootstrapped static asset set"]
+    fn installed_roles_select_without_system_fonts_and_preserve_overrides() {
+        let set = crate::assets::AssetSet::discover()
+            .unwrap()
+            .expect("installed set");
+        let mut fonts = bevy::text::FontCx::default();
+        fonts.context.collection = fontique::Collection::new(fontique::CollectionOptions {
+            system_fonts: false,
+            ..Default::default()
+        });
+        let mut typography = super::CtkTypography::without_environment();
+        let mut state = super::ThemeState::default();
+        super::configure_typography(&state, &mut typography, &mut fonts);
+        assert_eq!(typography.effective_family.as_deref(), set.family("sans"));
+        assert_eq!(
+            typography
+                .resolved_mono_families
+                .first()
+                .map(String::as_str),
+            set.family("mono")
+        );
+        state.typography.family = set.family("serif").unwrap().to_owned();
+        state.typography_family_provenance = super::TypographyProvenance::DirectApply;
+        super::configure_typography(&state, &mut typography, &mut fonts);
+        assert_eq!(typography.effective_family.as_deref(), set.family("serif"));
+        fonts.collection.clear();
+        super::configure_typography(&state, &mut typography, &mut fonts);
+        assert_eq!(typography.effective_family.as_deref(), set.family("serif"));
+        let authored_mono = cosmix_design::default_typography(TypographyRole::Mono)
+            .family
+            .clone();
+        fonts.collection.register_fonts(
+            fontique::Blob::from(std::fs::read(set.font_path("serif").unwrap()).unwrap()),
+            Some(fontique::FontInfoOverride {
+                family_name: Some(&authored_mono),
+                ..Default::default()
+            }),
+        );
+        typography.mono_builtin = false;
+        super::configure_typography(&state, &mut typography, &mut fonts);
+        assert_eq!(
+            typography.resolved_mono_families.first(),
+            Some(&authored_mono)
+        );
+    }
     use super::*;
 
     fn design_context(scheme: Scheme, mode: Mode) -> cosmix_design::DesignContext {
@@ -3582,9 +3680,11 @@ mod tests {
         // The capture layer installs lazily on the first `warnings_from`. Without
         // this the worker's warnings reach no subscriber at all and the probe
         // proves nothing — which is exactly how it first passed against `with`.
-        assert!(warnings_from(|| warn!("install the global capture layer"))
-            .iter()
-            .any(|line| line.contains("install the global capture layer")));
+        assert!(
+            warnings_from(|| warn!("install the global capture layer"))
+                .iter()
+                .any(|line| line.contains("install the global capture layer"))
+        );
 
         std::thread::spawn(|| {
             // Initialised BEFORE any warning, so `SINK` — first touched by the
@@ -5253,8 +5353,8 @@ mod tests {
 mod theme_file_tests {
     use super::*;
     use cosmix_design::{
-        ButtonCellKey, ButtonSize, ButtonVariant, DesignCompileOutcome, InteractionState,
-        EMBEDDED_DEFAULT_SOURCE,
+        ButtonCellKey, ButtonSize, ButtonVariant, DesignCompileOutcome, EMBEDDED_DEFAULT_SOURCE,
+        InteractionState,
     };
     use tempfile::TempDir;
 

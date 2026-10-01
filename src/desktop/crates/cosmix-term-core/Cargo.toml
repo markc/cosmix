@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-term-core"
-version = "0.8.3"
+version = "0.8.4"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -13,6 +13,7 @@ description = "Renderer-free core of CosMix Term: PTY, VT grid, tabs/panes, CPU 
 test-support = []
 
 [dependencies]
+cosmix-assets = { package = "cosmix-lib-assets", path = "../../../crates/cosmix-lib-assets" }
 cosmix-design = { path = "../cosmix-design" }
 # Match iced -> cosmic-text's locked discovery library.
 fontdb = "=0.23.0"

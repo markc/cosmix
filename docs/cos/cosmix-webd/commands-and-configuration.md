@@ -39,6 +39,8 @@ cosmix-webd serve [OPTIONS]
 | `--noded-ws <URL>` | Override the legacy broker WebSocket URL |
 | `--docs-dir <PATH>` | Serve Markdown files below `/docs` |
 | `--static-dir <PATH>` | Enter loopback-only static preview mode |
+| `--assets-dir <PATH>` | Opt in to verified shared asset publication from an absolute installation root; also works with static preview |
+| `--assets-cross-origin` | Permit anonymous font reads by pages on other origins; requires a configured asset directory |
 | `--tls-cert <PATH>` | Override the legacy certificate PEM path |
 | `--tls-key <PATH>` | Override the legacy private-key PEM path |
 
@@ -123,6 +125,8 @@ The crate loads `node.conf.mix` through `cosmix-lib-config`. Its source directly
 | Field | Use |
 |---|---|
 | `www_dir` | Legacy static root |
+| `shared_assets_dir` | Optional absolute root of installed static font/icon/emoji sets; defaults to disabled |
+| `shared_assets_cross_origin` | Permit anonymous cross-origin reads from published sets; defaults to false |
 | `http_listen` | Optional redirect and HTTP-01 listener |
 | `tls_cert` | Legacy manual certificate path |
 | `tls_key` | Legacy manual private-key path |

@@ -216,6 +216,7 @@ fn run(settings: config::Settings) -> Result<(), String> {
     // is exact rather than defensive; a second call would panic loudly
     // instead of silently booting a second terminal.
     let state = std::cell::RefCell::new(Some(state));
+    let ui_font = cosmix_iced_widgets::fonts::font_for("sans-serif", &[], 400, false, true);
     let result = iced::application(
         move || {
             (
@@ -230,6 +231,7 @@ fn run(settings: config::Settings) -> Result<(), String> {
     .title(DISPLAY_NAME)
     .subscription(subscription)
     .theme(iced::Theme::Dark)
+    .default_font(ui_font)
     .style(|state: &State, _theme| iced::theme::Style {
         background_color: state.tokens.surface,
         text_color: state.tokens.text,

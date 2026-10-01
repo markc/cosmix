@@ -108,6 +108,8 @@ The web section provides:
 | `enabled` | Enables webd. |
 | `port` | Port used by the implicit node-address listener. |
 | `www_dir` | Legacy document root. |
+| `shared_assets_dir` | Optional absolute shared asset installation root. Enables verified versioned `/_cos/assets/<set-id>/` publication; defaults to disabled and never uses user XDG overrides. |
+| `shared_assets_cross_origin` | Permit anonymous cross-origin font reads from published sets. Defaults to false; requires a shared asset directory. |
 | `tls_cert`, `tls_key` | Legacy manual certificate and key paths. |
 | `tls_server_name` | Hostnames covered by the legacy certificate pair. |
 | `http_listen` | Optional explicit plain-HTTP bind used by HTTP-01 and redirects. |

@@ -54,7 +54,7 @@ for the node schema, discovery order, listener rules, and ACME policy.
 | `client_helpers` | Resolves the local broker URL and opens named, provenance-bearing, or anonymous Bus client connections. |
 | `mix_data` | Parses strict-data Mix text or files into an untyped `Value` tree. |
 | `node` | Defines `node.conf.mix` types, loaders, derived addresses, and webd listener synthesis. |
-| `paths` | Resolves source, configuration, data, binary, runtime, log, and temporary directories. |
+| `paths` | Resolves source, configuration, data, binary, shared-resource, runtime, log, and temporary directories. |
 | `store` | Loads, saves, and materialises typed per-service `.conf.mix` files. |
 
 The private `settings` module is re-exported at the crate root.
@@ -132,12 +132,20 @@ set for the process. An environment override wins over user or system defaults.
 | `Etc` | `COSMIX_ETC` | XDG config directory under `cosmix` | `/etc/cosmix` |
 | `Var` | `COSMIX_VAR` | XDG data directory under `cosmix` | `/var/lib/cosmix` |
 | `Bin` | `COSMIX_BIN` | `~/.local/bin` | `/usr/local/bin` |
+| `Share` | `COSMIX_SHARE` | `/opt/cosmix/share` | `/opt/cosmix/share` |
 | `Run` | `COSMIX_RUN` | XDG runtime directory under `cosmix` | `/run/cosmix` |
 | `Log` | `COSMIX_LOG` | `COSMIX_VAR/log` | `/var/log/cosmix` |
 | `Tmp` | `COSMIX_TMP` | `/tmp/cosmix` | `/tmp/cosmix` |
 
 `current_uid()` is the crate's infallible wrapper around POSIX `getuid(2)`.
 Path selection uses it to distinguish user and root execution.
+
+`Share` is the deliberate exception to checkout-root and user/root selection:
+installed resources have one shared directory for desktop clients and daemons,
+even when only a desktop process inherits `COSMIX` pointing at a source checkout.
+An absolute `COSMIX_SHARE` overrides the default; empty and relative values are
+ignored. Static font/icon/emoji sets live beneath `Share/assets`; their XDG
+user/distribution precedence belongs to [cosmix-lib-assets](../cosmix-lib-assets/README.md).
 
 ## Node and ACME API
 

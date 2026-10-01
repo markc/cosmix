@@ -6,6 +6,7 @@ pub(crate) struct DecorationStartup {
     pub(crate) enabled: bool,
     pub(crate) theme: DecoTheme,
     pub(crate) title_typography: cosmix_design::ResolvedTypeRecord,
+    pub(crate) title_family_builtin: bool,
 }
 
 impl DecorationStartup {
@@ -45,6 +46,7 @@ impl DecorationStartup {
             enabled,
             theme,
             title_typography: title.clone(),
+            title_family_builtin: compiled.is_none(),
         }
     }
 }
@@ -58,6 +60,19 @@ impl Default for DecorationStartup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authored_builtin_family_keeps_authored_provenance() {
+        let builtin = DecorationStartup::resolve_with_source(true, ChromeStyle::Mac, None);
+        let authored = DecorationStartup::resolve_with_source(
+            true,
+            ChromeStyle::Mac,
+            Some(cosmix_design::EMBEDDED_DEFAULT_SOURCE),
+        );
+        assert_eq!(builtin.title_typography, authored.title_typography);
+        assert!(builtin.title_family_builtin);
+        assert!(!authored.title_family_builtin);
+    }
 
     #[test]
     fn default_decoration_startup_is_enabled_mac_ocean_light() {

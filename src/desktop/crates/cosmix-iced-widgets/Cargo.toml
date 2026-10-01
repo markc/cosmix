@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-iced-widgets"
-version = "0.1.5"
+version = "0.1.6"
 description = "Shared Cosmix iced widgets: text field, menus, pro-audio controls, waveform, piano roll, design tokens"
 edition = "2024"
 rust-version = "1.95"
@@ -24,6 +24,7 @@ gallery-wgpu = ["gallery", "wgpu", "iced/wgpu"]
 gallery-tiny-skia = ["gallery", "tiny-skia", "iced/tiny-skia"]
 
 [dependencies]
+cosmix-assets = { package = "cosmix-lib-assets", path = "../../../crates/cosmix-lib-assets" }
 iced_core = { version = "=0.14.0", default-features = false, features = ["advanced"] }
 iced_widget = { version = "=0.14.2", default-features = false, features = ["advanced"] }
 iced_graphics = { version = "=0.14.0", default-features = false, features = ["geometry"] }

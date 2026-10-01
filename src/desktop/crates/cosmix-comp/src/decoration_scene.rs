@@ -54,7 +54,7 @@ struct ChromeFontCxInitMeasurement {
 }
 
 #[derive(Resource)]
-pub(crate) struct DecorationSceneTheme(DecoTheme, cosmix_design::ResolvedTypeRecord);
+pub(crate) struct DecorationSceneTheme(DecoTheme, cosmix_design::ResolvedTypeRecord, bool);
 
 impl DecorationSceneTheme {
     #[cfg(test)]
@@ -62,6 +62,7 @@ impl DecorationSceneTheme {
         Self(
             theme,
             cosmix_design::default_typography(cosmix_design::TypographyRole::UiDisplay).clone(),
+            true,
         )
     }
 
@@ -79,6 +80,9 @@ impl DecorationSceneTheme {
 
 #[derive(Resource, Default)]
 struct ChromeFontSelection {
+    asset_fonts: cosmix_bevy_assets::RegisteredAssets,
+    asset_sans: Option<String>,
+    asset_emoji: Option<String>,
     /// Distinguish a discovered DejaVu family from our embedded final rescue.
     system_dejavu: bool,
     /// The last whole family which successfully resolved through the theme
@@ -233,6 +237,10 @@ impl DecorationEntities {
 
 impl Plugin for ChromeTypographyPlugin {
     fn build(&self, app: &mut App) {
+        let title_family_builtin = app
+            .world()
+            .resource::<DecorationStartup>()
+            .title_family_builtin;
         let theme = app.world().resource::<DecorationStartup>().theme.clone();
         let title_typography = app
             .world()
@@ -253,6 +261,13 @@ impl Plugin for ChromeTypographyPlugin {
                 "initialised chrome FontCx with eager system font discovery"
             );
         }
+        let assets = cosmix_bevy_assets::RegisteredAssets::discover_and_register(
+            &mut app.world_mut().resource_mut::<FontCx>(),
+        )
+        .unwrap_or_else(|error| {
+            warn!("chrome static assets: {error}");
+            Default::default()
+        });
         let system_dejavu = app
             .world_mut()
             .resource_mut::<FontCx>()
@@ -260,10 +275,17 @@ impl Plugin for ChromeTypographyPlugin {
             .family_id(EMBEDDED_CHROME_FONT_FAMILY)
             .is_some();
         app.insert_resource(ChromeFontSelection {
+            asset_sans: assets.family("sans").map(str::to_owned),
+            asset_emoji: assets.family("emoji").map(str::to_owned),
+            asset_fonts: assets,
             system_dejavu,
             ..Default::default()
         })
-        .insert_resource(DecorationSceneTheme(theme, title_typography));
+        .insert_resource(DecorationSceneTheme(
+            theme,
+            title_typography,
+            title_family_builtin,
+        ));
         {
             let mut fonts = app.world_mut().resource_mut::<Assets<Font>>();
             // Replace Bevy's tiny default subset even when TextPlugin already
@@ -402,6 +424,7 @@ fn configure_chrome_typography(
         With<DecoTitle>,
     >,
 ) {
+    selection.asset_fonts.register_missing(&mut font_cx);
     let Some((embedded_id, _)) = named_family(&mut font_cx, EMBEDDED_CHROME_FONT_FAMILY) else {
         // The font asset loader has not registered the embedded face yet.
         return;
@@ -416,14 +439,30 @@ fn configure_chrome_typography(
 
     // Explicit free families precede last-known-good and platform rescue.
     // It chooses the primary family; it is not the per-glyph fallback chain.
-    let requested = requested_chrome_family(
-        &mut font_cx,
-        &theme.0.metrics.title_font_family,
-        selection
-            .discovered_ui_sans_families
-            .as_deref()
-            .unwrap_or_default(),
-    );
+    let uses_default_family = match &theme.0.metrics.title_font_family {
+        DecoFontFamily::SystemUi => true,
+        DecoFontFamily::Named(name) => {
+            theme.2 && name == cosmix_deco::presets::DEFAULT_TITLE_FONT_FAMILY
+        }
+    };
+    let installed_request = uses_default_family
+        .then(|| {
+            selection
+                .asset_sans
+                .as_deref()
+                .and_then(|name| named_family(&mut font_cx, name))
+        })
+        .flatten();
+    let requested = installed_request.or_else(|| {
+        requested_chrome_family(
+            &mut font_cx,
+            &theme.0.metrics.title_font_family,
+            selection
+                .discovered_ui_sans_families
+                .as_deref()
+                .unwrap_or_default(),
+        )
+    });
     let free_chain = if requested.is_none() {
         theme
             .1
@@ -516,13 +555,18 @@ fn configure_chrome_typography(
     if resolved.0 != embedded_id || selection.system_dejavu {
         chain.push(resolved.0);
     }
-    for name in theme.1.fallbacks.iter().chain(
-        selection
-            .discovered_ui_sans_families
-            .as_deref()
-            .unwrap_or_default()
-            .iter(),
-    ) {
+    for name in selection
+        .asset_emoji
+        .iter()
+        .chain(theme.1.fallbacks.iter())
+        .chain(
+            selection
+                .discovered_ui_sans_families
+                .as_deref()
+                .unwrap_or_default()
+                .iter(),
+        )
+    {
         if let Some((id, _)) = named_family(&mut font_cx, name)
             && (id != embedded_id || selection.system_dejavu)
             && !chain.contains(&id)
@@ -1769,6 +1813,30 @@ fn elide_title_end_with_measure<E>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires a bootstrapped static asset set"]
+    fn installed_chrome_family_and_emoji_chain_resolve_without_system_fonts() {
+        let set = cosmix_bevy_assets::AssetSet::discover()
+            .unwrap()
+            .expect("installed set");
+        let mut app = typography_app_without_system_fonts();
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<ChromeFontSelection>()
+                .resolved_family
+                .as_deref(),
+            set.family("sans")
+        );
+        let families = ui_sans_family_names(&mut app);
+        assert_eq!(families.first().map(String::as_str), set.family("sans"));
+        assert!(
+            families
+                .iter()
+                .any(|family| Some(family.as_str()) == set.family("emoji"))
+        );
+        assert_ne!(resolved_ui_sans_glyph_id(&mut app, 'M'), 0);
+    }
     use super::*;
 
     mod font_probe {

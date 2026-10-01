@@ -1,0 +1,12 @@
+[package]
+name = "cosmix-bevy-assets"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+description = "Shared installed static font registration for Cosmix Bevy consumers"
+
+[dependencies]
+bevy_text = { version = "0.19", default-features = false }
+cosmix-assets = { package = "cosmix-lib-assets", path = "../../../crates/cosmix-lib-assets" }
+fontique = { version = "0.9", default-features = false }

@@ -29,6 +29,22 @@ pub(super) struct Primary {
     pub data: Arc<[u8]>,
 }
 
+// Primary and lazy Unicode coverage share one pinned selection. Installing a
+// newer set during this process cannot combine fonts from two asset releases.
+fn installed_assets() -> Result<Option<&'static cosmix_assets::AssetSet>, &'static str> {
+    static INSTALLED: OnceLock<Result<Option<cosmix_assets::AssetSet>, String>> = OnceLock::new();
+    match INSTALLED
+        .get_or_init(|| cosmix_assets::AssetSet::discover().map_err(|error| error.to_string()))
+    {
+        Ok(set) => Ok(set.as_ref()),
+        Err(error) => {
+            static REPORTED: OnceLock<()> = OnceLock::new();
+            REPORTED.get_or_init(|| eprintln!("terminal static assets: {error}"));
+            Err(error)
+        }
+    }
+}
+
 pub(super) fn discover(override_path: Option<&Path>) -> Result<Primary, String> {
     // An explicit path is authoritative, including an error for a bad file.
     if let Some(path) = override_path {
@@ -37,6 +53,17 @@ pub(super) fn discover(override_path: Option<&Path>) -> Result<Primary, String> 
     static SHARED: OnceLock<Result<Primary, String>> = OnceLock::new();
     SHARED
         .get_or_init(|| {
+            // The installed mono role precedes platform discovery. An explicit
+            // TERM_SPIKE_FONT above remains authoritative, including errors.
+            match installed_assets() {
+                Ok(Some(set)) => {
+                    if let Some(path) = set.font_path("mono") {
+                        return from_path(&path);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => return Err(format!("terminal static assets: {error}")),
+            }
             let mut db = Database::new();
             db.load_system_fonts();
             from_database(&mut db)
@@ -53,13 +80,54 @@ pub(super) fn discover(override_path: Option<&Path>) -> Result<Primary, String> 
 }
 
 /// Called only when the shared Unicode fallback set is first needed.
+pub(super) fn installed_role(role: &str) -> Result<Option<Primary>, String> {
+    let Some(set) = installed_assets().map_err(str::to_owned)? else {
+        return Ok(None);
+    };
+    let Some(path) = set.font_path(role) else {
+        return Ok(None);
+    };
+    let mut db = Database::new();
+    db.load_font_file(&path)
+        .map_err(|error| format!("installed {role} font {}: {error}", path.display()))?;
+    let index = db
+        .faces()
+        .next()
+        .ok_or_else(|| format!("installed {role} font has no face"))?
+        .index;
+    let data: Arc<[u8]> = std::fs::read(&path)
+        .map_err(|error| format!("installed {role} font {}: {error}", path.display()))?
+        .into();
+    let font = FontRef::from_index(&data, index as usize)
+        .ok_or_else(|| format!("installed {role} font cannot be read by Swash"))?;
+    if !metrics_readable(font) {
+        return Err(format!("installed {role} font has unreadable metrics"));
+    }
+    Ok(Some(Primary { path, index, data }))
+}
+
+/// Called only when the shared Unicode fallback set is first needed.
 pub(super) fn coverage() -> Vec<Primary> {
     let mut db = Database::new();
     db.load_system_fonts();
-    default_typography(TypographyRole::Terminal)
-        .fallbacks
-        .iter()
-        .filter_map(|name| select(&mut db, &[Family::Name(name)]))
+    // Emoji has a dedicated lane in UnicodeRaster. Every general coverage
+    // face uses the same validated loader, including the Swash metrics guard.
+    let installed = ["sans", "serif"]
+        .into_iter()
+        .filter_map(|role| match installed_role(role) {
+            Ok(face) => face,
+            Err(error) => {
+                eprintln!("terminal static coverage: {error}");
+                None
+            }
+        });
+    installed
+        .chain(
+            default_typography(TypographyRole::Terminal)
+                .fallbacks
+                .iter()
+                .filter_map(|name| select(&mut db, &[Family::Name(name)])),
+        )
         .collect()
 }
 
@@ -230,6 +298,27 @@ pub(super) fn fixture_weight(weight: Weight) -> Result<Primary, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a bootstrapped static asset set"]
+    fn installed_mono_is_primary_and_emoji_is_coverage() {
+        let set = cosmix_assets::AssetSet::discover()
+            .unwrap()
+            .expect("installed set");
+        assert_eq!(discover(None).unwrap().path, set.font_path("mono").unwrap());
+        assert_eq!(
+            installed_role("emoji").unwrap().unwrap().path,
+            set.font_path("emoji").unwrap()
+        );
+        assert!(
+            coverage()
+                .iter()
+                .any(|face| face.path == set.font_path("sans").unwrap())
+        );
+        let explicit = fixture().unwrap();
+        assert_eq!(discover(Some(&explicit.path)).unwrap().path, explicit.path);
+        assert!(discover(Some(Path::new("/no/such/explicit-font.ttf"))).is_err());
+    }
 
     #[test]
     fn light_queries_reject_thin_and_extra_light_even_via_generic_alias() {

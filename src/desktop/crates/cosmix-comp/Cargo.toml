@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-comp"
-version = "0.72.4"
+version = "0.72.5"
 description = "Smithay protocol frontend with Bevy rendering for the CosMix desktop"
 edition = "2024"
 rust-version = "1.95"
@@ -62,6 +62,7 @@ name = "cosmix-input-probe"
 path = "src/bin/cosmix-input-probe.rs"
 
 [dependencies]
+cosmix-bevy-assets = { path = "../cosmix-bevy-assets" }
 cosmix-design = { path = "../cosmix-design" }
 cosmix-quoin = { path = "../../apps/quoin", optional = true }
 cosmix-shell = { path = "../cosmix-shell", features = ["chrome"], optional = true }

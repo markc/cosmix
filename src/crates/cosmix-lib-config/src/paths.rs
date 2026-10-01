@@ -23,6 +23,10 @@
 //! | Run  | COSMIX_RUN   | `$COSMIX/run`   | $XDG_RUNTIME_DIR/cosmix/ · /run/cosmix/ |
 //! | Log  | COSMIX_LOG   | `$COSMIX/log`   | $COSMIX_VAR/log/ · /var/log/cosmix/ |
 //! | Tmp  | COSMIX_TMP   | `$COSMIX/tmp`   | /tmp/cosmix/ (both)                |
+//! | Share | COSMIX_SHARE | `/opt/cosmix/share` | `/opt/cosmix/share` (both)     |
+//!
+//! `Share` is installed read-only data, deliberately independent of the source
+//! checkout and user ID. All consumers use the same installation override.
 //!
 //! `cosmix-mix` carries a verbatim copy of the root rule in its
 //! `cosmix_paths.rs` (mix must not depend on this crate); keep them in step.
@@ -43,6 +47,8 @@ pub enum CosmixDir {
     Var,
     /// Installed binaries.
     Bin,
+    /// Shared, read-only installation resources, independent of the checkout.
+    Share,
     /// Runtime sockets and PIDs.
     Run,
     /// Log files.
@@ -51,13 +57,14 @@ pub enum CosmixDir {
     Tmp,
 }
 
-/// Resolved paths for all 7 directory categories.
+/// Resolved paths for all directory categories.
 struct ResolvedPaths {
     root: Option<PathBuf>,
     src: PathBuf,
     etc: PathBuf,
     var: PathBuf,
     bin: PathBuf,
+    share: PathBuf,
     run: PathBuf,
     log: PathBuf,
     tmp: PathBuf,
@@ -76,6 +83,7 @@ pub fn cosmix_path(kind: CosmixDir) -> PathBuf {
         CosmixDir::Etc => paths.etc.clone(),
         CosmixDir::Var => paths.var.clone(),
         CosmixDir::Bin => paths.bin.clone(),
+        CosmixDir::Share => paths.share.clone(),
         CosmixDir::Run => paths.run.clone(),
         CosmixDir::Log => paths.log.clone(),
         CosmixDir::Tmp => paths.tmp.clone(),
@@ -115,10 +123,15 @@ fn resolve_all() -> ResolvedPaths {
         .unwrap_or_else(|| PathBuf::from("/root"));
 
     let exe = std::env::current_exe().ok();
-    let root = locate_root(std::env::var_os("COSMIX").map(PathBuf::from), exe.as_deref());
+    let root = locate_root(
+        std::env::var_os("COSMIX").map(PathBuf::from),
+        exe.as_deref(),
+    );
 
     let src = env_or("COSMIX_SRC", || {
-        root.clone().unwrap_or_else(|| default_root(&home)).join("src")
+        root.clone()
+            .unwrap_or_else(|| default_root(&home))
+            .join("src")
     });
 
     let etc = env_or("COSMIX_ETC", || match &root {
@@ -144,6 +157,8 @@ fn resolve_all() -> ResolvedPaths {
         None if user_mode => home.join(".local/bin"),
         None => PathBuf::from("/usr/local/bin"),
     });
+
+    let share = resolve_share(std::env::var_os("COSMIX_SHARE").map(PathBuf::from));
 
     let run = env_or("COSMIX_RUN", || match &root {
         Some(r) => r.join("run"),
@@ -171,10 +186,19 @@ fn resolve_all() -> ResolvedPaths {
         etc,
         var,
         bin,
+        share,
         run,
         log,
         tmp,
     }
+}
+
+/// Resolve installed resources without consulting the checkout root or user ID.
+/// Empty and relative overrides are ignored so every result is an absolute path.
+pub fn resolve_share(override_path: Option<PathBuf>) -> PathBuf {
+    override_path
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| PathBuf::from("/opt/cosmix/share"))
 }
 
 fn env_or(var: &str, fallback: impl FnOnce() -> PathBuf) -> PathBuf {
@@ -220,9 +244,26 @@ mod root_tests {
     use std::path::Path;
 
     #[test]
+    fn shared_resources_use_an_absolute_installation_override() {
+        assert_eq!(resolve_share(None), PathBuf::from("/opt/cosmix/share"));
+        assert_eq!(resolve_share(Some(PathBuf::from(""))), resolve_share(None));
+        assert_eq!(
+            resolve_share(Some(PathBuf::from("relative"))),
+            resolve_share(None)
+        );
+        assert_eq!(
+            resolve_share(Some(PathBuf::from("/srv/resources"))),
+            PathBuf::from("/srv/resources")
+        );
+    }
+
+    #[test]
     fn env_root_wins_over_self_location() {
         assert_eq!(
-            locate_root(Some(PathBuf::from("/srv/cosmix")), Some(Path::new("/nowhere/bin/noded"))),
+            locate_root(
+                Some(PathBuf::from("/srv/cosmix")),
+                Some(Path::new("/nowhere/bin/noded"))
+            ),
             Some(PathBuf::from("/srv/cosmix"))
         );
     }
@@ -235,11 +276,17 @@ mod root_tests {
         std::fs::create_dir_all(root.join("src/target/release")).unwrap();
         std::fs::write(root.join("bootstrap"), "").unwrap();
         std::fs::write(root.join("src/Cargo.toml"), "").unwrap();
-        assert_eq!(locate_root(None, Some(&root.join("bin/noded"))), Some(root.clone()));
+        assert_eq!(
+            locate_root(None, Some(&root.join("bin/noded"))),
+            Some(root.clone())
+        );
         assert_eq!(
             locate_root(None, Some(&root.join("src/target/release/noded"))),
             Some(root.clone())
         );
-        assert_eq!(locate_root(None, Some(Path::new("/opt/cosmix/bin/noded"))), None);
+        assert_eq!(
+            locate_root(None, Some(Path::new("/opt/cosmix/bin/noded"))),
+            None
+        );
     }
 }

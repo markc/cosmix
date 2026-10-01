@@ -1,4 +1,4 @@
-use std::collections::{hash_map::DefaultHasher, VecDeque};
+use std::collections::{VecDeque, hash_map::DefaultHasher};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -9,10 +9,10 @@ use bevy::color::{Color, LinearRgba as BevyLinearRgba};
 use bevy::ecs::prelude::{IntoScheduleConfigs, Res, ResMut, Resource, SystemSet};
 use bevy::log::{error, info, warn};
 use cosmix_design::{
-    apply_compiled_design, compile_design, parse_design_source, ButtonCellKey, Contrast,
-    DesignApplyDecision, DesignCompileOutcome, DesignCompileStatus, DesignContext,
-    DesignDiagnostic, DesignRevision, DiagnosticSeverity, LinearRgba, ResolvedButtonCell,
-    ResolvedDesign, SourceIdentity, EMBEDDED_DEFAULT_SOURCE,
+    ButtonCellKey, Contrast, DesignApplyDecision, DesignCompileOutcome, DesignCompileStatus,
+    DesignContext, DesignDiagnostic, DesignRevision, DiagnosticSeverity, EMBEDDED_DEFAULT_SOURCE,
+    LinearRgba, ResolvedButtonCell, ResolvedDesign, SourceIdentity, apply_compiled_design,
+    compile_design, parse_design_source,
 };
 
 use crate::theme::{Mode, Scheme, ThemeState};
@@ -47,6 +47,14 @@ pub struct CtkDesign {
 }
 
 impl CtkDesign {
+    /// Provenance of the committed design, including a retained last-good
+    /// design when a replacement source fails to compile.
+    pub fn uses_embedded_source(&self) -> bool {
+        self.live
+            .as_ref()
+            .is_none_or(|design| design.source().as_str() == EMBEDDED_SOURCE_IDENTITY)
+    }
+
     pub fn live(&self) -> Option<&ResolvedDesign> {
         self.live.as_ref()
     }
@@ -396,6 +404,28 @@ pub(crate) fn bevy_color(colour: LinearRgba) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authored_embedded_values_retain_authored_provenance() {
+        let (builtin, _) = design_resources_for_source(
+            EMBEDDED_SOURCE_IDENTITY,
+            EMBEDDED_DEFAULT_SOURCE,
+            Scheme::Ocean,
+            Mode::Light,
+        );
+        let (authored, _) = design_resources_for_source(
+            "theme:authored",
+            EMBEDDED_DEFAULT_SOURCE,
+            Scheme::Ocean,
+            Mode::Light,
+        );
+        assert_eq!(
+            builtin.live().unwrap().typography(),
+            authored.live().unwrap().typography()
+        );
+        assert!(builtin.uses_embedded_source());
+        assert!(!authored.uses_embedded_source());
+    }
 
     #[test]
     fn bad_replacement_keeps_the_last_good_design() {

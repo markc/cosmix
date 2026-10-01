@@ -134,6 +134,9 @@ pub fn resolve(app_override: Option<&std::path::Path>) -> Theme {
 
 /// Compile `selection` into a [`Theme`].
 pub fn resolve_selection(selection: &Selection, mut notes: Vec<String>) -> Theme {
+    if let Err(error) = cosmix_iced_widgets::fonts::register_installed() {
+        notes.push(format!("static assets: {error}"));
+    }
     let compiled = compile(selection).or_else(|error| {
         if selection.design_source.is_some() {
             notes.push(format!("{error}; using the embedded design"));
@@ -169,8 +172,8 @@ pub fn resolve_selection(selection: &Selection, mut notes: Vec<String>) -> Theme
     };
     let mono = role(TypographyRole::Mono);
     let ui = role(TypographyRole::Ui);
-    let mono_font = font_for(&mono, true);
-    let ui_font = font_for(&ui, false);
+    let mono_font = font_for(&mono, true, selection.design_source.is_none());
+    let ui_font = font_for(&ui, false, selection.design_source.is_none());
     Theme {
         palette,
         tokens,
@@ -378,60 +381,17 @@ fn mix(a: LinearRgba, b: LinearRgba, t: f64) -> LinearRgba {
 /// The first installed family of the role (named family, then its
 /// fallbacks), else the generic family. The name is interned once per
 /// process: iced fonts name families with `&'static str`.
-fn font_for(record: &ResolvedTypeRecord, monospace: bool) -> iced::Font {
-    use iced::advanced::graphics::text::font_system;
-    let names: Vec<String> = std::iter::once(record.family.clone()).chain(record.fallbacks.iter().cloned()).collect();
-    let (installed, has_light) = {
-        let mut system = font_system().write().expect("font system");
-        let db = system.raw().db();
-        let found = names.iter().find(|name| {
-            db.faces().any(|face| face.families.iter().any(|(family, _)| family.eq_ignore_ascii_case(name)))
-        });
-        let light = found.is_some_and(|name| {
-            db.faces().any(|face| {
-                face.weight.0 == 300 && face.families.iter().any(|(family, _)| family.eq_ignore_ascii_case(name))
-            })
-        });
-        (found.cloned(), light)
-    };
-    let family = match installed {
-        Some(name) => iced::font::Family::Name(intern(&name)),
-        None if monospace => iced::font::Family::Monospace,
-        None => iced::font::Family::SansSerif,
-    };
-    let weight = match cosmix_design::family_font_weight(record.weight, has_light) {
-        0..=150 => iced::font::Weight::Thin,
-        151..=250 => iced::font::Weight::ExtraLight,
-        251..=350 => iced::font::Weight::Light,
-        351..=450 => iced::font::Weight::Normal,
-        451..=550 => iced::font::Weight::Medium,
-        551..=650 => iced::font::Weight::Semibold,
-        651..=750 => iced::font::Weight::Bold,
-        751..=850 => iced::font::Weight::ExtraBold,
-        _ => iced::font::Weight::Black,
-    };
-    iced::Font { family, weight, ..iced::Font::DEFAULT }
+fn font_for(record: &ResolvedTypeRecord, monospace: bool, builtin: bool) -> iced::Font {
+    let default = cosmix_design::default_typography(if monospace { TypographyRole::Mono } else { TypographyRole::Ui });
+    let prefer_assets = builtin && record.family == default.family && record.fallbacks == default.fallbacks;
+    cosmix_iced_widgets::fonts::font_for(&record.family, &record.fallbacks, record.weight, monospace, prefer_assets)
 }
-
 fn family_name(font: &iced::Font) -> String {
     match font.family {
         iced::font::Family::Name(name) => name.to_owned(),
         iced::font::Family::Monospace => "monospace".to_owned(),
         _ => "sans-serif".to_owned(),
     }
-}
-
-fn intern(name: &str) -> &'static str {
-    use std::collections::HashSet;
-    use std::sync::{Mutex, OnceLock};
-    static NAMES: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
-    let mut names = NAMES.get_or_init(Default::default).lock().expect("font names");
-    if let Some(existing) = names.get(name) {
-        return existing;
-    }
-    let leaked: &'static str = Box::leak(name.to_owned().into_boxed_str());
-    names.insert(leaked);
-    leaked
 }
 
 impl Theme {
@@ -460,6 +420,25 @@ impl Theme {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a bootstrapped static asset set"]
+    fn authored_builtin_family_remains_authoritative() {
+        use iced::advanced::graphics::text::{font_system, cosmic_text::fontdb::{Database, Language}};
+        let set = cosmix_iced_widgets::fonts::register_installed().unwrap().unwrap();
+        let requested = cosmix_design::default_typography(TypographyRole::Ui).family.clone();
+        let mut source = Database::new();
+        source.load_font_file(set.font_path("serif").unwrap()).unwrap();
+        let mut face = source.faces().next().unwrap().clone();
+        face.families = vec![(requested.clone(), Language::English_UnitedStates)];
+        font_system().write().unwrap().raw().db_mut().push_face_info(face);
+        let theme = resolve_selection(&Selection {
+            scheme: Scheme::default(), mode: Mode::default(),
+            design_source: Some((PathBuf::from("authored.conf.mix"), cosmix_design::EMBEDDED_DEFAULT_SOURCE.to_owned())),
+        }, Vec::new());
+        assert_eq!(family_name(&theme.ui_font), requested);
+        assert_ne!(family_name(&theme.ui_font), set.family("sans").unwrap());
+    }
 
     fn compiled(scheme: Scheme, mode: Mode) -> ResolvedDictionary {
         compile(&Selection { scheme, mode, design_source: None })

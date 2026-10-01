@@ -1,0 +1,68 @@
+-- version: 0.1.0
+-- Build-worker gates for static assets. Invoke at an exact pushed commit.
+-- mix src/tools/static-assets-gate.mix --core
+-- mix src/tools/static-assets-gate.mix --desktop --real-assets
+
+$g = getopt(args(), {core: {}, desktop: {}, "real-assets": {}})
+if len($g.errors) != 0 or len($g.rest) != 0 or ($g.opts.core and $g.opts.desktop) then
+  raise("GATE_ARGS", "Choose --core or --desktop [--real-assets]")
+end
+$src = dirname(dirname(realpath($0)))
+$checkout = dirname($src)
+$desktop = $src .. "/desktop"
+$mode = if $g.opts.desktop then "desktop" else "core" end
+
+fn gate($argv, $cwd)
+  print("gate: " .. join($argv, " "))
+  print(run_argv_must($argv, {cwd: $cwd, timeout: 1800, max_output: 6000000}))
+end
+
+if $mode == "core" then
+  gate(["/opt/cosmix/bin/mix", "lint", $checkout .. "/share/assets/install.mix", "--deny-warnings"], $src)
+  gate(["/opt/cosmix/bin/mix", "lint", $checkout .. "/setup.mix", "--deny-warnings"], $src)
+  gate(["cargo", "test", "--locked", "-p", "cosmix-lib-assets", "-p", "cosmix-lib-config", "-p", "cosmix-webd"], $src)
+  gate(["cargo", "test", "--locked", "-p", "cosmix-mix", "cosmix_paths::"], $src)
+  gate(["cargo", "clippy", "--locked", "-p", "cosmix-lib-assets", "-p", "cosmix-lib-config", "-p", "cosmix-webd", "-p", "cosmix-mix", "--all-targets", "--", "-D", "warnings"], $src)
+  gate(["cargo", "build", "--locked", "--release", "-p", "cosmix-webd", "-p", "cosmix-mix"], $src)
+  gate([$src .. "/target/release/cosmix-webd", "--version", "--json"], $src)
+  gate([$src .. "/target/release/mix", "--version", "--json"], $src)
+else
+  gate(["cargo", "test", "--locked", "-p", "cosmix-bevy-assets", "-p", "cosmix-iced-widgets", "-p", "cosmix-term-core", "-p", "cosmix-ced", "-p", "cosmix-dopus"], $desktop)
+  gate(["cargo", "test", "--locked", "-p", "ctk", "--lib", "--features", "bus,theme", "theme::"], $desktop)
+  $control = run_argv_must(["cargo", "test", "--locked", "-p", "ctk", "--lib", "--features", "bus,theme", "app_control::"], {cwd: $desktop, timeout: 1800, max_output: 6000000})
+  print($control)
+  if not re_match($control, "test result: ok[.] [1-9][0-9]* passed") then
+    raise("GATE_FEATURE", "CTK app control feature tests did not execute")
+  end
+  gate(["cargo", "test", "--locked", "-p", "cosmix-comp", "--lib", "decoration_scene::"], $desktop)
+  gate(["cargo", "clippy", "--locked", "-p", "cosmix-bevy-assets", "-p", "cosmix-iced-widgets", "-p", "cosmix-term-core", "-p", "cosmix-ced", "-p", "cosmix-dopus", "-p", "ctk", "-p", "cosmix-comp", "--all-targets", "--features", "ctk/bus,ctk/theme", "--", "-D", "warnings"], $desktop)
+  gate(["cargo", "build", "--locked", "--release", "-p", "cosmix-dopus", "-p", "cosmix-ced", "-p", "cosmix-term", "-p", "cosmix-comp"], $desktop)
+end
+
+if $g.opts["real-assets"] then
+  $fixture = "/tmp/cosmix-assets-gate-" .. to_string(pid())
+  $share = $fixture .. "/share"
+  mkdir($share)
+  gate(["/opt/cosmix/bin/mix", $checkout .. "/share/assets/install.mix", "--root", $share .. "/assets"], $src)
+  for $test in [
+    ["cosmix-bevy-assets", "installed_set_registers_without_system_fonts"],
+    ["cosmix-iced-widgets", "installed_roles_and_material_glyph_resolve"],
+    ["cosmix-ced", "authored_builtin_family_remains_authoritative"],
+    ["cosmix-dopus", "authored_builtin_family_remains_authoritative"],
+    ["cosmix-term-core", "installed_mono_is_primary_and_emoji_is_coverage"],
+    ["cosmix-term-core", "installed_emoji_precedes_legacy_system_emoji"],
+    ["ctk", "installed_roles_select_without_system_fonts_and_preserve_overrides"],
+    ["cosmix-comp", "installed_chrome_family_and_emoji_chain_resolve_without_system_fonts"]
+  ]
+    $result = run_argv_must(["cargo", "test", "--locked", "-p", $test[0], "--lib", $test[1], "--", "--ignored"], {
+      cwd: $desktop, timeout: 1800, max_output: 6000000,
+      env: {COSMIX_SHARE: $share, XDG_DATA_HOME: $fixture .. "/user-data", XDG_DATA_DIRS: $fixture .. "/system-data"}
+    })
+    print($result)
+    if not re_match($result, "test result: ok[.] [1-9][0-9]* passed") then
+      raise("GATE_REAL_ASSETS", "Installed asset acceptance test did not execute: " .. $test[1])
+    end
+  end
+  print("real asset fixtures: " .. $share .. "/assets")
+end
+print("Static assets " .. $mode .. " gates passed")

@@ -273,3 +273,5 @@ pub mod prelude {
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
+/// Shared verified static font registration and Material name lookup.
+pub use cosmix_bevy_assets as assets;

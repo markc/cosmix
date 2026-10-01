@@ -449,6 +449,11 @@ pub struct WebdConfig {
     pub enabled: bool,
     pub port: u16,
     pub www_dir: String,
+    /// Opt-in shared static asset installation, served under versioned
+    /// `/_cos/assets/` URLs. Never resolved from a user's XDG overrides.
+    pub shared_assets_dir: Option<String>,
+    /// Permit anonymous cross-origin font reads from the explicitly published sets.
+    pub shared_assets_cross_origin: bool,
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
     /// Expected web FQDN(s) for the legacy top-level
@@ -598,6 +603,8 @@ impl Default for WebdConfig {
             enabled: false,
             port: 443,
             www_dir: "/var/lib/cosmix/www".into(),
+            shared_assets_dir: None,
+            shared_assets_cross_origin: false,
             tls_cert: None,
             tls_key: None,
             tls_server_name: Vec::new(),
@@ -1084,6 +1091,21 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
+    #[test]
+    fn shared_assets_publication_is_explicitly_opt_in() {
+        let defaults: WebdConfig = cosmix_mix::from_conf_mix_str("{}").unwrap();
+        assert!(defaults.shared_assets_dir.is_none());
+        assert!(!defaults.shared_assets_cross_origin);
+        let configured: WebdConfig = cosmix_mix::from_conf_mix_str(
+            r#"{ shared_assets_dir: "/srv/cosmix-assets", shared_assets_cross_origin: true }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            configured.shared_assets_dir.as_deref(),
+            Some("/srv/cosmix-assets")
+        );
+        assert!(configured.shared_assets_cross_origin);
+    }
     #[test]
     fn webd_vhost_tolerates_unknown_fields_core_structs_still_strict() {
         // Forward-compat (drift fix): `WebdVhostConfig` no longer denies unknown

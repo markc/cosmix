@@ -3,6 +3,7 @@
 
 pub mod audio_style;
 pub mod fader;
+pub mod fonts;
 pub mod knob;
 pub mod menu;
 pub mod meter;

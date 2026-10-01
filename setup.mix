@@ -1,8 +1,9 @@
--- version: 0.1.1
+-- version: 0.2.0
 -- setup.mix — CosMix setup, stage 2. Runs under the `mix` that `bootstrap`
 -- just built; re-run it any time to rebuild and reinstall (idempotent).
 --
 --   mix $COSMIX/setup.mix [--desktop] [--system] [--skip-build] [--ctl DIR]
+--                         [--assets | --assets-only | --skip-assets]
 --
 --   (default)     build every crate in the workspace (release) and install
 --                 every binary into $COSMIX/bin — no root needed
@@ -18,6 +19,11 @@
 --                 private hub for specs, decisions, plans, deploy scripts and
 --                 the public-hygiene gate; see ctl/README.md. With --skip-build
 --                 and nothing else, only the copy happens.
+--   --assets      install the pinned fonts/icons/emoji set (also implied by
+--                 --desktop). User XDG data by default; shared with --system.
+--   --assets-only install only static resources, without building or copying
+--                 binaries. Requires an installed Mix.
+--   --skip-assets skip downloads, including when --desktop is selected.
 --
 -- $COSMIX is the directory this file lives in unless the environment says
 -- otherwise; every path below derives from it.
@@ -38,6 +44,9 @@ $want_system = false
 $skip_build = false
 $ctl_dest = ""
 $expect_ctl = false
+$want_assets = false
+$assets_only = false
+$skip_assets = false
 for each $a in args()
   if $expect_ctl then
     $ctl_dest = $a
@@ -50,10 +59,61 @@ for each $a in args()
     $want_system = true
   elif $a == "--skip-build" then
     $skip_build = true
+  elif $a == "--assets" then
+    $want_assets = true
+  elif $a == "--assets-only" then
+    $want_assets = true
+    $assets_only = true
+  elif $a == "--skip-assets" then
+    $skip_assets = true
   else
     print("setup: unknown flag " .. $a)
     exit(2)
   end
+end
+if $expect_ctl then
+  print("setup: --ctl needs a destination directory")
+  exit(2)
+end
+if $assets_only and ($want_desktop or $ctl_dest != "") then
+  print("setup: --assets-only cannot be combined with --desktop or --ctl")
+  exit(2)
+end
+if $skip_assets and $want_assets then
+  print("setup: --skip-assets conflicts with --assets or --assets-only")
+  exit(2)
+end
+$want_assets = ($want_assets or $want_desktop) and not $skip_assets
+
+function install_static_assets($checkout, $system)
+  $installer = $checkout .. "/share/assets/install.mix"
+  $lock = $checkout .. "/share/assets/core.conf.mix"
+  $mix_binary = "/opt/cosmix/bin/mix"
+  if not is_file($mix_binary) then
+    print("setup: static assets require the installed Mix at " .. $mix_binary)
+    exit(1)
+  end
+  if $system then
+    $share = env("COSMIX_SHARE", "/opt/cosmix/share")
+    if not starts_with($share, "/") or $share == "/" then
+      print("setup: COSMIX_SHARE must be an absolute resource directory")
+      exit(2)
+    end
+    $destination = $share .. "/assets"
+    $_directory = run_argv_must(["sudo", "install", "-d", "-m", "755", $destination])
+    -- Publish bootstrap resources alongside the sets, keeping all binaries out
+    -- of Git. webd serves only allowlisted files inside a published set.
+    $_script = run_argv_must(["sudo", "install", "-m", "644", $installer, $destination .. "/install.mix"])
+    $_lock = run_argv_must(["sudo", "install", "-m", "644", $lock, $destination .. "/core.conf.mix"])
+    print(run_argv_must(["sudo", $mix_binary, $destination .. "/install.mix", "--root", $destination], {timeout: 900}))
+  else
+    print(run_argv_must([$mix_binary, $installer, "--user", "--manifest", $lock], {timeout: 900}))
+  end
+end
+
+if $assets_only then
+  install_static_assets($root, $want_system)
+  exit(0)
 end
 
 -- Install a binary by writing beside the destination and renaming over it:
@@ -74,7 +134,7 @@ print(">> COSMIX = " .. $root)
 --    changes to ctl/ flow by diff. Refuses to touch an existing directory.
 --    Needs no git and no GitHub: `git init` there later is optional.
 if $ctl_dest != "" then
-  if $ctl_dest == "--desktop" or $ctl_dest == "--system" or $ctl_dest == "--skip-build" then
+  if starts_with($ctl_dest, "--") then
     print("setup: --ctl needs a destination directory")
     exit(2)
   end
@@ -86,7 +146,7 @@ if $ctl_dest != "" then
   print(">> starter control folder copied to " .. $ctl_dest)
   print("   next: read " .. $ctl_dest .. "/README.md; edit _etc/public-hygiene.conf.mix;")
   print("   optional: git -C " .. $ctl_dest .. " init  (no remote needed)")
-  if $skip_build and not $want_desktop and not $want_system then
+  if $skip_build and not $want_desktop and not $want_system and not $want_assets then
     exit(0)
   end
 end
@@ -283,6 +343,10 @@ if $want_system then
   end
   print(">> /opt/cosmix/bin updated. systemd units, polkit rules and sysusers live in")
   print("   " .. $src .. "/_etc — install them with your deploy tooling; this script does not.")
+end
+
+if $want_assets then
+  install_static_assets($root, $want_system)
 end
 
 print("")

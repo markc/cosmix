@@ -1,0 +1,22 @@
+[package]
+name = "cosmix-lib-assets"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Verified local static font, icon and emoji asset sets"
+
+[lib]
+name = "cosmix_assets"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+cosmix-lib-config = { path = "../cosmix-lib-config" }
+sha2.workspace = true
+blake3.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+serde_json.workspace = true

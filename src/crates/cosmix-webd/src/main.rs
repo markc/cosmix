@@ -19,6 +19,7 @@ mod mxresolve;
 mod portal_auth;
 mod public_response_cache;
 mod session;
+mod shared_assets;
 mod shares;
 mod stats;
 mod tls_status;
@@ -131,6 +132,16 @@ enum Command {
         #[arg(long)]
         docs_dir: Option<PathBuf>,
 
+        /// Opt-in shared asset tree (published fonts/icons/emoji sets only).
+        /// Overrides webd.shared_assets_dir; also supported in static dev mode.
+        #[arg(long)]
+        assets_dir: Option<PathBuf>,
+
+        /// Permit anonymous public fonts to be loaded by pages on other origins.
+        /// Requires an explicitly configured shared asset directory.
+        #[arg(long)]
+        assets_cross_origin: bool,
+
         /// DEV MODE: serve this directory as a static site on a loopback-only
         /// listener (default `127.0.0.1:8080`). Short-circuits the entire
         /// production path — no `node.conf.mix`, no database, no Bus broker, no
@@ -142,7 +153,7 @@ enum Command {
         /// `/assets/`). A zero-config local preview, fenced to loopback so the
         /// no-auth posture can't be reached off-box. With `--static-dir` set,
         /// `--listen` (if given) must RESOLVE to a loopback address; all other
-        /// serve flags are ignored.
+        /// serve flags except `--assets-dir` and `--assets-cross-origin` are ignored.
         #[arg(long)]
         static_dir: Option<PathBuf>,
 
@@ -6145,6 +6156,10 @@ fn build_per_vhost_router(node: Arc<NodeState>) -> Router {
         .route("/docs/", axum::routing::get(serve_docs_index))
         .route("/docs/{*path}", axum::routing::get(serve_docs))
         .route("/assets/{*rest}", axum::routing::get(serve_assets))
+        .route(
+            "/_cos/assets/{set_id}/{*path}",
+            axum::routing::get(shared_assets::serve),
+        )
         .fallback(serve_static)
         // Inner layer: records the response status against the per-vhost
         // counters. The `Extension<Arc<VhostState>>` it pulls is injected
@@ -6405,7 +6420,12 @@ async fn serve_plain(listen: &str, app: Router, kind: &str) -> Result<()> {
 /// Fenced to the loopback interface so the no-auth / no-isolation dev
 /// posture cannot be reached off-box: `--listen` (if given) must resolve to
 /// a loopback host, otherwise the daemon refuses to start.
-async fn run_static_dev_server(static_dir: PathBuf, cli_listen: Option<String>) -> Result<()> {
+async fn run_static_dev_server(
+    static_dir: PathBuf,
+    cli_listen: Option<String>,
+    assets_dir: Option<PathBuf>,
+    assets_cross_origin: bool,
+) -> Result<()> {
     let www_dir = static_dir.canonicalize().with_context(|| {
         format!("--static-dir {static_dir:?} does not exist or is not readable")
     })?;
@@ -6513,7 +6533,17 @@ async fn run_static_dev_server(static_dir: PathBuf, cli_listen: Option<String>) 
          handlers / CMS API / DB / TLS (loopback only)"
     );
     println!("  stop    : Ctrl-C");
-    serve_plain(&listen, build_router(node), "static-dev").await
+    if assets_cross_origin && assets_dir.is_none() {
+        anyhow::bail!("--assets-cross-origin requires --assets-dir");
+    }
+    let assets = shared_assets::Registry::load_optional(assets_dir.as_deref())?
+        .with_cross_origin(assets_cross_origin);
+    serve_plain(
+        &listen,
+        build_router(node).layer(Extension(Arc::new(assets))),
+        "static-dev",
+    )
+    .await
 }
 
 /// Resolve + validate the `--static-dir` dev-mode listen address and return
@@ -7088,6 +7118,8 @@ async fn async_main() -> Result<()> {
             jmap_upstream: cli_jmap_upstream,
             noded_ws: cli_noded_ws,
             docs_dir,
+            assets_dir: cli_assets_dir,
+            assets_cross_origin: cli_assets_cross_origin,
             static_dir,
             tls_cert: cli_tls_cert,
             tls_key: cli_tls_key,
@@ -7096,7 +7128,13 @@ async fn async_main() -> Result<()> {
             // serve path (no node.conf.mix / DB / broker / ACME / TLS) and
             // serves a plain static folder on a loopback-only listener.
             if let Some(static_dir) = static_dir {
-                return run_static_dev_server(static_dir, cli_listen).await;
+                return run_static_dev_server(
+                    static_dir,
+                    cli_listen,
+                    cli_assets_dir,
+                    cli_assets_cross_origin,
+                )
+                .await;
             }
 
             rustls::crypto::ring::default_provider()
@@ -7108,6 +7146,24 @@ async fn async_main() -> Result<()> {
 
             // Resolve config: CLI args override node.conf.mix
             let node_cfg = cosmix_config::node::load_node_config()?;
+            let assets_dir = cli_assets_dir.or_else(|| {
+                node_cfg
+                    .as_ref()
+                    .and_then(|c| c.webd.shared_assets_dir.as_ref().map(PathBuf::from))
+            });
+            let assets_cross_origin = cli_assets_cross_origin
+                || node_cfg
+                    .as_ref()
+                    .is_some_and(|c| c.webd.shared_assets_cross_origin);
+            if assets_cross_origin && assets_dir.is_none() {
+                anyhow::bail!(
+                    "cross-origin asset reads require --assets-dir or webd.shared_assets_dir"
+                );
+            }
+            let shared_assets = Arc::new(
+                shared_assets::Registry::load_optional(assets_dir.as_deref())?
+                    .with_cross_origin(assets_cross_origin),
+            );
             let listen = cli_listen
                 .or_else(|| node_cfg.as_ref().map(|c| c.web_listen()))
                 .unwrap_or_else(|| "0.0.0.0:443".into());
@@ -8153,7 +8209,7 @@ async fn async_main() -> Result<()> {
             // bearing — see the comment above.
             let _vhosts_provisioner_events_rx_parked = vhosts_provisioner_events_rx_opt;
 
-            let app = build_router(node.clone());
+            let app = build_router(node.clone()).layer(Extension(shared_assets));
 
             // Bus citizen surface — fire-and-forget background task.
             // `bus::run` never returns (retry-with-backoff covers both

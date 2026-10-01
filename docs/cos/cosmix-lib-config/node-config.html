@@ -524,6 +524,8 @@ HTTPS upstream URL for webd.</p>
 <tr><td><code>enabled</code></td><td>Enables webd.</td></tr>
 <tr><td><code>port</code></td><td>Port used by the implicit node-address listener.</td></tr>
 <tr><td><code>www_dir</code></td><td>Legacy document root.</td></tr>
+<tr><td><code>shared_assets_dir</code></td><td>Optional absolute shared asset installation root. Enables verified versioned <code>/_cos/assets/&lt;set-id&gt;/</code> publication; defaults to disabled and never uses user XDG overrides.</td></tr>
+<tr><td><code>shared_assets_cross_origin</code></td><td>Permit anonymous cross-origin font reads from published sets. Defaults to false; requires a shared asset directory.</td></tr>
 <tr><td><code>tls_cert</code>, <code>tls_key</code></td><td>Legacy manual certificate and key paths.</td></tr>
 <tr><td><code>tls_server_name</code></td><td>Hostnames covered by the legacy certificate pair.</td></tr>
 <tr><td><code>http_listen</code></td><td>Optional explicit plain-HTTP bind used by HTTP-01 and redirects.</td></tr>

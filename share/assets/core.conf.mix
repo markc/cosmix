@@ -1,0 +1,175 @@
+{
+  "schema": "cosmix.static-assets.v1",
+  "set_id": "2026-10-01-core-2",
+  "fonts": {
+    "sans": "fonts/InterVariable.ttf",
+    "serif": "fonts/NotoSerif.ttf",
+    "mono": "fonts/JetBrainsMono.ttf",
+    "icons": "icons/MaterialSymbolsRounded.ttf",
+    "emoji": "emoji/NotoColorEmoji.ttf",
+    "serif_italic": "fonts/NotoSerif-Italic.ttf",
+    "mono_italic": "fonts/JetBrainsMono-Italic.ttf"
+  },
+  "files": [
+    {
+      "path": "fonts/InterVariable.ttf",
+      "url": "https://raw.githubusercontent.com/rsms/inter/353b61b9f4430d5f420d56605a6e7993e0941470/docs/font-files/InterVariable.ttf",
+      "revision": "353b61b9f4430d5f420d56605a6e7993e0941470",
+      "upstream": "https://github.com/rsms/inter",
+      "licence": "OFL-1.1",
+      "bytes": 879708,
+      "sha256": "4989b125924991b90d05b2d16e0e388c48f7d5bb8b30539bbf9c755278d0ccaf",
+      "blake3": "273f86e03d009a0ba65d109cf6ed8931560e98289ce1da5bede6c27f36758bf9"
+    },
+    {
+      "path": "web/InterVariable.woff2",
+      "url": "https://raw.githubusercontent.com/rsms/inter/353b61b9f4430d5f420d56605a6e7993e0941470/docs/font-files/InterVariable.woff2",
+      "revision": "353b61b9f4430d5f420d56605a6e7993e0941470",
+      "upstream": "https://github.com/rsms/inter",
+      "licence": "OFL-1.1",
+      "bytes": 352240,
+      "sha256": "693b77d4f32ee9b8bfc995589b5fad5e99adf2832738661f5402f9978429a8e3",
+      "blake3": "b42cd608c35da362a163e5c8c151e96424052169267f9c69b0ae5a3b280a0cdc"
+    },
+    {
+      "path": "licences/Inter-OFL.txt",
+      "url": "https://raw.githubusercontent.com/rsms/inter/353b61b9f4430d5f420d56605a6e7993e0941470/LICENSE.txt",
+      "revision": "353b61b9f4430d5f420d56605a6e7993e0941470",
+      "upstream": "https://github.com/rsms/inter",
+      "licence": "OFL-1.1",
+      "bytes": 4380,
+      "sha256": "262481e844521b326f5ecd053e59b98c8b2da78c8ee1bdbb6e8174305e54935a",
+      "blake3": "54aa13ccba78c48b2b473f52adb37c68dc2bcb4e0c1af88d9e2f147ba0674561"
+    },
+    {
+      "path": "fonts/JetBrainsMono.ttf",
+      "url": "https://raw.githubusercontent.com/JetBrains/JetBrainsMono/cd5227bd1f61dff3bbd6c814ceaf7ffd95e947d9/fonts/variable/JetBrainsMono%5Bwght%5D.ttf",
+      "revision": "cd5227bd1f61dff3bbd6c814ceaf7ffd95e947d9",
+      "upstream": "https://github.com/JetBrains/JetBrainsMono",
+      "licence": "OFL-1.1",
+      "bytes": 303144,
+      "sha256": "662a196d58f1183bf2d77428b6d5283fe3f45161ab021bea4036bc98e5cac016",
+      "blake3": "00a26751f5073cf0057af971b277830bb30740ffb5583c322d5eb577f6d26d9b"
+    },
+    {
+      "path": "fonts/JetBrainsMono-Italic.ttf",
+      "url": "https://raw.githubusercontent.com/JetBrains/JetBrainsMono/cd5227bd1f61dff3bbd6c814ceaf7ffd95e947d9/fonts/variable/JetBrainsMono-Italic%5Bwght%5D.ttf",
+      "revision": "cd5227bd1f61dff3bbd6c814ceaf7ffd95e947d9",
+      "upstream": "https://github.com/JetBrains/JetBrainsMono",
+      "licence": "OFL-1.1",
+      "bytes": 308888,
+      "sha256": "f115aaa12113718c02ce72864fe6823b87241bc23d3e44cf1220155f861063f2",
+      "blake3": "06f7dd2b3c9e6e6765d309a4ae7c9ac1705996fe42eead844804883392a4defd"
+    },
+    {
+      "path": "licences/JetBrainsMono-OFL.txt",
+      "url": "https://raw.githubusercontent.com/JetBrains/JetBrainsMono/cd5227bd1f61dff3bbd6c814ceaf7ffd95e947d9/OFL.txt",
+      "revision": "cd5227bd1f61dff3bbd6c814ceaf7ffd95e947d9",
+      "upstream": "https://github.com/JetBrains/JetBrainsMono",
+      "licence": "OFL-1.1",
+      "bytes": 4399,
+      "sha256": "30f0c136e3c88e422d0791acd97238870f9054a9729bc34cf2ff0d4ed8cac4ad",
+      "blake3": "4ad21e838c2a993c5cabc052011205bdda92a83189805e75d163ef27bebc2d5e"
+    },
+    {
+      "path": "fonts/NotoSerif.ttf",
+      "url": "https://raw.githubusercontent.com/google/fonts/9710da1eacb3be272583c3224dcb70f9da6eadbb/ofl/notoserif/NotoSerif%5Bwdth,wght%5D.ttf",
+      "revision": "9710da1eacb3be272583c3224dcb70f9da6eadbb",
+      "upstream": "https://github.com/google/fonts",
+      "licence": "OFL-1.1",
+      "bytes": 1887192,
+      "sha256": "4d8e6761424656867019081a1a01336f3cb086982682698714054fc33f782713",
+      "blake3": "db06b083b266b9292cdb52c946f8142d9fc2f22e955fecb6be75e8109e723301"
+    },
+    {
+      "path": "fonts/NotoSerif-Italic.ttf",
+      "url": "https://raw.githubusercontent.com/google/fonts/9710da1eacb3be272583c3224dcb70f9da6eadbb/ofl/notoserif/NotoSerif-Italic%5Bwdth,wght%5D.ttf",
+      "revision": "9710da1eacb3be272583c3224dcb70f9da6eadbb",
+      "upstream": "https://github.com/google/fonts",
+      "licence": "OFL-1.1",
+      "bytes": 2448496,
+      "sha256": "e87acbc6c0efd0d9a20d6a8cbbda2b266c14be3a3a6f5af8ec9d7b2460570ad1",
+      "blake3": "36f250dd3caf9ecfc9681b4bb1f8cc39b08cb421decd63d5a853da8ac9655b93"
+    },
+    {
+      "path": "licences/NotoSerif-OFL.txt",
+      "url": "https://raw.githubusercontent.com/google/fonts/9710da1eacb3be272583c3224dcb70f9da6eadbb/ofl/notoserif/OFL.txt",
+      "revision": "9710da1eacb3be272583c3224dcb70f9da6eadbb",
+      "upstream": "https://github.com/google/fonts",
+      "licence": "OFL-1.1",
+      "bytes": 4396,
+      "sha256": "cee9892f9f0cc8fe882c9e9537ee6a89621d86ee7ceaf70b02e2b2b1c25c061a",
+      "blake3": "347bf2f0c4992ecf0abebdb585068899983a1f7b8aced2613ea4ce261d1be8d1"
+    },
+    {
+      "path": "icons/MaterialSymbolsRounded.ttf",
+      "url": "https://raw.githubusercontent.com/google/material-design-icons/bd8cb85bd4bad964fe6918f79665bb40c3a8efef/variablefont/MaterialSymbolsRounded%5BFILL,GRAD,opsz,wght%5D.ttf",
+      "revision": "bd8cb85bd4bad964fe6918f79665bb40c3a8efef",
+      "upstream": "https://github.com/google/material-design-icons",
+      "licence": "Apache-2.0",
+      "bytes": 15214320,
+      "sha256": "c2182b6337495e64cc9e2311c52522567ac277d25a842bd027f9c9e3a5cc6d86",
+      "blake3": "033a9b8204565af22e7e0f947d1a052aedf16edf393d1a9fe788fb593da139c2"
+    },
+    {
+      "path": "web/MaterialSymbolsRounded.woff2",
+      "url": "https://raw.githubusercontent.com/google/material-design-icons/bd8cb85bd4bad964fe6918f79665bb40c3a8efef/variablefont/MaterialSymbolsRounded%5BFILL,GRAD,opsz,wght%5D.woff2",
+      "revision": "bd8cb85bd4bad964fe6918f79665bb40c3a8efef",
+      "upstream": "https://github.com/google/material-design-icons",
+      "licence": "Apache-2.0",
+      "bytes": 5399668,
+      "sha256": "0865c62d7fda358cd4cdb77792b758afa66fae2c4159fa3fb04a2c1d05700e9e",
+      "blake3": "8ea8708632e22fbbf25932fefc4298799ec3b74d3b4ee3dc919869d91d3fa349"
+    },
+    {
+      "path": "icons/MaterialSymbolsRounded.codepoints",
+      "url": "https://raw.githubusercontent.com/google/material-design-icons/bd8cb85bd4bad964fe6918f79665bb40c3a8efef/variablefont/MaterialSymbolsRounded%5BFILL,GRAD,opsz,wght%5D.codepoints",
+      "revision": "bd8cb85bd4bad964fe6918f79665bb40c3a8efef",
+      "upstream": "https://github.com/google/material-design-icons",
+      "licence": "Apache-2.0",
+      "bytes": 79338,
+      "sha256": "225bd09137103cb7746bc93dc08d08764c9f0c3bd04f4b958d4a3c3c19432dd6",
+      "blake3": "4afce3cee07d21d5ba3a48781cc1e909b45cb2c1c2652d42f39eaabbca70945f"
+    },
+    {
+      "path": "licences/MaterialSymbols-Apache.txt",
+      "url": "https://raw.githubusercontent.com/google/material-design-icons/bd8cb85bd4bad964fe6918f79665bb40c3a8efef/LICENSE",
+      "revision": "bd8cb85bd4bad964fe6918f79665bb40c3a8efef",
+      "upstream": "https://github.com/google/material-design-icons",
+      "licence": "Apache-2.0",
+      "bytes": 11357,
+      "sha256": "58d1e17ffe5109a7ae296caafcadfdbe6a7d176f0bc4ab01e12a689b0499d8bd",
+      "blake3": "f247daade87762f3df12331600dbd8a4820f7632474e66a3dc3c63644bb3eaaf"
+    },
+    {
+      "path": "emoji/NotoColorEmoji.ttf",
+      "url": "https://raw.githubusercontent.com/googlefonts/noto-emoji/8998f5dd683424a73e2314a8c1f1e359c19e8742/fonts/NotoColorEmoji.ttf",
+      "revision": "8998f5dd683424a73e2314a8c1f1e359c19e8742",
+      "upstream": "https://github.com/googlefonts/noto-emoji",
+      "licence": "OFL-1.1",
+      "bytes": 10673480,
+      "sha256": "72a635cb3d2f3524c51620cdde406b217204e8a6a06c6a096ff8ed4b5fd6e27b",
+      "blake3": "b61dcf1dec7fe5cf666b22b4276be1c6d4c39f2a56a2a10453184b680eed73c1"
+    },
+    {
+      "path": "licences/NotoColorEmoji-OFL.txt",
+      "url": "https://raw.githubusercontent.com/googlefonts/noto-emoji/8998f5dd683424a73e2314a8c1f1e359c19e8742/fonts/LICENSE",
+      "revision": "8998f5dd683424a73e2314a8c1f1e359c19e8742",
+      "upstream": "https://github.com/googlefonts/noto-emoji",
+      "licence": "OFL-1.1",
+      "bytes": 4301,
+      "sha256": "6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2",
+      "blake3": "7074dc90f728d93e9226e8309f4df52f5db2059fd722ff6c7747c49d6689f9d7"
+    }
+  ],
+  "web_css": "/* Relative URLs keep this stylesheet bound to its immutable asset set. */\n@font-face { font-family: \"Cosmix Sans\"; src: url(\"web/InterVariable.woff2\") format(\"woff2\"); font-style: normal; font-weight: 100 900; font-display: swap; }\n@font-face { font-family: \"Cosmix Serif\"; src: url(\"fonts/NotoSerif.ttf\") format(\"truetype\"); font-style: normal; font-weight: 100 900; font-display: swap; }\n@font-face { font-family: \"Cosmix Serif\"; src: url(\"fonts/NotoSerif-Italic.ttf\") format(\"truetype\"); font-style: italic; font-weight: 100 900; font-display: swap; }\n@font-face { font-family: \"Cosmix Mono\"; src: url(\"fonts/JetBrainsMono.ttf\") format(\"truetype\"); font-style: normal; font-weight: 100 800; font-display: swap; }\n@font-face { font-family: \"Cosmix Mono\"; src: url(\"fonts/JetBrainsMono-Italic.ttf\") format(\"truetype\"); font-style: italic; font-weight: 100 800; font-display: swap; }\n@font-face { font-family: \"Cosmix Symbols Rounded\"; src: url(\"web/MaterialSymbolsRounded.woff2\") format(\"woff2\"); font-style: normal; font-weight: 100 700; font-display: block; }\n@font-face { font-family: \"Cosmix Emoji\"; src: url(\"emoji/NotoColorEmoji.ttf\") format(\"truetype\"); font-display: swap; }\n.cosmix-symbol { font-family: \"Cosmix Symbols Rounded\"; font-weight: 400; font-style: normal; font-size: 24px; line-height: 1; display: inline-block; white-space: nowrap; font-feature-settings: \"liga\"; font-variation-settings: \"FILL\" 0, \"wght\" 400, \"GRAD\" 0, \"opsz\" 24; }\n",
+  "font_families": {
+    "sans": "Inter Variable",
+    "serif": "Noto Serif",
+    "serif_italic": "Noto Serif",
+    "mono": "JetBrains Mono",
+    "mono_italic": "JetBrains Mono",
+    "icons": "Material Symbols Rounded",
+    "emoji": "Noto Color Emoji"
+  }
+}

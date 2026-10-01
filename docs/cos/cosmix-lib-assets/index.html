@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — cos/cosmix-webd/commands-and-configuration</title>
+    <title>CosMix — cos/cosmix-lib-assets/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -441,146 +441,145 @@
     <div id="brochure" data-stub style="display:none"></div>
 
     <div id="doc-view" class="content-section">
-        <div id="content-doc" data-prerendered="cos/cosmix-webd/commands-and-configuration.md"><div class="prose"><h1 id="commands-and-configuration">Commands and configuration</h1>
-<p>For account-root path sharing, configure <code>webd.shares.roots</code> in <code>node.conf.mix</code>.
-See <a href="/cos/cosmix-webd/shares">public shares</a> for the exact email-keyed map, startup validation,
-and the C1/C6 scope. Roots are operator configuration, never HTTP/Bus arguments.</p>
-<p><code>cosmix-webd</code> is a subcommand-driven daemon binary. Server flags override matching values resolved from <code>node.conf.mix</code>.</p>
-<h2 id="commands">Commands</h2>
-<table><thead><tr><th>Command</th><th>Purpose</th></tr></thead><tbody>
-<tr><td><code>cosmix-webd serve</code></td><td>Start production serving</td></tr>
-<tr><td><code>cosmix-webd init</code></td><td>Initialise the SQLite CMS schema</td></tr>
-<tr><td><code>cosmix-webd mkcert</code></td><td>Create a self-signed EC P-256 certificate</td></tr>
-<tr><td><code>cosmix-webd vhost</code></td><td>Add, list, show, or remove vhost property rows</td></tr>
-<tr><td><code>cosmix-webd acme</code></td><td>Force renewal or inspect one ACME vhost</td></tr>
-<tr><td><code>cosmix-webd routes list</code></td><td>Print the current route-map snapshot</td></tr>
-<tr><td><code>cosmix-webd stats</code></td><td>Print per-vhost response counters</td></tr>
-<tr><td><code>cosmix-webd tls status</code></td><td>Print TLS identity and ACME status</td></tr>
-<tr><td><code>cosmix-webd tls reload</code></td><td>Reload manual PEM files atomically</td></tr>
-<tr><td><code>cosmix-webd autoconfig served-domains</code></td><td>Print the autoconfiguration allowlist</td></tr>
-</tbody></table>
-<p><code>--version</code> includes the package version, source revision, and build time.</p>
-<h2 id="serve">Serve</h2>
-<pre><code class="language-text">cosmix-webd serve [OPTIONS]
+        <div id="content-doc" data-prerendered="cos/cosmix-lib-assets/README.md"><div class="prose"><h1 id="shared-static-assets">Shared static assets</h1>
+<p>Cosmix uses a shared installation tree for fonts, Material Symbols and colour
+emoji, with optional XDG user overrides. Applications read local files through
+<code>cosmix-lib-assets</code>; webd can serve those same files through an explicitly
+enabled versioned route. Static resources need no asset daemon, database,
+blobd/filesd dependency or runtime network request.</p>
+<h2 id="install">Install</h2>
+<p>From a checkout with Mix installed:</p>
+<pre><code class="language-text">mix setup.mix --assets-only
+mix setup.mix --assets-only --system
 </code></pre>
-<table><thead><tr><th>Option</th><th>Meaning</th></tr></thead><tbody>
-<tr><td><code>--listen &lt;ADDR&gt;</code></td><td>Override the primary listen address</td></tr>
-<tr><td><code>--http-listen &lt;ADDR&gt;</code></td><td>Add a plain-HTTP redirect and ACME listener</td></tr>
-<tr><td><code>--www-dir &lt;PATH&gt;</code></td><td>Override the legacy static root</td></tr>
-<tr><td><code>--db-path &lt;PATH&gt;</code></td><td>Override the legacy SQLite path</td></tr>
-<tr><td><code>--jmap-upstream &lt;URL&gt;</code></td><td>Override the legacy JMAP upstream</td></tr>
-<tr><td><code>--noded-ws &lt;URL&gt;</code></td><td>Override the legacy broker WebSocket URL</td></tr>
-<tr><td><code>--docs-dir &lt;PATH&gt;</code></td><td>Serve Markdown files below <code>/docs</code></td></tr>
-<tr><td><code>--static-dir &lt;PATH&gt;</code></td><td>Enter loopback-only static preview mode</td></tr>
-<tr><td><code>--assets-dir &lt;PATH&gt;</code></td><td>Opt in to verified shared asset publication from an absolute installation root; also works with static preview</td></tr>
-<tr><td><code>--assets-cross-origin</code></td><td>Permit anonymous font reads by pages on other origins; requires a configured asset directory</td></tr>
-<tr><td><code>--tls-cert &lt;PATH&gt;</code></td><td>Override the legacy certificate PEM path</td></tr>
-<tr><td><code>--tls-key &lt;PATH&gt;</code></td><td>Override the legacy private-key PEM path</td></tr>
-</tbody></table>
-<p>The normal resolution order is CLI, node configuration, then the source-defined default. The database defaults below the CosMix variable-data directory. The legacy static root defaults to its <code>www</code> subdirectory.</p>
-<p><code>--http-listen</code> is opt-in. Without a CLI value or configured value, no secondary plain-HTTP listener is created.</p>
-<h3 id="static-preview">Static preview</h3>
-<pre><code class="language-text">cosmix-webd serve --static-dir ./site
+<p>The first command installs into <code>$XDG_DATA_HOME/cosmix/assets</code>, defaulting to
+<code>$HOME/.local/share/cosmix/assets</code>. The second installs shared resources under
+<code>$COSMIX_SHARE/assets</code>, normally <code>/opt/cosmix/share/assets</code>, using sudo for the
+system destination. Neither command builds or installs binaries. Desktop setup
+also installs the assets; use <code>--skip-assets</code> when using a preinstalled set or
+working offline.</p>
+<p>The standalone bootstrap supports scratch destinations and inspection:</p>
+<pre><code class="language-text">mix share/assets/install.mix --list
+mix share/assets/install.mix --root /tmp/cosmix-assets
+mix share/assets/install.mix --root /tmp/cosmix-assets --verify
 </code></pre>
-<p>Static preview bypasses node configuration, SQLite, Bus, ACME, TLS, vhost registration, Mix handlers, the CMS API, JMAP, and WebSocket proxying. It serves static files plus the Markdown and asset routes.</p>
-<p>The default address is <code>127.0.0.1:8080</code>. An explicit <code>--listen</code> must resolve entirely to loopback addresses and must provide an IPv4 loopback result.</p>
-<h2 id="initialise-a-database">Initialise a database</h2>
-<pre><code class="language-text">cosmix-webd init [--db-path &lt;PATH&gt;]
+<p>For an installed system tree, use
+<code>mix /opt/cosmix/share/assets/install.mix --system --verify</code>, adjusting the prefix
+if configured differently. Run <code>--user</code> without sudo; it uses the current
+process user's HOME and XDG variables. The system prefix parent must already
+exist and be readable/traversable by the intended consumers. The installer
+creates a missing share directory, but does not alter existing ancestors.</p>
+<p>The pinned core set includes Inter Variable upright, Noto Serif upright/italic,
+JetBrains Mono upright/italic, Material Symbols Rounded with its upstream
+codepoint catalogue, and Noto Color Emoji 2.051. Upstream WOFF2 files are included
+where available. There are 15 downloads totalling 37,575,307 bytes (35.83 MiB).
+Inter italic and additional script/CJK packs are not part of this initial set.</p>
+<p>The source lock is <code>share/assets/core.conf.mix</code>. It records upstream revisions,
+HTTPS URLs, sizes, SHA-256/BLAKE3 checksums, role paths, actual family names,
+licences and a local stylesheet. Downloads use generic Mix HTTP primitives;
+no application contacts Google Fonts while rendering.</p>
+<h2 id="storage-and-lookup">Storage and lookup</h2>
+<pre><code class="language-text">assets/
+  install.mix                 # installed system bootstrap
+  core.conf.mix               # installed bootstrap lock
+  current -&gt; sets/2026-10-01-core-2
+  sets/2026-10-01-core-2/
+    manifest.conf.mix
+    fonts.css
+    fonts/
+    icons/
+    emoji/
+    web/
+    licences/
 </code></pre>
-<p>The command creates parent directories and applies the <code>posts</code> and <code>session_epochs</code> schema with <code>CREATE TABLE IF NOT EXISTS</code>.</p>
-<h2 id="create-a-local-certificate">Create a local certificate</h2>
-<pre><code class="language-text">cosmix-webd mkcert &lt;FQDN&gt; &lt;CERT-PEM&gt; &lt;KEY-PEM&gt;
+<p>Set IDs are immutable. The bootstrap downloads into a private staging directory
+on the destination filesystem, verifies all files, publishes the complete set
+and atomically switches <code>current</code>. Repeating installation verifies and reuses
+the existing bytes. An error preserves the previous activation. An existing ID
+with different manifest bytes is refused. Directories use 0755 and files 0644;
+only the installing operator writes system resources.</p>
+<p>Native discovery chooses a complete set in this order:</p>
+<ol>
+<li><code>$XDG_DATA_HOME/cosmix/assets/current</code>.</li>
+<li><code>&lt;entry&gt;/cosmix/assets/current</code> in <code>$XDG_DATA_DIRS</code> order, default
+<code>/usr/local/share:/usr/share</code>.</li>
+<li><code>$COSMIX_SHARE/assets/current</code>, default <code>/opt/cosmix/share/assets/current</code>.</li>
+</ol>
+<p>Relative XDG paths are ignored. Absent sets fall through; malformed existing
+sets report an error. A selected <code>current</code> link is resolved once, preserving one
+consistent set directory throughout its use. <code>COSMIX_SHARE</code> is a shared resource
+setting independent of the source checkout's <code>COSMIX</code>; configure it consistently
+for applications and daemons when changing the installation prefix.</p>
+<p>Adding <code>/opt/cosmix/share</code> to <code>XDG_DATA_DIRS</code> alone would search
+<code>/opt/cosmix/share/cosmix/assets</code>. The resolver explicitly handles the installation
+prefix fallback, so no such environment adjustment is required.</p>
+<p>Glyph atlases and other disposable rendering caches belong in memory or
+<code>$XDG_CACHE_HOME/cosmix</code>, default <code>$HOME/.cache/cosmix</code>. Font registration uses the
+verified files directly. Placing files under this directory does not automatically
+make fontconfig scan them; applications using fontconfig need explicit directory
+configuration and a font-cache rebuild.</p>
+<h2 id="rust-api">Rust API</h2>
+<p>The Cargo package is <code>cosmix-lib-assets</code>; the Rust crate is <code>cosmix_assets</code>.</p>
+<pre><code class="language-rust">use cosmix_assets::AssetSet;
+
+fn main() -&gt; anyhow::Result&lt;()&gt; {
+    if let Some(set) = AssetSet::discover()? {
+        if let Some(path) = set.font_path("sans") {
+            println!("{}: {}", set.set_id(), path.display());
+        }
+        if let Some(home) = set.icon("home") {
+            println!("{home}");
+        }
+    }
+    Ok(())
+}
 </code></pre>
-<p>The command creates a self-signed EC P-256 certificate for an internal or <code>.localhost</code> vhost. The FQDN is used for the common name and DNS subject alternative name; the certificate also contains a loopback IP subject alternative name.</p>
-<h2 id="manage-vhosts">Manage vhosts</h2>
-<pre><code class="language-text">cosmix-webd vhost add &lt;FQDN&gt; &lt;WWW-DIR&gt; [OPTIONS]
-cosmix-webd vhost list
-cosmix-webd vhost show &lt;FQDN&gt;
-cosmix-webd vhost remove &lt;FQDN&gt;
-</code></pre>
-<p><code>vhost</code> commands connect to the running daemon through the default broker.</p>
-<p><code>vhost add</code> accepts:</p>
-<table><thead><tr><th>Option</th><th>Meaning</th></tr></thead><tbody>
-<tr><td><code>--acme-provider &lt;NAME&gt;</code></td><td>Select an ACME provider</td></tr>
-<tr><td><code>--acme-challenge &lt;TYPE&gt;</code></td><td>Select the ACME challenge</td></tr>
-<tr><td><code>--acme-contact-email &lt;ADDRESS&gt;</code></td><td>Set the ACME account contact</td></tr>
-<tr><td><code>--tls-cert-path &lt;PATH&gt;</code></td><td>Set a manual certificate path</td></tr>
-<tr><td><code>--tls-key-path &lt;PATH&gt;</code></td><td>Set a manual private-key path</td></tr>
-<tr><td><code>--disabled</code></td><td>Create the row with <code>enabled = false</code></td></tr>
-</tbody></table>
-<p>The ACME provider, challenge, and contact fields form one mode. Manual certificate and key fields form the other mode. The modes are mutually exclusive, and certificate/key half-pairs are rejected.</p>
-<p><code>vhost remove</code> reads the current row version before deleting it. Missing rows are treated as an idempotent success; concurrent changes require a retry.</p>
-<p><code>vhost add</code> and <code>vhost remove</code> refuse a change the next restart would reject. On a node with explicit <code>[[webd.listener]]</code> rows, add the FQDN to exactly one enabled listener's <code>vhosts</code> in <code>node.conf.mix</code>, then run <code>vhost add</code> straight away. Do not restart between the two steps: a listener naming a host with no row aborts the boot. To remove, drop the host from the listener, then run <code>vhost remove</code>, unless a <code>[[webd.vhost]]</code> block still defines it. A refused add writes nothing. On such a node the new host is served after the next restart, and the reply says <code>"served_after": "restart"</code>. See <a href="/cos/cosmix-webd/bus-verbs#vhost-verbs">Bus verbs</a> for the exact rules and for how runtime-added certificates are loaded after a restart.</p>
-<h2 id="acme-routes-statistics-tls-and-autoconfiguration">ACME, routes, statistics, TLS, and autoconfiguration</h2>
-<pre><code class="language-text">cosmix-webd acme renew &lt;FQDN&gt;
-cosmix-webd acme status &lt;FQDN&gt;
-cosmix-webd routes list
-cosmix-webd stats
-cosmix-webd tls status
-cosmix-webd tls reload
-cosmix-webd autoconfig served-domains
-</code></pre>
-<p><code>acme renew</code> bypasses timing gates but does not bypass a disabled vhost or other policy gates. It returns after queuing the renewal; use <code>acme status</code> to observe the outcome.</p>
-<p><code>tls reload</code> is available only when manual PEM identities own the live listener resolvers. It validates all replacement material before swapping any resolver.</p>
-<h2 id="node-configuration-consumed-by-the-daemon">Node configuration consumed by the daemon</h2>
-<p>The crate loads <code>node.conf.mix</code> through <code>cosmix-lib-config</code>. Its source directly consumes the following web configuration fields.</p>
-<table><thead><tr><th>Field</th><th>Use</th></tr></thead><tbody>
-<tr><td><code>www_dir</code></td><td>Legacy static root</td></tr>
-<tr><td><code>shared_assets_dir</code></td><td>Optional absolute root of installed static font/icon/emoji sets; defaults to disabled</td></tr>
-<tr><td><code>shared_assets_cross_origin</code></td><td>Permit anonymous cross-origin reads from published sets; defaults to false</td></tr>
-<tr><td><code>http_listen</code></td><td>Optional redirect and HTTP-01 listener</td></tr>
-<tr><td><code>tls_cert</code></td><td>Legacy manual certificate path</td></tr>
-<tr><td><code>tls_key</code></td><td>Legacy manual private-key path</td></tr>
-<tr><td><code>tls_server_name</code></td><td>Legacy host-routing and certificate names</td></tr>
-<tr><td><code>served_mail_domains</code></td><td>Mail autoconfiguration admission allowlist</td></tr>
-<tr><td><code>autoconfig_mail_host</code></td><td>Optional advertised mail host override</td></tr>
-<tr><td><code>vhost</code></td><td>Per-vhost configuration rows</td></tr>
-<tr><td><code>listener</code></td><td>Per-interface listener rows</td></tr>
-<tr><td><code>listeners.operators</code></td><td>Bus service names allowed to mutate listener state</td></tr>
-</tbody></table>
-<p>The daemon also resolves the node's web listen address, JMAP upstream, and broker URL through configuration helper methods.</p>
-<h2 id="per-vhost-configuration">Per-vhost configuration</h2>
-<p>Each <code>[[webd.vhost]]</code> row supplies:</p>
-<table><thead><tr><th>Field</th><th>Use</th></tr></thead><tbody>
-<tr><td><code>host</code></td><td>Primary hostname</td></tr>
-<tr><td><code>aliases</code></td><td>Additional hostnames sharing the vhost state</td></tr>
-<tr><td><code>www_dir</code></td><td>Required static root</td></tr>
-<tr><td><code>tls_cert</code>, <code>tls_key</code></td><td>Manual TLS pair</td></tr>
-<tr><td><code>acme</code></td><td>ACME provider, challenge, and contact configuration</td></tr>
-<tr><td><code>cms_db_path</code></td><td>Optional per-vhost CMS SQLite file</td></tr>
-<tr><td><code>aux_dbs</code></td><td>Named auxiliary SQLite files attached to the CMS connection</td></tr>
-<tr><td><code>jmap_upstream</code></td><td>Optional JMAP proxy target</td></tr>
-<tr><td><code>noded_ws</code></td><td>Optional broker WebSocket proxy target</td></tr>
-<tr><td><code>docs_dir</code></td><td>Optional Markdown document root</td></tr>
-<tr><td><code>dev_session_email</code>, <code>dev_session_password</code></td><td>Paired internal-development auto-session credential</td></tr>
-<tr><td><code>public_read_email</code>, <code>public_read_password</code></td><td>Paired anonymous content-read credential</td></tr>
-<tr><td><code>system_sender_email</code>, <code>system_sender_password</code></td><td>Paired transactional-mail credential</td></tr>
-<tr><td><code>mfa_break_glass</code></td><td>Permit password-only login when second-factor state is indeterminate</td></tr>
-</tbody></table>
-<p>Hostnames are normalised and checked for duplicates before filesystem mutation. <code>www_dir</code> must exist. Operational failures for one vhost disable that vhost while healthy vhosts continue; an empty healthy set still prevents startup.</p>
-<p>Manual TLS and ACME are mutually exclusive. A public-facing manual certificate is validated against the primary name and aliases. A vhost with a development auto-session must be assigned only to explicit internal listeners with internal bind addresses.</p>
-<p>Auxiliary database paths must be absolute and unique within the vhost. They require <code>cms_db_path</code>. Schema names match <code>[a-z_][a-z0-9_]{0,31}</code> and cannot be <code>main</code> or <code>temp</code>.</p>
-<h2 id="listener-configuration">Listener configuration</h2>
-<p>Each explicit <code>[[webd.listener]]</code> row supplies:</p>
-<table><thead><tr><th>Field</th><th>Use</th></tr></thead><tbody>
-<tr><td><code>id</code></td><td>Stable listener identifier</td></tr>
-<tr><td><code>bind</code></td><td>Socket address</td></tr>
-<tr><td><code>external</code></td><td>Public/untrusted-facing classification</td></tr>
-<tr><td><code>enabled</code></td><td>Initial enabled state</td></tr>
-<tr><td><code>vhosts</code></td><td>Vhosts assigned to the listener</td></tr>
-</tbody></table>
-<p>Configuration validates unique IDs and binds, assigns every served host to one enabled listener, and rejects wildcard/specific clashes. Without explicit rows, the daemon creates one implicit internal listener at the resolved primary address and assigns every host to it.</p>
-<p>Configuration seeds <code>enabled</code> and guard state only when a <code>webd.listeners</code> property row is absent. Existing property state wins across restarts. The daemon always refreshes its own <code>external</code> field from configuration.</p>
-<h2 id="property-backed-configuration">Property-backed configuration</h2>
-<p>The daemon registers four property namespaces:</p>
-<ul>
-<li><code>webd.vhosts</code> for vhost identity, static root, TLS mode, and provisioner status.</li>
-<li><code>webd.handlers</code> for embedded Mix routes.</li>
-<li><code>webd.listeners</code> for listener guards, kill switches, and live status.</li>
-<li><code>webd.log</code> for live log-filter control.</li>
-</ul>
-<p>The three crate-defined namespaces use optimistic concurrency. Writes require the current row version.</p>
-<p>See <a href="/cos/cosmix-webd/bus-verbs">Bus verbs</a> for namespace keys, capabilities, ownership rules, lifecycle verbs, and listener lockout guards.</p></div></div>
+<p><code>load_current(root)</code> uses an explicit installation root. <code>open_published(root, set_id)</code> opens one fixed set for server use. <code>font_paths()</code> provides the native
+TTF files; <code>family(role)</code> provides the font's internal family name. <code>icon(name)</code>
+uses the pinned Material Symbols catalogue. <code>file_path(relative)</code> only resolves
+allowlisted manifest files and the known stylesheet/manifest metadata. <code>verify()</code>
+streams size and hash checks without retaining the complete set in memory.</p>
+<p>Renderer adapters register the shared fonts in their existing font systems.
+Explicit user font choices retain precedence over the installed role defaults.
+Variable-axis handling and colour emoji support remain renderer capabilities;
+the presence of a font file is not proof that every renderer supports FILL,
+optical size, bitmap emoji or COLRv1. Existing system/embedded fallbacks remain
+available when no installed set exists.</p>
+<h2 id="webd-and-mesh">webd and mesh</h2>
+<p>webd can expose explicitly configured system sets through
+<code>/_cos/assets/&lt;set-id&gt;/&lt;path&gt;</code>. Browser pages load the set's <code>fonts.css</code>, whose
+relative URLs keep every font request bound to that same set. The route serves
+only manifest files and known metadata; staging directories, bootstrap resources,
+<code>current</code> and user overrides are not exposed. The existing per-site <code>/assets/</code>
+route keeps its existing behaviour.</p>
+<p>Fixed-set URLs permit long-lived immutable caching. Mutable discovery URLs must
+revalidate instead. Font/CSS MIME types, <code>nosniff</code>, conditional requests and HEAD
+are part of the static serving contract. The default is same-origin use. Enable
+<code>serve --assets-cross-origin</code> or <code>webd.shared_assets_cross_origin: true</code> to let
+pages on other nodes/origins load these public fonts anonymously. This adds
+<code>Access-Control-Allow-Origin: *</code> to shared asset responses and never enables
+credentialed cross-origin reads.</p>
+<p>A filesystem path is local to one node. Browser clients can fetch public bytes
+from webd; native clients install a local set for offline startup. Requests to
+install or activate sets across nodes use noded ABP control. HTTP static delivery
+must not become a substitute for node control.</p>
+<h2 id="licences-and-maintenance">Licences and maintenance</h2>
+<p>The fonts retain OFL-1.1 and Material Symbols retain Apache-2.0. Original licence
+texts accompany the downloaded set. Preserve applicable NOTICE and reserved font
+names when adding or modifying resources. These software resources are separate
+from an unrestricted CC0 media catalogue; do not relabel third-party fonts/icons.</p>
+<p>Git stores text scripts, locks, provenance and licence records. Downloaded binary
+assets stay outside Git. When updating resources, pin a new upstream revision,
+verify its bytes and licences, then assign a new set ID. Keep previously published
+sets while native readers or versioned web URLs still need them. An interrupted
+installer may leave an inactive staging directory; remove it manually only after
+confirming the installer is no longer running. Atomic visibility is guaranteed;
+power-loss durability of the final directory/link renames is not claimed.</p>
+<p>See the <a href="https://specifications.freedesktop.org/basedir/latest/">XDG specification</a>,
+<a href="https://github.com/rsms/inter">Inter</a>,
+<a href="https://github.com/JetBrains/JetBrainsMono">JetBrains Mono</a>,
+<a href="https://github.com/google/material-design-icons">Material Symbols</a> and
+<a href="https://github.com/googlefonts/noto-emoji/tree/v2.051">Noto Emoji</a>.</p></div></div>
     </div>
 
 </main>

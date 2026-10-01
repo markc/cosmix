@@ -102,7 +102,14 @@ impl Fonts {
                             .into_iter()
                             .filter_map(|face| Face::at_index(face.data, face.index))
                             .collect(),
-                        emoji: optional(EMOJI_PATHS),
+                        emoji: match super::primary_font::installed_role("emoji") {
+                            Ok(Some(face)) => Face::at_index(face.data, face.index),
+                            Ok(None) => optional(EMOJI_PATHS),
+                            Err(error) => {
+                                eprintln!("terminal static emoji: {error}");
+                                None
+                            }
+                        },
                         symbols: optional(&[
                             "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
                             "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
@@ -699,6 +706,18 @@ fn tofu(width: u32, height: u32) -> ClusterImage {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires a bootstrapped static asset set"]
+    fn installed_emoji_precedes_legacy_system_emoji() {
+        let primary = super::super::primary_font::discover(None).unwrap();
+        let installed = super::super::primary_font::installed_role("emoji")
+            .unwrap()
+            .expect("installed emoji");
+        let fonts = super::Fonts::discover(primary.data, primary.index).unwrap();
+        let selected = fonts.fallbacks().emoji.as_ref().expect("selected emoji");
+        assert_eq!(selected.data.as_ref(), installed.data.as_ref());
+        assert_eq!(selected.index, installed.index);
+    }
     use super::*;
     use crate::raster::{PixelFormat, paint_cluster};
 

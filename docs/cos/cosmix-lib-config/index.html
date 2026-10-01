@@ -485,7 +485,7 @@ for the node schema, discovery order, listener rules, and ACME policy.</p>
 <tr><td><code>client_helpers</code></td><td>Resolves the local broker URL and opens named, provenance-bearing, or anonymous Bus client connections.</td></tr>
 <tr><td><code>mix_data</code></td><td>Parses strict-data Mix text or files into an untyped <code>Value</code> tree.</td></tr>
 <tr><td><code>node</code></td><td>Defines <code>node.conf.mix</code> types, loaders, derived addresses, and webd listener synthesis.</td></tr>
-<tr><td><code>paths</code></td><td>Resolves source, configuration, data, binary, runtime, log, and temporary directories.</td></tr>
+<tr><td><code>paths</code></td><td>Resolves source, configuration, data, binary, shared-resource, runtime, log, and temporary directories.</td></tr>
 <tr><td><code>store</code></td><td>Loads, saves, and materialises typed per-service <code>.conf.mix</code> files.</td></tr>
 </tbody></table>
 <p>The private <code>settings</code> module is re-exported at the crate root.</p>
@@ -545,12 +545,19 @@ set for the process. An environment override wins over user or system defaults.<
 <tr><td><code>Etc</code></td><td><code>COSMIX_ETC</code></td><td>XDG config directory under <code>cosmix</code></td><td><code>/etc/cosmix</code></td></tr>
 <tr><td><code>Var</code></td><td><code>COSMIX_VAR</code></td><td>XDG data directory under <code>cosmix</code></td><td><code>/var/lib/cosmix</code></td></tr>
 <tr><td><code>Bin</code></td><td><code>COSMIX_BIN</code></td><td><code>~/.local/bin</code></td><td><code>/usr/local/bin</code></td></tr>
+<tr><td><code>Share</code></td><td><code>COSMIX_SHARE</code></td><td><code>/opt/cosmix/share</code></td><td><code>/opt/cosmix/share</code></td></tr>
 <tr><td><code>Run</code></td><td><code>COSMIX_RUN</code></td><td>XDG runtime directory under <code>cosmix</code></td><td><code>/run/cosmix</code></td></tr>
 <tr><td><code>Log</code></td><td><code>COSMIX_LOG</code></td><td><code>COSMIX_VAR/log</code></td><td><code>/var/log/cosmix</code></td></tr>
 <tr><td><code>Tmp</code></td><td><code>COSMIX_TMP</code></td><td><code>/tmp/cosmix</code></td><td><code>/tmp/cosmix</code></td></tr>
 </tbody></table>
 <p><code>current_uid()</code> is the crate's infallible wrapper around POSIX <code>getuid(2)</code>.
 Path selection uses it to distinguish user and root execution.</p>
+<p><code>Share</code> is the deliberate exception to checkout-root and user/root selection:
+installed resources have one shared directory for desktop clients and daemons,
+even when only a desktop process inherits <code>COSMIX</code> pointing at a source checkout.
+An absolute <code>COSMIX_SHARE</code> overrides the default; empty and relative values are
+ignored. Static font/icon/emoji sets live beneath <code>Share/assets</code>; their XDG
+user/distribution precedence belongs to <a href="/cos/cosmix-lib-assets/">cosmix-lib-assets</a>.</p>
 <h2 id="node-and-acme-api">Node and ACME API</h2>
 <p><code>node::load_from</code> parses an explicit node file. <code>node::load_node_config</code>
 performs standard discovery and returns <code>None</code> when no file exists.
