@@ -6,6 +6,44 @@ use super::{KeyboardHandle, PointerHandle, Seat, Serial, WaylandState, WlSurface
 pub const HUMAN_SEAT_NAME: &str = "cosmix";
 pub const AGENT_SEAT_NAME: &str = "cosmix-agent";
 
+/// Mozilla's GTK legacy pointer lookup selects the last seat, while its own
+/// Wayland input code combines the first pointer with the last seat. Publishing
+/// only the human seat avoids that mismatch. Independent Bus agent input remains
+/// available to other clients; these clients use explicit `seat:"human"` input.
+pub(super) fn single_seat_executable(executable: &std::path::Path) -> bool {
+    let Some(name) = executable.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    // A running process can retain an executable replaced by a package update.
+    let name = name.strip_suffix(" (deleted)").unwrap_or(name);
+    matches!(name, "firefox" | "firefox-bin" | "firefox-esr" | "thunderbird" | "thunderbird-bin")
+}
+
+pub(super) fn peer_supports_agent_seat(
+    client: &smithay::reexports::wayland_server::Client,
+    display: &smithay::reexports::wayland_server::DisplayHandle,
+) -> bool {
+    let credentials = match client.get_credentials(display) {
+        Ok(credentials) => credentials,
+        Err(error) => {
+            tracing::debug!(%error, "seat compatibility unknown: peer credentials unavailable");
+            return true;
+        }
+    };
+    let executable = match std::fs::read_link(format!("/proc/{}/exe", credentials.pid)) {
+        Ok(executable) => executable,
+        Err(error) => {
+            tracing::debug!(pid = credentials.pid, %error, "seat compatibility unknown: executable unavailable");
+            return true;
+        }
+    };
+    let single_seat = single_seat_executable(&executable);
+    if single_seat {
+        tracing::info!(pid = credentials.pid, executable = ?executable.file_name(), "using human-seat compatibility for Mozilla client");
+    }
+    !single_seat
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SeatKind {
     Human,

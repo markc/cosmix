@@ -3202,15 +3202,18 @@ impl ProtocolServer {
             .add_keyboard(Default::default(), 500, 30)
             .map_err(|error| error.to_string())?;
         let pointer = seat.add_pointer();
-        // The human global is deliberately created first for legacy clients.
+        // Keep the human global first for clients choosing the default seat.
         let mut agent_seat = seat_state.new_wl_seat_with_filter(
             &display_handle,
             AGENT_SEAT_NAME,
-            |_client| {
+            |client| {
                 #[cfg(feature = "xwayland")]
-                { _client.get_data::<smithay::xwayland::XWaylandClientData>().is_none() }
-                #[cfg(not(feature = "xwayland"))]
-                { true }
+                if client.get_data::<smithay::xwayland::XWaylandClientData>().is_some() {
+                    return false;
+                }
+                client.get_data::<WaylandClientState>().is_none_or(|state| {
+                    state.agent_seat_compatible.load(Ordering::Acquire)
+                })
             },
         );
         let agent_keyboard = agent_seat
@@ -3568,13 +3571,19 @@ impl ProtocolServer {
             .insert_source(
                 listening_socket,
                 |client_stream, (), state: &mut WaylandState| {
-                    if let Err(error) = state.display_handle.insert_client(
-                        client_stream,
-                        Arc::new(WaylandClientState::new(
-                            state.client_disconnect_sender.clone(),
-                        )),
-                    ) {
-                        tracing::error!(%error, "failed to register Wayland client");
+                    let client_state = Arc::new(WaylandClientState::new(
+                        state.client_disconnect_sender.clone(),
+                    ));
+                    match state.display_handle.insert_client(client_stream, client_state.clone()) {
+                        Ok(client) => {
+                            // Resolve once, before registry requests can be dispatched.
+                            // This is toolkit compatibility, not an input authorisation gate.
+                            client_state.agent_seat_compatible.store(
+                                seat::peer_supports_agent_seat(&client, &state.display_handle),
+                                Ordering::Release,
+                            );
+                        }
+                        Err(error) => tracing::error!(%error, "failed to register Wayland client"),
                     }
                 },
             )
@@ -16635,6 +16644,8 @@ pub(crate) use seat::SeatKind;
 
 struct WaylandClientState {
     compositor_state: CompositorClientState,
+    // Fixed at connection admission; app IDs and titles cannot change seat visibility.
+    agent_seat_compatible: AtomicBool,
     surface_count: AtomicUsize,
     shm_bytes: AtomicUsize,
     retained_dmabufs: AtomicUsize,
@@ -16647,6 +16658,7 @@ impl WaylandClientState {
     fn new(disconnect_sender: channel::Sender<ClientId>) -> Self {
         Self {
             compositor_state: CompositorClientState::default(),
+            agent_seat_compatible: AtomicBool::new(true),
             surface_count: AtomicUsize::new(0),
             shm_bytes: AtomicUsize::new(0),
             retained_dmabufs: AtomicUsize::new(0),

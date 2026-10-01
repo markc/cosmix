@@ -971,6 +971,17 @@ delivery and probe changes ship together in 0.72.0. `cosmix-agent` has its own
 keyboard, XKB modifiers, pointer, focus and injected holds. Its global remains
 hidden from Xwayland. Every `comp.input.*` verb accepts `seat:"human"` or
 `seat:"agent"`; there are no caller authorisation gates on either choice.
+Since **0.72.3**, Firefox and Thunderbird also see only the human seat:
+Mozilla's GTK legacy pointer lookup and its own Wayland seat selection disagree
+when both seats are advertised. This avoids selecting the idle agent pointer
+for ordinary mouse interaction and drag requests. Compatibility is fixed per
+connection from the peer's executable basename (`firefox`, `firefox-bin`,
+`firefox-esr`, `thunderbird`, or `thunderbird-bin`), including executables retained
+after a package update. App IDs and window titles do not select this policy.
+Unknown or inaccessible executables retain both seats. These Mozilla clients
+remain available to Bus input with explicit `seat:"human"`; agent requests return
+`agent_seat_unbound` with the human-seat hint, rather than changing input seats
+silently. Reconnecting the application is required after a compositor update.
 Clipboard and primary selections now relay between the two seats with source
 provenance. Consecutive compatible agent motions coalesce, and agent delivery
 runs in bounded batches after ready human input. Full-click menu switching

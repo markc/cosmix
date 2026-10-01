@@ -2562,6 +2562,160 @@ fn xwayland_tagged_client_sees_only_human_seat() {
 }
 
 #[test]
+fn mozilla_single_seat_classification_uses_exact_executable_names() {
+    for name in ["firefox", "firefox-bin", "firefox-esr", "thunderbird", "thunderbird-bin"] {
+        for suffix in ["", " (deleted)"] {
+            let path = PathBuf::from(format!("/opt/browser/{name}{suffix}"));
+            assert!(seat::single_seat_executable(&path), "{path:?}");
+        }
+    }
+    for name in ["cosmix-term", "cosmix-comp", "not-firefox", "firefox-helper", "Firefox", ""] {
+        assert!(!seat::single_seat_executable(std::path::Path::new(name)), "{name}");
+    }
+}
+
+#[test]
+#[ignore = "subprocess fixture for mozilla_peer_credentials_filter_the_registry"]
+fn mozilla_peer_registry_probe() {
+    let path = env::var("COSMIX_TEST_MOZILLA_SOCKET").expect("parent supplies native Wayland socket");
+    let mut socket = UnixStream::connect(path).unwrap();
+    socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    send_display_request(&mut socket, 1, 2);
+    send_display_request(&mut socket, 0, 3);
+    let globals = registry_globals(&mut socket, 3);
+    assert_eq!(globals.all("wl_seat").len(), 1, "Mozilla sees only the human seat");
+    bind_global_for(&mut socket, 2, globals.all("wl_seat")[0].0, "wl_seat", 9, 4);
+    send_display_request(&mut socket, 0, 5);
+    let events = events_until_callback(&mut socket, 5);
+    assert!(events.iter().any(|(object, opcode, body)| {
+        *object == 4 && *opcode == 1 && wire_string(body, &mut 0) == HUMAN_SEAT_NAME
+    }));
+    assert_eq!(seat_capabilities(&events, 4), vec![SEAT_CAPS_WITHOUT_TOUCH]);
+    let guessed = env::var("COSMIX_TEST_AGENT_GLOBAL").unwrap().parse::<u32>().unwrap();
+    bind_global_for(&mut socket, 2, guessed, "wl_seat", 9, 6);
+    let (object, code, _) = read_protocol_error(&mut socket);
+    assert_eq!(object, 1);
+    assert_eq!(code, ::wayland_client::protocol::wl_display::Error::InvalidObject as u32);
+}
+
+#[test]
+fn mozilla_peer_credentials_filter_the_registry() {
+    use std::os::unix::net::UnixListener;
+    use std::process::{Child, Command, Stdio};
+
+    struct Fixture { child: Child, directory: PathBuf, socket_path: PathBuf }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = fs::remove_dir_all(&self.directory);
+            let _ = fs::remove_file(&self.socket_path);
+        }
+    }
+
+    let mut h = KeybindingHarness::new(false);
+    let executable = env::current_exe().unwrap();
+    let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    // Same filesystem as the test binary: a hard link avoids copying a large binary.
+    let directory = executable.parent().unwrap().join(format!("mozilla-peer-{}-{unique}", std::process::id()));
+    fs::create_dir(&directory).unwrap();
+    let child_executable = directory.join("thunderbird");
+    fs::hard_link(executable, &child_executable).unwrap();
+    // Keep the AF_UNIX address short even in a deeply nested source checkout.
+    let socket_path = env::temp_dir().join(format!("cm-moz-{}-{unique}.sock", std::process::id()));
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let child = Command::new(&child_executable)
+        .args(["--ignored", "--exact", "protocol::tests::mozilla_peer_registry_probe", "--nocapture"])
+        .env("COSMIX_TEST_MOZILLA_SOCKET", &socket_path)
+        .env("COSMIX_TEST_AGENT_GLOBAL", h.registry_globals.all("wl_seat")[1].0.to_string())
+        .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut fixture = Fixture { child, directory, socket_path };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "Mozilla fixture did not connect");
+                assert!(fixture.child.try_wait().unwrap().is_none(), "Mozilla fixture exited before connecting");
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => panic!("accept Mozilla fixture: {error}"),
+        }
+    };
+    let client_state = Arc::new(WaylandClientState::new(h.server.state.client_disconnect_sender.clone()));
+    let client = h.server.state.display_handle.insert_client(stream, client_state.clone()).unwrap();
+    let compatible = seat::peer_supports_agent_seat(&client, &h.server.state.display_handle);
+    assert!(!compatible, "real peer credentials identify the thunderbird executable");
+    client_state.agent_seat_compatible.store(compatible, Ordering::Release);
+    loop {
+        h.dispatch_client();
+        if let Some(status) = fixture.child.try_wait().unwrap() {
+            assert!(status.success(), "Mozilla registry probe failed: {status}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "Mozilla registry probe did not finish");
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(h.server.state.agent.seat.client_seats(&client).is_empty());
+}
+
+#[cfg(feature = "bus")]
+#[test]
+fn mozilla_single_seat_keeps_human_motion_buttons_and_drag_delivery() {
+    let mut h = KeybindingHarness::new(false);
+    let surface = h.subsurface();
+    let client = surface.client().unwrap();
+    // Use the same connection policy as the real executable fixture above.
+    client.get_data::<WaylandClientState>().unwrap().agent_seat_compatible.store(false, Ordering::Release);
+    let pointer = h.bind_pointer();
+    h.prime_pointer_focus();
+    route_pointer_to(&mut h, 200.0, 180.0);
+    let events = h.sync();
+    let motion = pointer_body(&events, pointer, 2);
+    assert_eq!((fixed(&motion, 1), fixed(&motion, 2)), (200.0, 180.0));
+    assert!(!pointer_bodies(&events, pointer, 5).is_empty(), "motion ends with a frame");
+    route_pointer_button(&mut h, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    let events = h.sync();
+    let press = pointer_body(&events, pointer, 3);
+    assert_eq!(word(&press, 3), 1);
+    let serial = word(&press, 0);
+    route_pointer_to(&mut h, 220.0, 190.0);
+    let events = h.sync();
+    assert_eq!(fixed(&pointer_body(&events, pointer, 2), 1), 220.0, "held motion reaches the client");
+
+    let &(name, version) = h.registry_globals.get("wl_data_device_manager").unwrap();
+    let manager = h.allocate_object_id();
+    bind_global(&mut h.client, name, "wl_data_device_manager", version.min(3), manager);
+    let device = h.allocate_object_id();
+    send_request(&mut h.client, manager, 1, &words(&[device, TEST_SEAT_ID]));
+    let _ = h.sync();
+    send_request(&mut h.client, device, 0, &words(&[0, TEST_TOPLEVEL_SURFACE_ID, 0, serial]));
+    let _ = h.sync();
+    assert!(h.server.state.human.pointer.is_grabbed());
+    assert!(h.server.state.human.pointer.current_focus().is_none(), "DnD takes over the pointer");
+    route_pointer_to(&mut h, 240.0, 210.0);
+    let events = h.sync();
+    assert!(events.iter().any(|(object, opcode, _)| *object == device && *opcode == 1), "drag enters the client");
+    route_pointer_to(&mut h, 250.0, 220.0);
+    let events = h.sync();
+    assert!(events.iter().any(|(object, opcode, body)| {
+        *object == device && *opcode == 3 && fixed(body, 1) == 250.0 && fixed(body, 2) == 220.0
+    }), "drag motion reaches the client");
+    route_pointer_button(&mut h, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    let _ = h.sync();
+    assert!(!h.server.state.human.pointer.is_grabbed(), "release ends the drag grab");
+
+    for keyboard in [false, true] {
+        let reply = h.server.state.validate_agent_surface(&surface, keyboard).unwrap_err().wire_json();
+        assert_eq!(reply["error_code"], "agent_seat_unbound");
+        assert_eq!(reply["hint"]["seat"], "human");
+    }
+    assert!(h.server.state.agent.pointer.current_focus().is_none());
+    assert!(h.server.state.agent.held.is_empty());
+}
+
+#[test]
 fn both_seats_idle_and_only_human_activity_resumes_them() {
     let mut h = KeybindingHarness::new(false);
     let (_, agent_seat, _) = named_seat_discovery_traffic(&mut h, AGENT_SEAT_NAME, false);
