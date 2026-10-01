@@ -442,6 +442,7 @@ impl Widget<Msg, iced::Theme, Renderer> for Layer<'_> {
 }
 
 fn draw_text(renderer: &mut Renderer, content: &str, position: Point, clip: Rectangle, look: Look) {
+    use iced::advanced::Renderer as _;
     renderer.with_layer(clip, |renderer| {
         renderer.fill_text(
             iced::advanced::text::Text {
