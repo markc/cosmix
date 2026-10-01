@@ -91,6 +91,7 @@ pub fn run(
         // theme.set is refused below.
         theme_scheme: String::new(),
         theme_mode: String::new(),
+        appearance: Default::default(),
         actions: verbs::action_table(&keymap),
     };
 

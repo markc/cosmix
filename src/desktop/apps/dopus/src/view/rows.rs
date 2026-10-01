@@ -23,7 +23,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use iced::advanced::image::{self as aimage, Renderer as _};
 use iced::advanced::text::{self as atext, Paragraph as _};
 use iced::advanced::widget::{Tree, tree};
 use iced::advanced::{Clipboard, Layout, Renderer as _, Shell, Widget, layout, mouse, renderer};
@@ -986,9 +985,8 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
                         } else {
                             icons::Icon::ChevronRight
                         };
-                        if let Some(handle) = self.icons.get(chevron, self.tint, icons::RASTER_PX) {
-                            renderer.draw_image(aimage::Image::new(handle), chevron_bounds, clip);
-                        }
+                        self.icons
+                            .draw(renderer, chevron, self.tint, chevron_bounds, clip);
                     }
                     let icon_bounds = Rectangle {
                         x: x + icon_px,
@@ -998,9 +996,8 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
                     };
                     let expanded = self.is_expanded(&row.entry.path);
                     let file_icon = icons::file_icon(&row.entry.path, row.entry.is_dir, expanded);
-                    if let Some(handle) = self.icons.get(file_icon, self.tint, icons::RASTER_PX) {
-                        renderer.draw_image(aimage::Image::new(handle), icon_bounds, clip);
-                    }
+                    self.icons
+                        .draw(renderer, file_icon, self.tint, icon_bounds, clip);
 
                     // Name; secondary columns right-aligned, in the mono role.
                     if let Some(cached) = st.cache.get(&row.entry.path) {

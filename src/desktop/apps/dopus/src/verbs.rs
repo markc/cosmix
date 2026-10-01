@@ -129,6 +129,17 @@ pub struct StateReply {
     pub panes: Vec<PaneState>,
     pub theme_scheme: String,
     pub theme_mode: String,
+    #[serde(default)]
+    pub appearance: AppearanceState,
+}
+
+/// Renderer choices observed by the live window; headless leaves these empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppearanceState {
+    pub icons: String,
+    pub asset_set: Option<String>,
+    pub font_ui: String,
+    pub font_mono: String,
 }
 
 // ── action / actions.list ───────────────────────────────────────────────────
@@ -277,6 +288,7 @@ pub struct ServerMeta {
     /// (and `dopus.state` reports them empty on purpose).
     pub theme_scheme: String,
     pub theme_mode: String,
+    pub appearance: AppearanceState,
     /// The `dopus.actions.list` table, built once at boot from the effective
     /// keymap (the caller owns the keymap; this layer stays stateless).
     pub actions: Vec<ActionRow>,
@@ -812,6 +824,7 @@ pub fn serve_command(
                 panes: vec![pane_state(core, PaneId::Left), pane_state(core, PaneId::Right)],
                 theme_scheme: meta.theme_scheme.clone(),
                 theme_mode: meta.theme_mode.clone(),
+                appearance: meta.appearance.clone(),
             };
             vec![Served::reply_json(command.id, &state)]
         }

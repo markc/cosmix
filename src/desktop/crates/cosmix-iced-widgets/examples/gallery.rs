@@ -22,6 +22,7 @@ const TRACK_COLOURS: [iced::Color; 4] = [
 
 fn main() -> iced::Result {
     iced::application(Gallery::new, Gallery::update, Gallery::view)
+        .default_font(cosmix_iced_widgets::fonts::default_ui_font())
         .title("Cosmix widget gallery")
         .theme(Theme::Dark)
         .run()

@@ -1,5 +1,7 @@
 //! Installed font registration and named Material glyphs for iced consumers.
 //! Registration uses iced's shared font system before theme family selection.
+//! Generic sans, serif and mono families use the installed roles. Authored named
+//! families remain selectable through the existing theme resolver.
 //! Material variable axes beyond weight remain renderer dependent.
 
 use cosmix_assets::AssetSet;
@@ -86,6 +88,18 @@ pub fn register_installed() -> Result<Option<&'static AssetSet>, &'static str> {
                     ));
                 }
             }
+            // Generic widget fonts share the same defaults as explicit roles.
+            // These mappings do not rewrite an authored Family::Name choice.
+            let db = system.raw().db_mut();
+            if let Some(family) = set.family("sans") {
+                db.set_sans_serif_family(family);
+            }
+            if let Some(family) = set.family("serif") {
+                db.set_serif_family(family);
+            }
+            if let Some(family) = set.family("mono") {
+                db.set_monospace_family(family);
+            }
         }
         Ok(set)
     }) {
@@ -96,6 +110,18 @@ pub fn register_installed() -> Result<Option<&'static AssetSet>, &'static str> {
             Err(error.as_str())
         }
     }
+}
+
+/// Shared UI default for an iced application's `.default_font(...)`.
+/// Registration is once per process and does not contact the network.
+pub fn default_ui_font() -> Font {
+    font_for("sans-serif", &[], 400, false, true)
+}
+
+/// Shared mono default for code, technical fields and other mono widgets.
+/// Explicit authored families should continue to use `font_for`.
+pub fn default_mono_font() -> Font {
+    font_for("monospace", &[], 400, true, true)
 }
 
 /// Resolve an authored family chain. An untouched embedded role can prefer
@@ -209,7 +235,7 @@ mod tests {
         // A preloaded conflicting family points at different valid font bytes.
         // Only fontdb's in-memory family metadata is changed, never a font file.
         let mut source = Database::new();
-        source.load_font_data(mono_bytes);
+        source.load_font_data(mono_bytes.clone());
         let mut conflict = source.faces().next().unwrap().clone();
         conflict.families = vec![(
             expected.family("sans").unwrap().to_owned(),
@@ -237,6 +263,24 @@ mod tests {
                 db.with_face_data(id, |bytes, _| bytes.to_vec()).unwrap(),
                 sans_bytes
             );
+            for (family, role) in [
+                (Family::SansSerif, "sans"),
+                (Family::Serif, "serif"),
+                (Family::Monospace, "mono"),
+            ] {
+                assert_eq!(db.family_name(&family), set.family(role).unwrap());
+                let id = db
+                    .query(&Query {
+                        families: &[family],
+                        ..Default::default()
+                    })
+                    .unwrap();
+                assert_eq!(
+                    db.with_face_data(id, |bytes, _| bytes.to_vec()).unwrap(),
+                    std::fs::read(set.font_path(role).unwrap()).unwrap(),
+                    "generic {role} must select the installed bytes"
+                );
+            }
         }
         let sans = font_for("Missing family", &[], 400, false, true);
         let mono = font_for("Missing family", &[], 400, true, true);
@@ -247,6 +291,13 @@ mod tests {
         assert_eq!(
             mono.family,
             font::Family::Name(intern(set.family("mono").unwrap()))
+        );
+        assert_eq!(default_ui_font(), sans);
+        assert_eq!(default_mono_font(), mono);
+        let authored = font_for(set.family("serif").unwrap(), &[], 400, false, false);
+        assert_eq!(
+            authored.family,
+            font::Family::Name(intern(set.family("serif").unwrap()))
         );
         let (glyph, font) = material_icon("delete").unwrap().unwrap();
         // Match the pinned Material Symbols catalogue, not legacy Material Icons.

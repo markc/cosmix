@@ -265,8 +265,7 @@ pub fn button_look(
     }
 }
 
-/// A cached icon handle as an iced image widget, at the header's 16 px; a
-/// blank 16 px filler while the rasterisation is still in flight.
+/// A shared Material glyph or cached Lucide fallback at the header's icon size.
 pub fn image_widget(
     look: Look,
     icons: &Icons,

@@ -1,4 +1,4 @@
--- version: 0.1.1
+-- version: 0.1.2
 -- Build-worker gates for static assets. Invoke at an exact pushed commit.
 -- mix src/tools/static-assets-gate.mix --core
 -- mix src/tools/static-assets-gate.mix --desktop --real-assets
@@ -37,6 +37,7 @@ if $mode == "core" then
   gate([$src .. "/target/release/mix", "--version", "--json"], $src)
 else
   gate(["cargo", "test", "--locked", "-p", "cosmix-bevy-assets", "-p", "cosmix-iced-widgets", "-p", "cosmix-term-core", "-p", "cosmix-ced", "-p", "cosmix-dopus"], $desktop)
+  gate(["cargo", "check", "--locked", "-p", "cosmix-iced-widgets", "--example", "gallery", "--features", "gallery-tiny-skia"], $desktop)
   gate(["cargo", "test", "--locked", "-p", "ctk", "--lib", "--features", "bus,theme", "theme::"], $desktop)
   $control = passed(run_argv(["cargo", "test", "--locked", "-p", "ctk", "--lib", "--features", "bus,theme", "app_control::"], {cwd: $desktop, timeout: 1800, max_output: 6000000}))
   if not re_match($control, "test result: ok[.] [1-9][0-9]* passed") then
@@ -56,6 +57,7 @@ if $g.opts["real-assets"] then
     ["cosmix-iced-widgets", "installed_roles_and_material_glyph_resolve"],
     ["cosmix-ced", "authored_builtin_family_remains_authoritative"],
     ["cosmix-dopus", "authored_builtin_family_remains_authoritative"],
+    ["cosmix-dopus", "installed_material_catalogue_draws_tinted_glyphs_at_output_scales"],
     ["cosmix-term-core", "installed_mono_is_primary_and_emoji_is_coverage"],
     ["cosmix-term-core", "installed_emoji_precedes_legacy_system_emoji"],
     ["ctk", "installed_roles_select_without_system_fonts_and_preserve_overrides"],

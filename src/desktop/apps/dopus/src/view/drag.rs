@@ -4,7 +4,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use cosmix_dopus_core::{DropAction, PaneId, sanitise_display_path};
-use iced::advanced::image::{self as aimage, Renderer as _};
 use iced::advanced::text::Renderer as _;
 use iced::advanced::widget::{Operation, Tree, tree};
 use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, mouse, overlay, renderer};
@@ -313,22 +312,18 @@ impl Widget<Msg, iced::Theme, Renderer> for Layer<'_> {
                     },
                     t.popover,
                 );
-                if let Some(handle) = self.icons.get(
+                self.icons.draw(
+                    renderer,
                     icons::file_icon(&active.source, active.is_dir, false),
                     self.tint,
-                    icons::RASTER_PX,
-                ) {
-                    renderer.draw_image(
-                        aimage::Image::new(handle),
-                        Rectangle {
-                            x: bounds.x + pad,
-                            y: bounds.center_y() - icon / 2.0,
-                            width: icon,
-                            height: icon,
-                        },
-                        *viewport,
-                    );
-                }
+                    Rectangle {
+                        x: bounds.x + pad,
+                        y: bounds.center_y() - icon / 2.0,
+                        width: icon,
+                        height: icon,
+                    },
+                    *viewport,
+                );
                 draw_text(
                     renderer,
                     &label,

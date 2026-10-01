@@ -3128,7 +3128,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-dopus"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3193,7 +3193,7 @@ version = "0.1.0"
 
 [[package]]
 name = "cosmix-iced-widgets"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "cosmix-design",
  "cosmix-lib-assets",

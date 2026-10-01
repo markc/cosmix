@@ -840,6 +840,12 @@ impl Dopus {
                 .map(|d| d.config_dir().join("config.conf.mix").display().to_string()),
             theme_scheme: self.theme.scheme.name().to_owned(),
             theme_mode: self.theme.mode.name().to_owned(),
+            appearance: crate::verbs::AppearanceState {
+                icons: self.icons.mode().to_owned(),
+                asset_set: self.icons.asset_set().map(str::to_owned),
+                font_ui: self.theme.ui.0.clone(),
+                font_mono: self.theme.mono.0.clone(),
+            },
             actions: self.action_table.clone(),
         }
     }

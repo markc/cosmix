@@ -123,9 +123,23 @@ fn place_look(
     }
 }
 
-/// A cached icon handle as an iced image widget, 16 px (the header's shape;
-/// `view::mod` shares this one — kept here so the sidebar is self-contained).
+/// A Material text glyph, or the cached Lucide fallback, at the same icon size.
 pub fn image_widget(look: Look, icons: &Icons, tint: &str, icon: Icon) -> Element<'static, Msg> {
+    if let Some((glyph, font)) = icons.glyph(icon) {
+        return iced::widget::text(glyph.to_string())
+            .font(font)
+            .size(look.chrome.icon)
+            .line_height(iced::advanced::text::LineHeight::Absolute(iced::Pixels(
+                look.chrome.icon,
+            )))
+            .shaping(iced::advanced::text::Shaping::Advanced)
+            .color(icons::tint_color(tint))
+            .align_x(iced::alignment::Horizontal::Center)
+            .align_y(iced::alignment::Vertical::Center)
+            .width(Length::Fixed(look.chrome.icon))
+            .height(Length::Fixed(look.chrome.icon))
+            .into();
+    }
     match icons.get(icon, tint, icons::RASTER_PX) {
         Some(handle) => image(handle)
             .width(Length::Fixed(look.chrome.icon))
