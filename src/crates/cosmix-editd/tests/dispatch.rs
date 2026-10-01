@@ -631,7 +631,26 @@ async fn watcher_reloads_clean_and_flags_deleted() {
     let h = start();
     let f = h.file("w.txt", "one\n");
     let b = h.open(&f).await;
+    // A same-length rewrite can keep (dev, ino, size, mtime_ns) equal on a
+    // coarse-mtime filesystem, and an equal stat is intentionally skipped by
+    // the recheck. Give the rewrite a distinct mtime so the reload's
+    // stat-change precondition holds; set_times raises the watcher's
+    // attribute event itself.
+    let meta = std::fs::metadata(&f).unwrap();
+    let pre = cosmix_editd::files::stat(&f).unwrap();
+    let mtime = meta.modified().unwrap() + Duration::from_secs(2);
     std::fs::write(&f, "two\n").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&f)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(mtime))
+        .unwrap();
+    assert_ne!(
+        cosmix_editd::files::stat(&f).unwrap(),
+        pre,
+        "the rewrite left the observed stat unchanged"
+    );
     h.event(|e| e["event"] == "edit" && e["kind"] == "reload" && e["buffer"] == b.as_str()).await;
     assert_eq!(h.text(&b).await, "two\n");
     let hist = h.ok("edit.history", json!({"buffer": b})).await;

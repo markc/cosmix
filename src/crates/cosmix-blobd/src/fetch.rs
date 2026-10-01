@@ -2551,11 +2551,22 @@ mod tests {
         fetcher.spawn_dispatcher().await;
 
         let peak = Arc::new(AtomicU64::new(0));
+        let (sampled_tx, sampled_rx) = tokio::sync::oneshot::channel();
         let sampler = {
             let (fetcher, peak) = (fetcher.clone(), Arc::clone(&peak));
             tokio::spawn(async move {
+                let mut sampled_tx = Some(sampled_tx);
                 loop {
-                    peak.fetch_max(fetcher.gauges().in_flight, Ordering::SeqCst);
+                    let gauges = fetcher.gauges();
+                    peak.fetch_max(gauges.in_flight, Ordering::SeqCst);
+                    if gauges.in_flight == 1 && gauges.queued == 1
+                        && let Some(sampled_tx) = sampled_tx.take()
+                    {
+                        // The admitted slot held behind `release_rx`: tell the
+                        // main task the sampler has seen it, so the release
+                        // below cannot finish both downloads first.
+                        let _ = sampled_tx.send(());
+                    }
                     tokio::time::sleep(Duration::from_millis(1)).await;
                 }
             })
@@ -2592,6 +2603,14 @@ mod tests {
         );
         let gauges = fetcher.gauges();
         assert_eq!((gauges.in_flight, gauges.queued), (1, 1));
+
+        // The held phase lasts only until the release below: prove the
+        // sampler observed it first, or a fast release lets both downloads
+        // finish before the sampler's first sample and peak reads 0.
+        tokio::time::timeout(Duration::from_secs(10), sampled_rx)
+            .await
+            .expect("the sampler never observed the admitted held slot")
+            .expect("the sampler died before observing the held slot");
 
         // Release the bytes with every publish parked: both downloads
         // must finish and park in complete(). The second can only run
