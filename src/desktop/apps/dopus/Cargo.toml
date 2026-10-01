@@ -57,6 +57,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [dev-dependencies]
 iced_runtime = "=0.14.0"
 tempfile = "3"
+# Match the native iced renderer in glyph raster checks; resvg retains its
+# independently pinned tiny-skia version for bundled SVG fallbacks.
+iced-tiny-skia-pixels = { package = "tiny-skia", version = "=0.11.4", default-features = false, features = ["std"] }
 
 [build-dependencies]
 cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }

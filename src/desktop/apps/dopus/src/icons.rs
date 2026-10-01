@@ -556,8 +556,8 @@ mod tests {
                     .map(|group| group.as_slice().len())
                     .sum();
                 assert_eq!(text_count, 1, "{icon:?}: native text, not image fallback");
-                let mut pixels = tiny_skia::Pixmap::new(side, side).unwrap();
-                let mut mask = tiny_skia::Mask::new(side, side).unwrap();
+                let mut pixels = iced_tiny_skia_pixels::Pixmap::new(side, side).unwrap();
+                let mut mask = iced_tiny_skia_pixels::Mask::new(side, side).unwrap();
                 renderer.draw(
                     &mut pixels.as_mut(),
                     &mut mask,
