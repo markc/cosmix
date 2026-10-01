@@ -77,11 +77,14 @@ updated; their use of `DcsAppShell` is not a template for new app furniture.
 
 Direct application dependencies remain in Studio, Tower, BusViewer, Mail,
 InteractGUI, Quoin, Media, Wallpaper and BG Showcase. Wallpaper and BG Showcase
-select CTK's Bus support without its default widget features. Quoin's rendered
-scene widgets also reach CTK through `cosmix-scene-bevy`.
+select CTK's Bus support without its default widget features in their direct
+dependency, but also inherit CTK chrome through `cosmix-shell-host`. Quoin's
+rendered scene widgets also reach CTK through `cosmix-scene-bevy`.
 
 The two direct library consumers are `cosmix-scene-bevy` and `cosmix-shell`;
-the latter only enables CTK with its optional `chrome-core` feature. The
-compositor inherits CTK when built with embedded Quoin. Term, Ced and DOpus
-use iced and do not depend on CTK. Retirement of FileMgr and BTerm does not
-remove the other applications' Bevy or CTK dependencies.
+the latter only enables CTK with its optional `chrome-core` feature.
+`cosmix-shell-host` is an indirect library consumer because it enables
+`cosmix-shell`'s chrome feature. The compositor inherits CTK when built with
+embedded Quoin. Term, Ced and DOpus use iced and do not depend on CTK.
+Retirement of FileMgr and BTerm does not remove the other applications'
+Bevy or CTK dependencies.
