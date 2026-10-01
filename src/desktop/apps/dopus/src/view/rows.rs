@@ -275,7 +275,8 @@ struct RowState {
     /// listing starts at the top.
     listing: Option<PathBuf>,
     /// Where a button went down, waiting for its release.
-    press: Option<(Point, usize)>,
+    press: Option<(Point, usize, PathBuf)>,
+    drag_epoch: u64,
     /// The last completed click: `(when, row)` — a second on the same row
     /// inside [`DOUBLE_CLICK`] is a double-click.
     last_click: Option<(Instant, usize)>,
@@ -292,6 +293,7 @@ impl RowState {
             last_selected: None,
             listing: None,
             press: None,
+            drag_epoch: 0,
             last_click: None,
             cache: HashMap::new(),
         }
@@ -493,6 +495,8 @@ impl<'a> FileList<'a> {
         st.listing = Some(self.root.to_path_buf());
         st.offset = 0.0;
         st.last_selected = None;
+        st.press = None;
+        st.last_click = None;
     }
 
     /// Follow the selection when it changes: keep the selected row visible.
@@ -656,8 +660,24 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
         st.clamp(self.rows.len(), clip.height);
         self.sync_cache(st, clip.height, bounds.width);
 
+        // Async listings and sorting can replace the pressed index before the
+        // drag threshold. Never transfer whichever entry happens to occupy it.
+        if st.press.as_ref().is_some_and(|(_, index, path)| {
+            self.rows
+                .get(*index)
+                .is_none_or(|row| row.entry.path != *path)
+        }) {
+            st.press = None;
+            st.last_click = None;
+        }
+
         {
             let mut drag = super::drag::lock(&self.drag);
+            if st.drag_epoch != drag.cancel_epoch {
+                st.press = None;
+                st.last_click = None;
+                st.drag_epoch = drag.cancel_epoch;
+            }
             if let Some(active) = drag.active.as_mut() {
                 st.press = None;
                 st.last_click = None;
@@ -702,11 +722,11 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
 
         match event {
             Event::Mouse(mouse::Event::CursorMoved { position }) => {
-                if let Some((pressed_at, index)) = st.press
+                if let Some((pressed_at, index, _)) = st.press.as_ref()
                     && ((position.x - pressed_at.x).powi(2) + (position.y - pressed_at.y).powi(2))
                         .sqrt()
                         > CLICK_SLOP
-                    && let Some(row) = self.rows.get(index)
+                    && let Some(row) = self.rows.get(*index)
                     && !self.busy
                 {
                     st.press = None;
@@ -744,11 +764,11 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
                 shell.publish(RowsMsg::Press);
                 let position = cursor.position().unwrap_or_default();
                 if let Some(index) = st.row_at(position.y - bounds.y, self.rows.len()) {
-                    st.press = Some((position, index));
+                    st.press = Some((position, index, self.rows[index].entry.path.clone()));
                 }
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
-                let Some((pressed_at, index)) = st.press.take() else {
+                let Some((pressed_at, index, _)) = st.press.take() else {
                     return;
                 };
                 if !cursor.is_over(clip) {
@@ -790,7 +810,8 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
                 }
                 shell.capture_event();
             }
-            Event::Window(iced::window::Event::Unfocused | iced::window::Event::Resized(_)) => {
+            Event::Window(iced::window::Event::Unfocused | iced::window::Event::Resized(_))
+            | Event::Mouse(mouse::Event::CursorLeft) => {
                 st.press = None;
                 st.last_click = None;
             }

@@ -1564,7 +1564,7 @@ fn surface_output<'a>(
     match &current.role {
         SurfaceRole::Layer(role) => role.output.output(),
         SurfaceRole::LockSurface(role) => Some(&role.output),
-        SurfaceRole::Toplevel(_) => default,
+        SurfaceRole::Toplevel(_) | SurfaceRole::DragIcon { .. } => default,
         #[cfg(feature = "xwayland")]
         SurfaceRole::X11(_) => default,
         SurfaceRole::Popup(_)

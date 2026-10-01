@@ -406,11 +406,29 @@ impl Dopus {
     }
 
     fn update(&mut self, msg: Msg) -> Task<Msg> {
+        let layout = self.drag_layout();
         let task = self.dispatch(msg);
+        // Bus actions can change pane geometry while the pointer is idle.
+        // Retire the captured target bounds before drawing the new layout.
+        if layout != self.drag_layout() {
+            view::drag::lock(&self.drag).cancel();
+        }
         // The view snapshot: refreshed on every message, so no core mutation
         // can be drawn stale.
         self.refresh_panes();
         task
+    }
+
+    fn drag_layout(&self) -> (Look, f32, [cosmix_dopus_core::config::SidebarConfig; 2]) {
+        use cosmix_dopus_core::config::Sidebar;
+        (
+            self.look(),
+            self.core.config_snapshot().split_ratio,
+            [
+                self.core.sidebar(Sidebar::Places),
+                self.core.sidebar(Sidebar::Properties),
+            ],
+        )
     }
 
     fn dispatch(&mut self, msg: Msg) -> Task<Msg> {
@@ -1296,6 +1314,107 @@ mod tests {
             drag: Default::default(),
         };
         (dir, app)
+    }
+
+    fn pin_pending_drop(app: &mut Dopus, source: PathBuf) {
+        let root = app.core.pane(PaneId::Left).path.clone();
+        app.core.on_event(CoreEvent::ListingArrived {
+            pane: PaneId::Left,
+            generation: app.core.pane(PaneId::Left).generation,
+            path: root.clone(),
+            root: true,
+            result: Ok(vec![cosmix_dopus_core::FileEntry {
+                name: "source".into(),
+                path: source.clone(),
+                is_dir: false,
+                size: Some(1),
+                child_count: None,
+                modified: None,
+            }]),
+        });
+        app.refresh_panes();
+        let bounds = iced::Rectangle {
+            x: 300.0,
+            y: 0.0,
+            width: 300.0,
+            height: 300.0,
+        };
+        let target = app.core.pane(PaneId::Right).path.clone();
+        view::drag::lock(&app.drag).pending = Some(view::drag::Gesture {
+            pane: PaneId::Left,
+            source_root: root,
+            source,
+            is_dir: false,
+            pointer: iced::Point::new(400.0, 80.0),
+            target: Some(view::drag::Target {
+                path: target.clone(),
+                root: target,
+                bounds,
+                highlight: bounds,
+            }),
+        });
+    }
+
+    #[test]
+    fn pending_drop_cancels_when_actions_change_the_pane_layout() {
+        use cosmix_dopus_core::config::Sidebar;
+        let command = |action: ActionId| {
+            Msg::Bus(Delivery::Command(bus::Command {
+                id: 7,
+                verb: "dopus.action".into(),
+                body: serde_json::json!({"id": action.as_str()}).to_string(),
+                caller_key: "mesh:caller@example".into(),
+            }))
+        };
+        let mutations = [
+            Msg::Split(0.7),
+            Msg::SidebarWidth(Sidebar::Places, 0.24),
+            Msg::SidebarWidth(Sidebar::Properties, 0.22),
+            Msg::Actions(vec![cosmix_actions::view::TOGGLE_PLACES]),
+            command(cosmix_actions::view::TOGGLE_PLACES),
+            command(cosmix_actions::view::TOGGLE_PROPERTIES),
+            command(cosmix_actions::theme::MODE_TOGGLE),
+        ];
+        for mutation in mutations {
+            let (dir, mut app) = fixture();
+            let source = dir.path().join("source");
+            std::fs::write(&source, b"source").unwrap();
+            pin_pending_drop(&mut app, source.clone());
+            let _ = app.update(Msg::Noop);
+            assert!(
+                view::drag::lock(&app.drag).pending.is_some(),
+                "unchanged layout preserves choice"
+            );
+            let before = app.drag_layout();
+            let _ = app.update(mutation);
+            assert_ne!(
+                app.drag_layout(),
+                before,
+                "action must actually change layout/theme"
+            );
+            assert!(
+                view::drag::lock(&app.drag).pending.is_none(),
+                "stale target geometry must retire"
+            );
+            assert!(source.exists());
+            assert!(!app.core.availability().operation_running);
+        }
+    }
+
+    #[test]
+    fn theme_reload_cancels_a_pending_drop_when_typography_changes() {
+        let (dir, mut app) = fixture();
+        let source = dir.path().join("source");
+        std::fs::write(&source, b"source").unwrap();
+        // Simulate the previous typography before a Bus theme-change notice.
+        app.theme.ui.1 += 3.0;
+        pin_pending_drop(&mut app, source);
+        let _ = app.update(Msg::Noop);
+        assert!(view::drag::lock(&app.drag).pending.is_some());
+        let before = app.drag_layout();
+        let _ = app.update(Msg::Bus(Delivery::ThemeChanged));
+        assert_ne!(app.drag_layout(), before);
+        assert!(view::drag::lock(&app.drag).pending.is_none());
     }
 
     #[test]

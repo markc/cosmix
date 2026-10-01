@@ -40,6 +40,8 @@ pub struct Gesture {
 pub struct State {
     pub active: Option<Gesture>,
     pub pending: Option<Gesture>,
+    /// Lists observe cancellation even when the root captures the event.
+    pub cancel_epoch: u64,
 }
 
 pub fn lock(shared: &Shared) -> MutexGuard<'_, State> {
@@ -52,9 +54,10 @@ impl State {
     pub fn cancel(&mut self) {
         self.active = None;
         self.pending = None;
+        self.cancel_epoch = self.cancel_epoch.wrapping_add(1);
     }
 
-    fn drop(&mut self) {
+    fn release(&mut self) {
         self.pending = self.active.take().filter(|drag| drag.target.is_some());
     }
 }
@@ -243,7 +246,7 @@ impl Widget<Msg, iced::Theme, Renderer> for Layer<'_> {
                 event,
                 Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
             ) {
-                state.drop();
+                state.release();
             }
             if matches!(event, Event::Mouse(_)) {
                 shell.capture_event();
@@ -498,6 +501,170 @@ mod tests {
         messages
     }
 
+    fn single_list<'a>(
+        rows: &'a [cosmix_dopus_core::VisibleRow],
+        root: &'a std::path::Path,
+        icons: &'a Icons,
+        expanded: &'a std::collections::HashSet<PathBuf>,
+        shared: Shared,
+        look: Look,
+    ) -> Layer<'a> {
+        let columns = crate::view::rows::Columns {
+            name_min: 50.0,
+            size: 30.0,
+            modified: 40.0,
+            gap: 4.0,
+            pad: 4.0,
+        };
+        let content = Element::new(crate::view::rows::FileList::new(
+            rows,
+            None,
+            root,
+            expanded,
+            icons,
+            "",
+            look,
+            &[],
+            columns,
+            PaneId::Left,
+            shared.clone(),
+            false,
+        ))
+        .map(|msg| Msg::PaneRows(PaneId::Left, msg));
+        Layer::new(content, shared, look, icons, "")
+    }
+
+    #[test]
+    fn armed_press_cancels_if_async_listing_replaces_the_row_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = |name: &str| cosmix_dopus_core::VisibleRow {
+            entry: cosmix_dopus_core::FileEntry {
+                path: dir.path().join(name),
+                name: name.into(),
+                is_dir: false,
+                size: Some(1),
+                modified: None,
+                child_count: None,
+            },
+            depth: 0,
+        };
+        let original = vec![entry("pressed"), entry("replacement")];
+        let reordered = vec![entry("replacement"), entry("pressed")];
+        let look = look();
+        let icons = Icons::new();
+        let expanded = Default::default();
+        let shared: Shared = Default::default();
+        let renderer = Renderer::new(look.ui_font, iced::Pixels(look.px));
+        let mut layer = single_list(
+            &original,
+            dir.path(),
+            &icons,
+            &expanded,
+            shared.clone(),
+            look,
+        );
+        let mut tree = Tree::new(&layer as &dyn Widget<Msg, iced::Theme, Renderer>);
+        send(
+            &mut layer,
+            &mut tree,
+            &renderer,
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            Point::new(100.0, 10.0),
+        );
+        // The app rebuilt the widget after an async relist/sort, retaining its Tree.
+        let mut replacement = single_list(
+            &reordered,
+            dir.path(),
+            &icons,
+            &expanded,
+            shared.clone(),
+            look,
+        );
+        replacement.diff(&mut tree);
+        let moved = Point::new(120.0, 10.0);
+        assert!(
+            send(
+                &mut replacement,
+                &mut tree,
+                &renderer,
+                Event::Mouse(mouse::Event::CursorMoved { position: moved }),
+                moved
+            )
+            .is_empty()
+        );
+        assert!(
+            lock(&shared).active.is_none(),
+            "replacement row cannot become the drag source"
+        );
+        assert!(
+            send(
+                &mut replacement,
+                &mut tree,
+                &renderer,
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                moved
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn leaving_before_threshold_or_root_cancellation_cannot_start_a_phantom_drag() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = vec![cosmix_dopus_core::VisibleRow {
+            entry: cosmix_dopus_core::FileEntry {
+                path: dir.path().join("pressed"),
+                name: "pressed".into(),
+                is_dir: false,
+                size: Some(1),
+                modified: None,
+                child_count: None,
+            },
+            depth: 0,
+        }];
+        let look = look();
+        let icons = Icons::new();
+        let expanded = Default::default();
+        let shared: Shared = Default::default();
+        let renderer = Renderer::new(look.ui_font, iced::Pixels(look.px));
+        let mut layer = single_list(&rows, dir.path(), &icons, &expanded, shared.clone(), look);
+        let mut tree = Tree::new(&layer as &dyn Widget<Msg, iced::Theme, Renderer>);
+        for cancel_at_root in [false, true] {
+            send(
+                &mut layer,
+                &mut tree,
+                &renderer,
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Point::new(100.0, 10.0),
+            );
+            if cancel_at_root {
+                lock(&shared).cancel();
+            } else {
+                send(
+                    &mut layer,
+                    &mut tree,
+                    &renderer,
+                    Event::Mouse(mouse::Event::CursorLeft),
+                    Point::new(100.0, 10.0),
+                );
+            }
+            // Release happened outside the window and was never delivered. The
+            // pointer returns with no button held, beyond the old threshold.
+            let reenter = Point::new(140.0, 10.0);
+            assert!(
+                send(
+                    &mut layer,
+                    &mut tree,
+                    &renderer,
+                    Event::Mouse(mouse::Event::CursorMoved { position: reenter }),
+                    reenter
+                )
+                .is_empty()
+            );
+            assert!(lock(&shared).active.is_none());
+        }
+    }
+
     #[test]
     fn actual_list_events_preserve_clicks_and_drag_in_both_directions() {
         use crate::view::rows::{Columns, FileList, RowsMsg};
@@ -673,8 +840,9 @@ mod tests {
         let mut state = State {
             active: Some(gesture.clone()),
             pending: None,
+            ..Default::default()
         };
-        state.drop();
+        state.release();
         assert!(state.pending.is_none());
         let mut gesture = gesture;
         gesture.target = Some(Target {
@@ -684,7 +852,7 @@ mod tests {
             highlight: Rectangle::default(),
         });
         state.active = Some(gesture);
-        state.drop();
+        state.release();
         assert!(state.active.is_none());
         let pending = state.pending.as_ref().unwrap();
         assert_eq!(pending.source, PathBuf::from("/source/file"));

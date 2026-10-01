@@ -326,8 +326,12 @@ impl CompositorHandler for WaylandState {
         // cache until a role tells us how to consume them. Damage has no
         // roleless consumer and the first cursor import necessarily builds a
         // complete backing, so retaining it would only let repeated commits
-        // grow Smithay's merged damage vector without bound.
-        if compositor::get_role(surface).is_none() && !self.surfaces.contains_key(&surface.id()) {
+        // grow Smithay's merged damage vector without bound. A dormant drag
+        // icon can likewise be precommitted before its next start_drag: retain
+        // its applied content without remapping it until the new grab adopts it.
+        if (compositor::get_role(surface).is_none() && !self.surfaces.contains_key(&surface.id()))
+            || self.inactive_drag_icon_member(surface)
+        {
             compositor::with_states(surface, |states| {
                 states
                     .cached_state
@@ -525,13 +529,6 @@ impl CompositorHandler for WaylandState {
                 buffer_delta,
             },
         ) {
-            return;
-        }
-
-        if self.inactive_drag_icon_member(surface) {
-            if let Some(BufferAssignment::NewBuffer(buffer)) = buffer {
-                self.retire_buffer_immediately(buffer);
-            }
             return;
         }
 

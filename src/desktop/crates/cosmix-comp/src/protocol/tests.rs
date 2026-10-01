@@ -24226,7 +24226,8 @@ fn precommitted_drag_icon_adopts_scale_offset_and_follows_pointer_without_interc
             .mapped_surface_ids()
             .contains(&record.id)
     );
-    // A late icon repaint after the drop must not restore the artwork.
+    // A late icon repaint stays hidden, but remains available for a new drag
+    // reusing the same permanent wl_surface role.
     let late_buffer = harness.create_dmabuf_buffer();
     send_request(
         &mut harness.client,
@@ -24238,9 +24239,45 @@ fn precommitted_drag_icon_adopts_scale_offset_and_follows_pointer_without_interc
     let late = harness.sync();
     assert!(
         late.iter()
-            .any(|(id, opcode, _)| *id == late_buffer && *opcode == 0)
+            .all(|(id, opcode, _)| !(*id == late_buffer && *opcode == 0))
     );
     assert!(!harness.server.state.surfaces[&object].mapped);
+
+    let manager = harness.bind_test_global("wl_data_device_manager", 3);
+    let data_device = harness.allocate_object_id();
+    let source = harness.allocate_object_id();
+    send_request(&mut harness.client, manager, 1, &words(&[data_device, TEST_SEAT_ID]));
+    send_request(&mut harness.client, manager, 0, &words(&[source]));
+    send_request(&mut harness.client, source, 0, &wire_string_argument("text/plain"));
+    send_request(&mut harness.client, source, 2, &words(&[1]));
+    let pointer = harness.bind_pointer();
+    harness.prime_pointer_focus();
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    let pressed = harness.sync();
+    let serial = word(&pointer_body(&pressed, pointer, 3), 0);
+    send_request(&mut harness.client, data_device, 0,
+        &words(&[source, TEST_TOPLEVEL_SURFACE_ID, icon_surface, serial]));
+    let second_drag = harness.sync();
+    assert!(second_drag.iter().all(|(id, opcode, _)| !(*id == late_buffer && *opcode == 0)));
+    let record = &harness.server.state.surfaces[&object];
+    assert!(record.mapped && record.layout.visible);
+    assert_eq!(record.dmabuf_backing.as_ref().unwrap().buffer.id().protocol_id(), late_buffer);
+    assert_eq!((record.layout.width, record.layout.height), (32.0, 16.0));
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    let _ = harness.sync();
+    let record = &harness.server.state.surfaces[&object];
+    assert!(!record.mapped && !record.layout.visible);
+    assert!(record.dmabuf_backing.is_none());
+    // Simulate renderer retirement of both delivered frames. Protocol backing
+    // ownership has already gone at each drop; the final renderer owner releases
+    // the precommitted second buffer once, not before adoption or twice at drop.
+    for event in mem::take(&mut harness.server.state.events) {
+        if let Some(token) = protocol_event_dmabuf_token(&event) {
+            harness.server.state.release_buffer_token(token);
+        }
+    }
+    let retired = harness.sync();
+    assert_eq!(retired.iter().filter(|(id, opcode, _)| *id == late_buffer && *opcode == 0).count(), 1);
 }
 
 #[test]

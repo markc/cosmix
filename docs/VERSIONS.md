@@ -48,7 +48,7 @@ CoS — substrate libraries and daemon family
 
 | crate | version |
 |---|---|
-| `cosmix-actions` | 0.4.2 |
+| `cosmix-actions` | 0.4.3 |
 | `cosmix-app-identity` | 0.2.0 |
 | `cosmix-blobd` | 0.6.1 |
 | `cosmix-dbusd` | 0.3.1 |
@@ -108,11 +108,11 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 | `cosmix-busviewer` | 0.1.2 |
 | `cosmix-capture` | 0.2.4 |
 | `cosmix-ced` | 0.1.4 |
-| `cosmix-comp` | 0.72.1 |
+| `cosmix-comp` | 0.72.4 |
 | `cosmix-deco` | 0.4.1 |
 | `cosmix-design` | 0.17.1 |
-| `cosmix-dopus` | 0.3.1 |
-| `cosmix-dopus-core` | 0.3.1 |
+| `cosmix-dopus` | 0.3.3 |
+| `cosmix-dopus-core` | 0.3.2 |
 | `cosmix-filemgr` | 0.9.8 |
 | `cosmix-flock` | 0.1.0 |
 | `cosmix-iced-widgets` | 0.1.5 |
@@ -126,7 +126,7 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 | `cosmix-shell` | 0.19.0 |
 | `cosmix-shell-host` | 0.11.2 |
 | `cosmix-studio` | 0.4.8 |
-| `cosmix-term` | 0.3.2 |
+| `cosmix-term` | 0.3.3 |
 | `cosmix-term-core` | 0.8.3 |
 | `cosmix-tower` | 0.5.5 |
 | `cosmix-tray` | 0.3.2 |
