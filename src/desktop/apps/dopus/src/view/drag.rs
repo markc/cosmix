@@ -442,12 +442,20 @@ impl Widget<Msg, iced::Theme, Renderer> for Layer<'_> {
 }
 
 fn draw_text(renderer: &mut Renderer, content: &str, position: Point, clip: Rectangle, look: Look) {
-    use iced::advanced::Renderer as _;
+    use iced::advanced::{Renderer as _, text::Paragraph as _};
+    // Cached raw text drops its wrapping mode in tiny-skia. Measure and elide
+    // with the listing's single-line paragraphs before handing off owned text.
+    let width = (clip.x + clip.width - position.x - look.chrome.pad).max(0.0);
+    let label = super::elide::middle(content, width, |value| {
+        super::elide::shape(value, look.ui_font, look.px)
+            .min_bounds()
+            .width
+    });
     renderer.with_layer(clip, |renderer| {
         renderer.fill_text(
             iced::advanced::text::Text {
-                content: content.to_owned(),
-                bounds: clip.size(),
+                content: label,
+                bounds: Size::new(width, clip.height),
                 size: iced::Pixels(look.px),
                 line_height: iced::advanced::text::LineHeight::Absolute(iced::Pixels(
                     look.px * 1.4,
@@ -468,6 +476,40 @@ fn draw_text(renderer: &mut Renderer, content: &str, position: Point, clip: Rect
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn long_drag_labels_keep_owned_text_within_one_row() {
+        use iced::advanced::text::Paragraph as _;
+        let look = look();
+        let clip = Rectangle {
+            x: 20.0,
+            y: 30.0,
+            width: 180.0,
+            height: 40.0,
+        };
+        let label = "target-long-name-".repeat(20);
+        let mut renderer = Renderer::new(look.ui_font, iced::Pixels(look.px));
+        draw_text(&mut renderer, &label, Point::new(32.0, 36.0), clip, look);
+        let text: Vec<_> = renderer
+            .layers()
+            .iter()
+            .flat_map(|layer| layer.text.iter())
+            .flat_map(|group| group.as_slice())
+            .collect();
+        assert_eq!(text.len(), 1);
+        let iced_tiny_skia::graphics::text::Text::Cached {
+            content, bounds, ..
+        } = text[0]
+        else {
+            panic!("labels must retain owned text until rasterisation");
+        };
+        assert!(content.contains('…'), "long label must elide");
+        let shaped = super::super::elide::shape(content, look.ui_font, look.px).min_bounds();
+        let single_line = super::super::elide::shape("Ag", look.ui_font, look.px).min_bounds();
+        assert!(shaped.width <= bounds.width + 0.01);
+        assert!(shaped.height <= single_line.height + 0.01);
+        assert!(bounds.width < clip.width, "retain label padding");
+    }
+
     fn look() -> Look {
         let theme = crate::theme::resolve_selection(
             &crate::theme::Selection {
