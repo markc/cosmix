@@ -12,6 +12,7 @@ pub use alignment::FirstRow;
 pub use measurements::Measurements;
 pub mod columns;
 pub mod dialogs;
+pub mod drag;
 pub mod elide;
 pub mod location;
 pub mod panes;
@@ -96,6 +97,8 @@ pub fn root<'a>(
     properties_config: cosmix_dopus_core::config::SidebarConfig,
     actions: &'a [crate::verbs::ActionRow],
     columns: [rows::Columns; 2],
+    drag: drag::Shared,
+    busy: bool,
 ) -> Element<'a, Msg> {
     let (first_row, [left_footer, right_footer]) = {
         let mut measurements = measurements.borrow_mut();
@@ -166,7 +169,9 @@ pub fn root<'a>(
                 active == PaneId::Left,
                 left_edit,
                 actions,
-                columns[0]
+                columns[0],
+                drag.clone(),
+                busy
             ),
             panes::Divider::new(&look, None, sides),
             panes::pane_column(
@@ -182,7 +187,9 @@ pub fn root<'a>(
                 active == PaneId::Right,
                 right_edit,
                 actions,
-                columns[1]
+                columns[1],
+                drag,
+                busy
             ),
         ]
         .width(Length::FillPortion(1000 - sides[0] - sides[1]))

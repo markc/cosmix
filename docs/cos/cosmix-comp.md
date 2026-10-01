@@ -971,6 +971,15 @@ delivery and probe changes ship together in 0.72.0. `cosmix-agent` has its own
 keyboard, XKB modifiers, pointer, focus and injected holds. Its global remains
 hidden from Xwayland. Every `comp.input.*` verb accepts `seat:"human"` or
 `seat:"agent"`; there are no caller authorisation gates on either choice.
+Since **0.72.4**, native Wayland drag icons are composited above windows and
+desktop layers, below the pointer. The source application supplies the artwork
+(for example, Thunderbird's floating message icon and label); comp moves its
+surface tree with the human pointer, honours logical surface offsets and buffer
+scale/viewport sizing, and passes input through to the drop target. Drop or
+cancellation removes the artwork immediately, including source/icon destruction
+and seat teardown. Session locking hides ordinary drag artwork with the rest of
+the desktop scene.
+
 Since **0.72.3**, Firefox and Thunderbird also see only the human seat:
 Mozilla's GTK legacy pointer lookup and its own Wayland seat selection disagree
 when both seats are advertised. This avoids selecting the idle agent pointer

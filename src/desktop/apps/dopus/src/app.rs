@@ -104,6 +104,8 @@ pub enum Msg {
     /// Enter/Escape while a dialog is up, from the key router's modal
     /// capture.
     DialogKey(ModalKey),
+    /// An explicit decision on pinned drag/drop paths.
+    DropTransfer(PaneId, PathBuf, PathBuf, cosmix_dopus_core::DropAction),
     Noop,
 }
 
@@ -161,6 +163,7 @@ pub struct Dopus {
     service: String,
     tint: String,
     quitting: bool,
+    drag: view::drag::Shared,
 }
 
 /// Run the windowed app registered on the Bus as `service`. `paths` are the
@@ -245,6 +248,7 @@ pub fn run(
         service: service.to_owned(),
         tint: tint.clone(),
         quitting: false,
+        drag: Default::default(),
     };
     app.refresh_panes();
     if let Some(note) = app.theme.notes.clone() {
@@ -492,6 +496,15 @@ impl Dopus {
             }
             Msg::Dialog(msg) => self.on_dialog(msg),
             Msg::DialogKey(key) => self.on_dialog_key(key),
+            Msg::DropTransfer(pane, source, destination, action) => {
+                if let Err(error) =
+                    self.core
+                        .transfer_paths(pane, vec![source], destination, action)
+                {
+                    self.status = Some(error);
+                }
+                Task::none()
+            }
             Msg::Noop => Task::none(),
         }
     }
@@ -507,6 +520,25 @@ impl Dopus {
             self.column_cache[index].refresh(look, self.core.pane(pane), &self.rows[index]);
         }
         self.split_ratio = self.core.config_snapshot().split_ratio;
+        let mut drag = view::drag::lock(&self.drag);
+        if let Some(gesture) = drag.active.as_ref().or(drag.pending.as_ref())
+            && (self.dialog.is_some()
+                || self.core.availability().operation_running
+                || self.core.pane(gesture.pane).path != gesture.source_root
+                || gesture.target.as_ref().is_some_and(|target| {
+                    let pane = gesture.pane.other();
+                    self.core.pane(pane).path != target.root
+                        || (target.path != target.root
+                            && !self.rows[pane.index()]
+                                .iter()
+                                .any(|row| row.entry.is_dir && row.entry.path == target.path))
+                })
+                || !self.rows[gesture.pane.index()]
+                    .iter()
+                    .any(|row| row.entry.path == gesture.source))
+        {
+            drag.cancel();
+        }
     }
 
     fn on_rows(&mut self, pane: PaneId, msg: rows::RowsMsg) -> Task<Msg> {
@@ -1033,6 +1065,9 @@ impl Dopus {
                 }
             }
             iced::window::Event::CloseRequested => return self.quit(),
+            iced::window::Event::Unfocused | iced::window::Event::Resized(_) => {
+                view::drag::lock(&self.drag).cancel()
+            }
             _ => {}
         }
         Task::none()
@@ -1067,6 +1102,7 @@ impl Dopus {
                 iced::Event::Window(
                     e @ (iced::window::Event::Resized(_)
                     | iced::window::Event::Focused
+                    | iced::window::Event::Unfocused
                     | iced::window::Event::CloseRequested),
                 ) => Some(Msg::Window(e)),
                 _ => None,
@@ -1123,6 +1159,8 @@ impl Dopus {
                 self.column_cache[0].get(self.look()),
                 self.column_cache[1].get(self.look()),
             ],
+            self.drag.clone(),
+            self.core.availability().operation_running,
         );
         // The router wraps everything: it sees every key before its children
         // and publishes resolved actions (never `event::listen`, which drops
@@ -1136,7 +1174,13 @@ impl Dopus {
         } else if let Some((pane, _)) = self.editing.as_ref() {
             routed = routed.on_edit_cancel(view::location::location_id(*pane), Msg::LocationCancel);
         }
-        routed.into()
+        Element::new(view::drag::Layer::new(
+            routed.into(),
+            self.drag.clone(),
+            self.look(),
+            &self.icons,
+            &self.tint,
+        ))
     }
 }
 
@@ -1249,6 +1293,7 @@ mod tests {
             service: "dopus-test".into(),
             tint: String::new(),
             quitting: false,
+            drag: Default::default(),
         };
         (dir, app)
     }

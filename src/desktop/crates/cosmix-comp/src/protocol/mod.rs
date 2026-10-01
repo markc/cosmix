@@ -318,11 +318,13 @@ pub(crate) enum StackBand {
     Normal,
     Top,
     Overlay,
+    /// Pointer-following client artwork, above desktop layers, never an input target.
+    DragIcon,
     Lock,
 }
 
 impl StackBand {
-    const COUNT: usize = 6;
+    const COUNT: usize = 7;
 
     const fn index(self) -> usize {
         match self {
@@ -331,7 +333,8 @@ impl StackBand {
             Self::Normal => 2,
             Self::Top => 3,
             Self::Overlay => 4,
-            Self::Lock => 5,
+            Self::DragIcon => 5,
+            Self::Lock => 6,
         }
     }
 
@@ -352,6 +355,7 @@ impl StackBand {
             Self::Normal => "normal",
             Self::Top => "top",
             Self::Overlay => "overlay",
+            Self::DragIcon => "drag-icon",
             Self::Lock => "lock",
         }
     }
@@ -5407,6 +5411,10 @@ enum SurfaceRole {
     /// Boxed for the same reason the X11 role is — every `SurfaceRecord` would
     /// otherwise pay for the largest variant.
     ImePopup(Box<ImePopupSurface>),
+    DragIcon {
+        surface: WlSurface,
+        offset: (i32, i32),
+    },
     Subsurface {
         surface: WlSurface,
         parent: WlSurface,
@@ -5806,6 +5814,7 @@ impl SurfaceRole {
             // A candidate window IS a popup in every sense the scene cares
             // about: positioned, transient, above its parent, not a window.
             Self::ImePopup(_) => SceneSurfaceKind::Popup,
+            Self::DragIcon { .. } => SceneSurfaceKind::Subsurface,
             Self::Layer(_) => SceneSurfaceKind::Subsurface,
             Self::LockSurface(_) => SceneSurfaceKind::Subsurface,
             // Dormant records are excluded by `surface_is_presentable`, so
@@ -5819,6 +5828,7 @@ impl SurfaceRole {
             Self::Toplevel(surface) => surface.wl_surface(),
             Self::Popup(surface) => surface.wl_surface(),
             Self::ImePopup(popup) => popup.wl_surface(),
+            Self::DragIcon { surface, .. } => surface,
             Self::Layer(role) => role.surface.wl_surface(),
             Self::LockSurface(role) => role.surface.wl_surface(),
             Self::Subsurface { surface, .. } => surface,
@@ -5833,6 +5843,7 @@ impl SurfaceRole {
             Self::Toplevel(surface) => Some(surface),
             Self::Popup(_)
             | Self::ImePopup(_)
+            | Self::DragIcon { .. }
             | Self::Layer(_)
             | Self::LockSurface(_)
             | Self::Subsurface { .. }
@@ -5882,6 +5893,7 @@ impl SurfaceRole {
             // claiming one would make it inherit clipping and visibility from
             // a surface it is not actually a child of.
             | Self::ImePopup(_)
+            | Self::DragIcon { .. }
             | Self::Layer(_)
             | Self::LockSurface(_)
             | Self::Dormant(_) => None,
@@ -5901,6 +5913,7 @@ impl SurfaceRole {
             Self::Layer(_) => "layer",
             Self::LockSurface(_) => "lock",
             Self::Subsurface { .. } => "subsurface",
+            Self::DragIcon { .. } => "drag-icon",
             Self::Dormant(_) => "dormant",
             // Distinct role strings so the props surface can tell a menu
             // from an app window (X-2a legibility): both ride the same
@@ -10403,6 +10416,7 @@ impl WaylandState {
                 SurfaceRole::LockSurface(role) => Some(ConfigureTarget::Lock(role.surface.clone())),
                 SurfaceRole::Layer(_)
                 | SurfaceRole::ImePopup(_)
+                | SurfaceRole::DragIcon { .. }
                 | SurfaceRole::Subsurface { .. }
                 | SurfaceRole::Dormant(_) => None,
                 // X11 has no xdg configure/ack cycle; its geometry authority
@@ -10600,6 +10614,7 @@ impl WaylandState {
                 SurfaceRole::LockSurface(role) => Some(ConfigureTarget::Lock(role.surface.clone())),
                 SurfaceRole::Layer(_)
                 | SurfaceRole::ImePopup(_)
+                | SurfaceRole::DragIcon { .. }
                 | SurfaceRole::Subsurface { .. }
                 | SurfaceRole::Dormant(_) => None,
                 #[cfg(feature = "xwayland")]
@@ -10673,6 +10688,7 @@ impl WaylandState {
                 SurfaceRole::Layer(role) => Some(ConfigureTarget::Layer(role.surface.clone())),
                 SurfaceRole::LockSurface(role) => Some(ConfigureTarget::Lock(role.surface.clone())),
                 SurfaceRole::ImePopup(_)
+                | SurfaceRole::DragIcon { .. }
                 | SurfaceRole::Subsurface { .. }
                 | SurfaceRole::Dormant(_) => None,
                 #[cfg(feature = "xwayland")]
@@ -10838,6 +10854,7 @@ impl WaylandState {
                 SurfaceRole::Toplevel(_)
                 | SurfaceRole::Popup(_)
                 | SurfaceRole::ImePopup(_)
+                | SurfaceRole::DragIcon { .. }
                 | SurfaceRole::Layer(_)
                 | SurfaceRole::LockSurface(_) => true,
                 // The X11 association is established before the record exists
@@ -11912,6 +11929,7 @@ impl WaylandState {
             snapshot.revision = snapshot.revision.saturating_add(1);
         }
         self.cursor_position = (x, y);
+        self.reposition_drag_icon();
         let geometry_changed = self.update_interactive_pointer(x, y);
         if self.chrome_pointer_grab.is_some() {
             if let Some(grab) = self.chrome_pointer_grab.as_mut()
@@ -12869,6 +12887,9 @@ impl WaylandState {
     }
 
     fn surface_is_input_presentable(&self, record: &SurfaceRecord) -> bool {
+        if record.layout.z.band == StackBand::DragIcon {
+            return false;
+        }
         if matches!(self.lock_lifecycle, LockLifecycle::Unlocked)
             && self.kms_session_lock_gate.normal_scene_restricted()
         {
@@ -15372,6 +15393,7 @@ impl WaylandState {
                 SurfaceRole::X11(_) => return Some(current),
                 SurfaceRole::Popup(_)
                 | SurfaceRole::ImePopup(_)
+                | SurfaceRole::DragIcon { .. }
                 | SurfaceRole::Layer(_)
                 | SurfaceRole::LockSurface(_)
                 | SurfaceRole::Dormant(_) => {
@@ -15938,8 +15960,8 @@ impl WaylandState {
     /// child and our ordinary [`CompositorHandler::commit`] consumes that
     /// buffer. Its frame callbacks stay alongside it until the adopted child is
     /// presented. Cursor surfaces perform the same adoption explicitly in
-    /// `set_cursor_image`, while unsupported drag icons are retired here as
-    /// soon as their role is assigned.
+    /// `set_cursor_image`; drag icons adopt committed content into the ordinary
+    /// scene path in `start_drag_icon`.
     fn retire_unadopted_roleless_buffer(&mut self, surface: &WlSurface) {
         debug_assert_ne!(compositor::get_role(surface), Some(CURSOR_IMAGE_ROLE));
         let buffer = compositor::with_states(surface, |states| {
@@ -16619,6 +16641,7 @@ mod explicit_sync;
 mod focus;
 mod seat;
 mod handlers;
+mod drag_icon;
 mod input;
 #[cfg(feature = "bus")]
 mod input_injection;

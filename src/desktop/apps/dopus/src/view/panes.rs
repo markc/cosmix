@@ -53,6 +53,8 @@ pub fn pane_column<'a>(
     editing: Option<&'a str>,
     actions: &'a [crate::verbs::ActionRow],
     columns: rows::Columns,
+    drag: super::drag::Shared,
+    busy: bool,
 ) -> Element<'a, Msg> {
     container(
         column![
@@ -68,6 +70,9 @@ pub fn pane_column<'a>(
                 look,
                 actions,
                 columns,
+                pane_id,
+                drag,
+                busy,
             ))
             .map(move |m| Msg::PaneRows(pane_id, m)),
             summary_footer(look, footer),

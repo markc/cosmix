@@ -1596,6 +1596,7 @@ fn band_name(band: StackBand) -> &'static str {
         StackBand::Normal => "normal",
         StackBand::Top => "top",
         StackBand::Overlay => "overlay",
+        StackBand::DragIcon => "drag-icon",
         StackBand::Lock => "lock",
     }
 }

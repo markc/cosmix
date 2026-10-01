@@ -361,6 +361,7 @@ impl CompositorHandler for WaylandState {
                 )
             });
         let force_full_damage = damage.len() > MAX_DAMAGE_RECTS;
+        self.apply_drag_icon_offset(surface, buffer_delta);
         if force_full_damage {
             tracing::warn!(
                 surface = ?surface.id(),
@@ -411,6 +412,7 @@ impl CompositorHandler for WaylandState {
                             .then_some(popup.clone()),
                         SurfaceRole::Toplevel(_)
                         | SurfaceRole::ImePopup(_)
+                        | SurfaceRole::DragIcon { .. }
                         | SurfaceRole::Layer(_)
                         | SurfaceRole::LockSurface(_)
                         | SurfaceRole::Subsurface { .. }
@@ -475,6 +477,7 @@ impl CompositorHandler for WaylandState {
                         Some(ConfigureTarget::Lock(role.surface.clone()))
                     }
                     SurfaceRole::ImePopup(_)
+                    | SurfaceRole::DragIcon { .. }
                     | SurfaceRole::Subsurface { .. }
                     | SurfaceRole::Dormant(_) => None,
                     // X11 bypasses the xdg configure/ack gate entirely: its
@@ -525,11 +528,17 @@ impl CompositorHandler for WaylandState {
             return;
         }
 
+        if self.inactive_drag_icon_member(surface) {
+            if let Some(BufferAssignment::NewBuffer(buffer)) = buffer {
+                self.retire_buffer_immediately(buffer);
+            }
+            return;
+        }
+
         if !self.surfaces.contains_key(&surface.id()) {
             if let Some(BufferAssignment::NewBuffer(buffer)) = buffer {
-                // Drag-icon and otherwise unassigned surfaces do not
-                // participate in the window scene yet. Cursor surfaces have
-                // already taken their separate state path above.
+                // Otherwise unassigned surfaces have no scene consumer.
+                // Cursor surfaces took their separate state path above.
                 self.retire_untracked_surface_buffer(surface, buffer);
             }
             return;
@@ -759,6 +768,13 @@ impl CompositorHandler for WaylandState {
     }
 
     fn destroyed(&mut self, surface: &WlSurface) {
+        if self
+            .surfaces
+            .get(&surface.id())
+            .is_some_and(|record| matches!(record.role, SurfaceRole::DragIcon { .. }))
+        {
+            self.finish_drag_icon();
+        }
         let former_root = self.toplevel_root_for_surface(surface);
         self.buffer_history_surfaces.remove(&surface.id());
         self.buffer_bearing_surfaces.remove(&surface.id());
@@ -2686,7 +2702,13 @@ impl ClientDndGrabHandler for WaylandState {
             return;
         }
         if let Some(icon) = icon {
-            self.retire_unadopted_roleless_buffer(&icon);
+            self.start_drag_icon(icon);
+        }
+    }
+
+    fn dropped(&mut self, _target: Option<WlSurface>, _validated: bool, seat: Seat<Self>) {
+        if seat == self.human.seat {
+            self.finish_drag_icon();
         }
     }
 }

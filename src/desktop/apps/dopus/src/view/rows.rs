@@ -332,6 +332,9 @@ pub struct FileList<'a> {
     look: Look,
     tips: Vec<Element<'static, RowsMsg>>,
     open_label: String,
+    pane: cosmix_dopus_core::PaneId,
+    drag: super::drag::Shared,
+    busy: bool,
 }
 
 impl<'a> FileList<'a> {
@@ -346,6 +349,9 @@ impl<'a> FileList<'a> {
         look: Look,
         actions: &[crate::verbs::ActionRow],
         columns: Columns,
+        pane: cosmix_dopus_core::PaneId,
+        drag: super::drag::Shared,
+        busy: bool,
     ) -> Self {
         Self {
             columns,
@@ -357,6 +363,9 @@ impl<'a> FileList<'a> {
             tint,
             look,
             tips: Vec::new(),
+            pane,
+            drag,
+            busy,
             open_label: super::tips::action_label(
                 actions,
                 cosmix_actions::filemgr::FILE_OPEN,
@@ -647,7 +656,73 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
         st.clamp(self.rows.len(), clip.height);
         self.sync_cache(st, clip.height, bounds.width);
 
+        {
+            let mut drag = super::drag::lock(&self.drag);
+            if let Some(active) = drag.active.as_mut() {
+                st.press = None;
+                st.last_click = None;
+                if self.pane != active.pane && cursor.is_over(clip) {
+                    let position = cursor.position().unwrap_or(active.pointer);
+                    let index = st.row_at(position.y - bounds.y, self.rows.len());
+                    let directory = index
+                        .and_then(|index| self.rows.get(index))
+                        .filter(|row| row.entry.is_dir);
+                    let destination = directory
+                        .map(|row| row.entry.path.as_path())
+                        .unwrap_or(self.root);
+                    if cosmix_dopus_core::model::file_drop_actions(
+                        &active.source,
+                        destination,
+                        self.busy,
+                    )
+                    .contains(cosmix_dopus_core::DropAction::Ask)
+                    {
+                        let highlight = if directory.is_some() {
+                            Rectangle {
+                                y: bounds.y + index.unwrap() as f32 * st.row_h - st.offset,
+                                height: st.row_h,
+                                ..clip
+                            }
+                            .intersection(&clip)
+                            .unwrap_or(clip)
+                        } else {
+                            clip
+                        };
+                        active.target = Some(super::drag::Target {
+                            path: destination.to_path_buf(),
+                            root: self.root.to_path_buf(),
+                            bounds: clip,
+                            highlight,
+                        });
+                    }
+                }
+                return;
+            }
+        }
+
         match event {
+            Event::Mouse(mouse::Event::CursorMoved { position }) => {
+                if let Some((pressed_at, index)) = st.press
+                    && ((position.x - pressed_at.x).powi(2) + (position.y - pressed_at.y).powi(2))
+                        .sqrt()
+                        > CLICK_SLOP
+                    && let Some(row) = self.rows.get(index)
+                    && !self.busy
+                {
+                    st.press = None;
+                    st.last_click = None;
+                    super::drag::lock(&self.drag).active = Some(super::drag::Gesture {
+                        pane: self.pane,
+                        source_root: self.root.to_path_buf(),
+                        source: row.entry.path.clone(),
+                        is_dir: row.entry.is_dir,
+                        pointer: *position,
+                        target: None,
+                    });
+                    shell.request_redraw();
+                    shell.capture_event();
+                }
+            }
             Event::Mouse(mouse::Event::WheelScrolled { delta }) if cursor.is_over(clip) => {
                 let lines = match delta {
                     mouse::ScrollDelta::Lines { y, .. } => *y * WHEEL_ROWS,
@@ -672,12 +747,13 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
                     st.press = Some((position, index));
                 }
             }
-            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
-                if cursor.is_over(clip) =>
-            {
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
                 let Some((pressed_at, index)) = st.press.take() else {
                     return;
                 };
+                if !cursor.is_over(clip) {
+                    return;
+                }
                 let position = cursor.position().unwrap_or_default();
                 let moved = ((position.x - pressed_at.x).powi(2)
                     + (position.y - pressed_at.y).powi(2))
@@ -714,6 +790,10 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
                 }
                 shell.capture_event();
             }
+            Event::Window(iced::window::Event::Unfocused | iced::window::Event::Resized(_)) => {
+                st.press = None;
+                st.last_click = None;
+            }
             _ => {}
         }
     }
@@ -739,6 +819,27 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
         let icon_px = self.look.chrome.icon;
         let row_pad = self.look.chrome.small;
         renderer.with_layer(clip, |renderer| {
+            let drag = super::drag::lock(&self.drag);
+            if let Some(target) = drag
+                .active
+                .as_ref()
+                .or(drag.pending.as_ref())
+                .and_then(|drag| drag.target.as_ref())
+                && let Some(highlight) = target.highlight.intersection(&clip)
+            {
+                renderer.fill_quad(
+                    renderer::Quad {
+                        bounds: highlight,
+                        border: iced::Border {
+                            color: t.ring,
+                            width: self.look.chrome.edge * 2.0,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    t.muted_surface,
+                );
+            }
             // The selected row's full-width background, under everything.
             if let Some(selected) = self.selected
                 && let Some(index) = self

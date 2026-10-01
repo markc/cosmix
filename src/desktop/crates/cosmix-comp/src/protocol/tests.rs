@@ -24076,8 +24076,7 @@ fn real_client_commit_before_set_cursor_adopts_image_and_pulses_frame_callback()
     wait_for_callback(&mut a.socket, CURSOR_FRAME);
 }
 
-#[test]
-fn precommitted_drag_icon_buffer_is_released_when_the_role_is_assigned() {
+fn start_precommitted_drag_icon() -> (KeybindingHarness, u32, ObjectId, u32) {
     let mut harness = KeybindingHarness::new(false);
     let pointer = harness.bind_pointer();
     harness.prime_pointer_focus();
@@ -24095,12 +24094,21 @@ fn precommitted_drag_icon_buffer_is_released_when_the_role_is_assigned() {
         manager,
     );
     let data_device = harness.allocate_object_id();
+    let source = harness.allocate_object_id();
     send_request(
         &mut harness.client,
         manager,
         1,
         &words(&[data_device, TEST_SEAT_ID]),
     );
+    send_request(&mut harness.client, manager, 0, &words(&[source]));
+    send_request(
+        &mut harness.client,
+        source,
+        0,
+        &wire_string_argument("text/plain"),
+    );
+    send_request(&mut harness.client, source, 2, &words(&[1]));
     let _ = harness.sync();
 
     let icon_surface = harness.allocate_object_id();
@@ -24116,6 +24124,13 @@ fn precommitted_drag_icon_buffer_is_released_when_the_role_is_assigned() {
         icon_surface,
         1,
         &words(&[icon_buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, icon_surface, 8, &words(&[2]));
+    send_request(
+        &mut harness.client,
+        icon_surface,
+        10,
+        &words(&[(-7i32) as u32, 9]),
     );
     send_request(&mut harness.client, icon_surface, 6, &[]);
     let precommitted = harness.sync();
@@ -24139,7 +24154,7 @@ fn precommitted_drag_icon_buffer_is_released_when_the_role_is_assigned() {
         &mut harness.client,
         data_device,
         0,
-        &words(&[0, TEST_TOPLEVEL_SURFACE_ID, icon_surface, serial]),
+        &words(&[source, TEST_TOPLEVEL_SURFACE_ID, icon_surface, serial]),
     );
     let started = harness.sync();
     assert_eq!(
@@ -24147,9 +24162,164 @@ fn precommitted_drag_icon_buffer_is_released_when_the_role_is_assigned() {
             .iter()
             .filter(|(object, opcode, _)| *object == icon_buffer && *opcode == 0)
             .count(),
-        1,
-        "assigning the non-cursor DND icon role promptly releases the cached buffer"
+        0,
+        "the adopted icon buffer remains retained for renderer use"
     );
+    let object = harness
+        .server
+        .state
+        .surfaces
+        .keys()
+        .find(|object| object.protocol_id() == icon_surface)
+        .expect("drag icon tracked")
+        .clone();
+    (harness, icon_surface, object, source)
+}
+
+#[test]
+fn precommitted_drag_icon_adopts_scale_offset_and_follows_pointer_without_intercepting_input() {
+    let (mut harness, icon_surface, object, _) = start_precommitted_drag_icon();
+    let record = &harness.server.state.surfaces[&object];
+    assert!(record.mapped && record.layout.visible);
+    assert_eq!(record.layout.z.band, StackBand::DragIcon);
+    assert_eq!((record.layout.width, record.layout.height), (32.0, 16.0));
+    let pointer = harness.server.state.cursor_position;
+    assert_eq!(
+        (record.layout.x, record.layout.y),
+        (pointer.0 as f32 - 7.0, pointer.1 as f32 + 9.0)
+    );
+    assert!(!harness.server.state.surface_is_input_presentable(record));
+    assert!(!record.role.managed_toplevel());
+    assert!(record.role.toplevel().is_none());
+    route_pointer_to(&mut harness, 120.0, 140.0);
+    let _ = harness.sync();
+    let record = &harness.server.state.surfaces[&object];
+    assert_eq!((record.layout.x, record.layout.y), (113.0, 149.0));
+    assert!(
+        harness
+            .server
+            .state
+            .surface_at(114.0, 150.0)
+            .is_none_or(|target| target.id != record.id)
+    );
+    // Bufferless offsets move existing artwork and accumulate in logical units.
+    send_request(
+        &mut harness.client,
+        icon_surface,
+        10,
+        &words(&[3, (-4i32) as u32]),
+    );
+    send_request(&mut harness.client, icon_surface, 6, &[]);
+    let _ = harness.sync();
+    let record = &harness.server.state.surfaces[&object];
+    assert_eq!((record.layout.x, record.layout.y), (116.0, 145.0));
+    assert_eq!((record.layout.width, record.layout.height), (32.0, 16.0));
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    let _ = harness.sync();
+    let record = &harness.server.state.surfaces[&object];
+    assert!(!record.mapped && !record.layout.visible);
+    assert!(record.dmabuf_backing.is_none());
+    assert!(
+        !harness
+            .server
+            .state
+            .mapped_surface_ids()
+            .contains(&record.id)
+    );
+    // A late icon repaint after the drop must not restore the artwork.
+    let late_buffer = harness.create_dmabuf_buffer();
+    send_request(
+        &mut harness.client,
+        icon_surface,
+        1,
+        &words(&[late_buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, icon_surface, 6, &[]);
+    let late = harness.sync();
+    assert!(
+        late.iter()
+            .any(|(id, opcode, _)| *id == late_buffer && *opcode == 0)
+    );
+    assert!(!harness.server.state.surfaces[&object].mapped);
+}
+
+#[test]
+fn drag_icon_source_and_icon_destruction_retire_artwork() {
+    for destroy_icon in [false, true] {
+        let (mut harness, icon, object, source) = start_precommitted_drag_icon();
+        let id = harness.server.state.surfaces[&object].id;
+        if destroy_icon {
+            send_request(&mut harness.client, icon, 0, &[]);
+        } else {
+            send_request(&mut harness.client, source, 1, &[]);
+        }
+        let _ = harness.sync();
+        assert!(!harness.server.state.mapped_surface_ids().contains(&id));
+        assert!(
+            harness
+                .server
+                .state
+                .surfaces
+                .get(&object)
+                .is_none_or(|record| { !record.mapped && record.dmabuf_backing.is_none() })
+        );
+    }
+}
+
+#[test]
+fn drag_icon_subsurface_tree_moves_and_unmaps_with_root() {
+    let (mut harness, icon, root_object, _) = start_precommitted_drag_icon();
+    let subcompositor = harness.bind_test_global("wl_subcompositor", 1);
+    let child = harness.allocate_object_id();
+    let subsurface = harness.allocate_object_id();
+    let child_buffer = harness.create_dmabuf_buffer_sized(16, 8);
+    send_request(&mut harness.client, TEST_COMPOSITOR_ID, 0, &words(&[child]));
+    send_request(
+        &mut harness.client,
+        subcompositor,
+        1,
+        &words(&[subsurface, child, icon]),
+    );
+    send_request(&mut harness.client, subsurface, 1, &words(&[20, 5]));
+    send_request(&mut harness.client, child, 1, &words(&[child_buffer, 0, 0]));
+    send_request(&mut harness.client, child, 6, &[]);
+    send_request(&mut harness.client, icon, 6, &[]);
+    let _ = harness.sync();
+    let child_object = harness
+        .server
+        .state
+        .surfaces
+        .keys()
+        .find(|object| object.protocol_id() == child)
+        .unwrap()
+        .clone();
+    let root = &harness.server.state.surfaces[&root_object];
+    let child_record = &harness.server.state.surfaces[&child_object];
+    assert!(child_record.mapped && child_record.layout.visible);
+    assert_eq!(child_record.layout.parent, Some(root.id));
+    assert_eq!(child_record.layout.z.band, StackBand::DragIcon);
+    assert_eq!(
+        (child_record.layout.x, child_record.layout.y),
+        (root.layout.x + 20.0, root.layout.y + 5.0)
+    );
+    assert!(
+        !harness
+            .server
+            .state
+            .surface_is_input_presentable(child_record)
+    );
+    route_pointer_to(&mut harness, 120.0, 140.0);
+    let _ = harness.sync();
+    let child_record = &harness.server.state.surfaces[&child_object];
+    assert_eq!(
+        (child_record.layout.x, child_record.layout.y),
+        (133.0, 154.0)
+    );
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    let _ = harness.sync();
+    let child_record = &harness.server.state.surfaces[&child_object];
+    assert!(!child_record.mapped && !child_record.layout.visible);
+    assert!(child_record.dmabuf_backing.is_none());
 }
 
 #[test]

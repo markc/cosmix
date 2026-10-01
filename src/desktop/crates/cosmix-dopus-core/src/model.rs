@@ -807,6 +807,29 @@ impl DopusCore {
         self.start_operation(operation, pane_id);
     }
 
+    /// Transfer the gesture's pinned paths through the normal single-flight worker.
+    /// `Ask` is a pending UI decision and never a file operation.
+    pub fn transfer_paths(
+        &mut self,
+        source_pane: PaneId,
+        sources: Vec<PathBuf>,
+        destination: PathBuf,
+        action: DropAction,
+    ) -> Result<(), String> {
+        if action == DropAction::Ask {
+            return Err("Choose Move or Copy before transferring items".into());
+        }
+        if !file_drop_actions_batch(&sources, &destination, !self.is_idle()).contains(action) {
+            return Err("This destination cannot receive the dragged items".into());
+        }
+        let operation = transfer_operation(action, sources, destination)?;
+        if self.start_operation(operation, source_pane) {
+            Ok(())
+        } else {
+            Err("Another file operation is still running".into())
+        }
+    }
+
     /// Raise the destructive-delete confirmation (browser.rs
     /// `request_delete_confirm`, 958-992). Refuses while anything is in
     /// flight; the token is resolved through [`DopusCore::confirm`].
@@ -2086,6 +2109,63 @@ mod tests {
         };
         let (core, rx) = DopusCore::new(config, None);
         (dir, core, rx)
+    }
+
+    #[test]
+    fn pinned_transfers_require_a_choice_and_use_the_worker_single_flight() {
+        for action in [DropAction::Copy, DropAction::Move] {
+            let (dir, mut core, rx) = core_fixture();
+            let source = dir.path().join("left/pinned.txt");
+            let destination = dir.path().join("right");
+            std::fs::write(&source, b"pinned contents").unwrap();
+            assert!(
+                core.transfer_paths(
+                    PaneId::Left,
+                    vec![source.clone()],
+                    destination.clone(),
+                    DropAction::Ask
+                )
+                .is_err()
+            );
+            assert!(source.exists());
+            assert!(!destination.join("pinned.txt").exists());
+            assert!(!core.availability().operation_running);
+            core.select_path(PaneId::Left, Some(dir.path().join("left/unrelated.txt")));
+            core.transfer_paths(
+                PaneId::Left,
+                vec![source.clone()],
+                destination.clone(),
+                action,
+            )
+            .unwrap();
+            assert!(core.availability().operation_running);
+            assert!(
+                core.transfer_paths(
+                    PaneId::Left,
+                    vec![source.clone()],
+                    destination.clone(),
+                    action
+                )
+                .is_err()
+            );
+            loop {
+                let event = rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .expect("transfer worker reply");
+                if let CoreEvent::OperationArrived { ref result, .. } = event {
+                    assert!(result.is_ok(), "{result:?}");
+                    core.on_event(event);
+                    break;
+                }
+                core.on_event(event);
+            }
+            assert_eq!(
+                std::fs::read(destination.join("pinned.txt")).unwrap(),
+                b"pinned contents"
+            );
+            assert_eq!(source.exists(), action == DropAction::Copy);
+            assert!(!core.availability().operation_running);
+        }
     }
 
     fn pane_fixture() -> PaneModel {

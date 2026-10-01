@@ -325,9 +325,21 @@ The normal settled atomic write saves schema 2; no filemgr config is imported.
 `--print-config` prints the resolved config as JSON.
 Theme changes are session selections, not persisted config fields.
 
+## Dragging between panes
+
+Press a file or directory and move the pointer more than five pixels to drag it.
+A floating file icon and filename follow the pointer across both panes. The
+receiving directory highlights; a drop elsewhere in the receiving list targets
+that pane's current directory.
+
+On release, the preview disappears and a popup over the receiving pane offers
+**Move here**, **Copy here** and **Cancel**. Files remain untouched until you
+choose an operation. Escape, an outside press, focus loss or navigation cancels
+the pending drop. Self, descendant and same-directory destinations are refused.
+
 ## Not in v1
 
-- Drag and drop, internal or OS.
+- OS drag and drop to or from other applications.
 - Multi-selection.
 - Previews.
 - Listing virtualisation (drawing is limited to visible rows).

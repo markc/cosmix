@@ -730,9 +730,18 @@ keeps Properties hidden at 22%, while an explicit saved width is preserved.
 The normal settled atomic write saves schema 2; no filemgr config is imported.
 <code>--print-config</code> prints the resolved config as JSON.
 Theme changes are session selections, not persisted config fields.</p>
+<h2 id="dragging-between-panes">Dragging between panes</h2>
+<p>Press a file or directory and move the pointer more than five pixels to drag it.
+A floating file icon and filename follow the pointer across both panes. The
+receiving directory highlights; a drop elsewhere in the receiving list targets
+that pane's current directory.</p>
+<p>On release, the preview disappears and a popup over the receiving pane offers
+<strong>Move here</strong>, <strong>Copy here</strong> and <strong>Cancel</strong>. Files remain untouched until you
+choose an operation. Escape, an outside press, focus loss or navigation cancels
+the pending drop. Self, descendant and same-directory destinations are refused.</p>
 <h2 id="not-in-v1">Not in v1</h2>
 <ul>
-<li>Drag and drop, internal or OS.</li>
+<li>OS drag and drop to or from other applications.</li>
 <li>Multi-selection.</li>
 <li>Previews.</li>
 <li>Listing virtualisation (drawing is limited to visible rows).</li>

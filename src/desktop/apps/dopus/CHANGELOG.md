@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.3
+
+- Drag files or directories between the panes with a floating icon, filename and
+  background. Receiving directories and lists highlight under the pointer.
+- A drop opens Move here, Copy here and Cancel over the receiving pane. Paths are
+  pinned until an explicit choice; Escape, outside press, focus loss or navigation
+  cancels. Movement under five pixels retains the existing click behaviour.
+
 ## 0.3.2
 
 - Tab switches panes from the location editor too, dismissing the draft

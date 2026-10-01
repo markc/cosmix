@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.2
+
+- Add `transfer_paths` for an explicit Copy or Move on pinned gesture paths,
+  using the existing destination validation, worker and single-flight operation
+  pipeline. An unresolved Ask cannot start a file operation.
+
 ## 0.3.1
 
 - Distinguish summary and message Status events by a typed kind.
