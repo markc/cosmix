@@ -63,6 +63,19 @@ pub struct BusHandle {
 }
 
 impl BusHandle {
+    /// Exercise the real window command performer without a broker connection.
+    #[cfg(test)]
+    pub fn response_sink() -> (Self, tokio::sync::mpsc::UnboundedReceiver<Effect>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            Self {
+                tx,
+                done: std::sync::Arc::new((std::sync::Mutex::new(true), std::sync::Condvar::new())),
+            },
+            rx,
+        )
+    }
+
     pub fn respond(&self, id: u64, rc: u8, body: String) {
         let _ = self.tx.send(Effect::Respond { id, rc, body });
     }

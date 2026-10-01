@@ -851,11 +851,6 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
                 renderer.fill_quad(
                     renderer::Quad {
                         bounds: highlight,
-                        border: iced::Border {
-                            color: t.ring,
-                            width: self.look.chrome.edge * 2.0,
-                            ..Default::default()
-                        },
                         ..Default::default()
                     },
                     t.muted_surface,
@@ -884,6 +879,29 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
                         t.selection,
                     );
                 }
+            }
+
+            // Selection keeps its text/background contrast. Paint the target
+            // outline afterwards so an already selected folder cannot hide it.
+            if let Some(target) = drag
+                .active
+                .as_ref()
+                .or(drag.pending.as_ref())
+                .and_then(|drag| drag.target.as_ref())
+                && let Some(highlight) = target.highlight.intersection(&clip)
+            {
+                renderer.fill_quad(
+                    renderer::Quad {
+                        bounds: highlight,
+                        border: iced::Border {
+                            color: t.ring,
+                            width: self.look.chrome.edge * 2.0,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    iced::Color::TRANSPARENT,
+                );
             }
 
             let first = (st.offset / st.row_h).floor().max(0.0) as usize;

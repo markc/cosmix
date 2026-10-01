@@ -214,6 +214,9 @@ impl Widget<Msg, iced::Theme, Renderer> for Layer<'_> {
                 }
                 // No underlying action, click or shortcut may mutate the snapshots.
                 if matches!(event, Event::Mouse(_) | Event::Keyboard(_)) {
+                    if matches!(event, Event::Mouse(mouse::Event::CursorMoved { .. })) {
+                        shell.request_redraw();
+                    }
                     shell.capture_event();
                     return;
                 }
@@ -826,6 +829,117 @@ mod tests {
         let card = card_bounds(&gesture, viewport, look()).unwrap();
         assert_eq!(card.intersection(&target), Some(card));
         assert_eq!(card.intersection(&viewport), Some(card));
+    }
+
+    #[test]
+    fn selected_directory_draws_drop_outline_above_its_selection() {
+        use crate::view::rows::{Columns, FileList};
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("folder");
+        let rows = vec![cosmix_dopus_core::VisibleRow {
+            entry: cosmix_dopus_core::FileEntry {
+                path: target.clone(),
+                name: "folder".into(),
+                is_dir: true,
+                size: None,
+                modified: None,
+                child_count: None,
+            },
+            depth: 0,
+        }];
+        let look = look();
+        let icons = Icons::new();
+        let expanded = Default::default();
+        let shared: Shared = Default::default();
+        let columns = Columns {
+            name_min: 50.0,
+            size: 30.0,
+            modified: 40.0,
+            gap: 4.0,
+            pad: 4.0,
+        };
+        let mut list = FileList::new(
+            &rows,
+            Some(&target),
+            dir.path(),
+            &expanded,
+            &icons,
+            "",
+            look,
+            &[],
+            columns,
+            PaneId::Left,
+            shared.clone(),
+            false,
+        );
+        let mut tree =
+            Tree::new(&list as &dyn Widget<crate::view::rows::RowsMsg, iced::Theme, Renderer>);
+        let mut renderer = Renderer::new(look.ui_font, iced::Pixels(look.px));
+        let viewport = Rectangle::with_size(Size::new(600.0, 300.0));
+        let node = list.layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        let mut messages = Vec::new();
+        list.update(
+            &mut tree,
+            &Event::Window(iced::window::Event::Focused),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &viewport,
+        );
+        lock(&shared).active = Some(Gesture {
+            pane: PaneId::Right,
+            source_root: "/source".into(),
+            source: "/source/item".into(),
+            is_dir: false,
+            pointer: Point::new(100.0, 10.0),
+            target: Some(Target {
+                path: target,
+                root: dir.path().to_path_buf(),
+                bounds: viewport,
+                highlight: Rectangle {
+                    height: 40.0,
+                    ..viewport
+                },
+            }),
+        });
+        list.draw(
+            &tree,
+            &mut renderer,
+            &iced::Theme::default(),
+            &renderer::Style::default(),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &viewport,
+        );
+        let quads: Vec<_> = renderer
+            .layers()
+            .iter()
+            .flat_map(|layer| layer.quads.iter())
+            .collect();
+        let selection = quads
+            .iter()
+            .position(|(_, background)| {
+                *background == iced::Background::Color(look.tokens.selection)
+            })
+            .expect("selected row background");
+        let outline = quads
+            .iter()
+            .position(|(quad, _)| quad.border.width > 0.0 && quad.border.color == look.tokens.ring)
+            .expect("drop target outline");
+        assert!(
+            outline > selection,
+            "opaque selection cannot cover the drop outline"
+        );
+        assert_eq!(
+            quads[outline].1,
+            iced::Background::Color(iced::Color::TRANSPARENT)
+        );
     }
     #[test]
     fn dropping_without_a_target_cancels_and_valid_drop_pins_both_paths() {

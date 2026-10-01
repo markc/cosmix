@@ -1377,6 +1377,25 @@ mod tests {
         ];
         for mutation in mutations {
             let (dir, mut app) = fixture();
+            let mutation = match mutation {
+                Msg::Split(_) => Msg::Split(if app.core.config_snapshot().split_ratio >= 0.5 {
+                    0.3
+                } else {
+                    0.7
+                }),
+                Msg::SidebarWidth(sidebar, _) => Msg::SidebarWidth(
+                    sidebar,
+                    if app.core.sidebar(sidebar).width >= 0.2 {
+                        0.1
+                    } else {
+                        0.3
+                    },
+                ),
+                message => message,
+            };
+            let is_command = matches!(&mutation, Msg::Bus(Delivery::Command(_)));
+            let (handle, mut responses) = BusHandle::response_sink();
+            app.bus = Some(handle);
             let source = dir.path().join("source");
             std::fs::write(&source, b"source").unwrap();
             pin_pending_drop(&mut app, source.clone());
@@ -1387,6 +1406,15 @@ mod tests {
             );
             let before = app.drag_layout();
             let _ = app.update(mutation);
+            if is_command {
+                assert!(
+                    matches!(
+                        responses.try_recv(),
+                        Ok(bus::Effect::Respond { id: 7, rc: 0, .. })
+                    ),
+                    "Bus action must run its performer and return success"
+                );
+            }
             assert_ne!(
                 app.drag_layout(),
                 before,

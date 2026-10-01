@@ -93,6 +93,19 @@ impl WaylandState {
             |child, _, &()| applied.push(child.clone()),
             |_, _, &()| true,
         );
+        // start_drag can reuse the same icon without any new attach/commit.
+        // Dormancy removed renderer entities, not the committed surface content:
+        // remap the retained tree and queue complete upserts, as subsurface
+        // association remapping does. A new assignment below supersedes this
+        // replay; null-buffer assignments still unmap through the normal path.
+        for member in &applied {
+            if let Some(record) = self.surfaces.get_mut(&member.id())
+                && (record.shm_backing.is_some() || record.dmabuf_backing.is_some())
+            {
+                record.mapped = true;
+                self.pending_full_upserts.insert(record.id);
+            }
+        }
         CompositorHandler::commit(self, &surface);
         for child in applied {
             if child != surface {
@@ -174,8 +187,10 @@ impl WaylandState {
             record.role = SurfaceRole::Dormant(surface.clone());
             record.generation = generation;
         }
-        // Remove the whole artwork, not only the root. Retire protocol backing
-        // ownership now; renderer-owned DMA-BUF uses retain their existing fence.
+        // Hide the whole artwork and remove its renderer ownership. Keep the
+        // committed backing on the still-live wl_surface: another start_drag
+        // may legally reuse it without repainting. SHM remains budgeted and
+        // DMA-BUF backing ownership remains fenced until replacement/destruction.
         let members = self
             .surfaces
             .values()
@@ -186,24 +201,11 @@ impl WaylandState {
             let Some(record) = self.surfaces.get_mut(&member.id()) else {
                 continue;
             };
-            let bytes = record
-                .shm_backing
-                .take()
-                .map_or(0, |backing| backing.rgba.len());
-            let token = record
-                .dmabuf_backing
-                .take()
-                .map(|backing| backing.retention_token);
-            record.buffer_dimensions = None;
             let mapped = mem::replace(&mut record.mapped, false);
             let visible = mem::replace(&mut record.layout.visible, false);
             let id = record.id;
             if visible {
                 self.backend.output_leave(&member);
-            }
-            self.release_shm_bytes(&member, bytes);
-            if let Some(token) = token {
-                self.release_buffer_token(token);
             }
             if mapped {
                 self.events.push(ProtocolEvent::SurfaceUnmapped { id });
