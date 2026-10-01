@@ -121,7 +121,8 @@ mod tests {
                 family
             ));
         }
-        assert_eq!(assets.icon("delete"), Some('\u{e872}'));
+        // The pinned Material Symbols catalogue differs from legacy Material Icons.
+        assert_eq!(assets.icon("delete"), Some('\u{e92e}'));
         fonts.collection.clear();
         // Simulate a family surviving in an external/system collection: names
         // alone are present, but all point at the wrong source bytes.

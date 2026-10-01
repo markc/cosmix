@@ -249,7 +249,8 @@ mod tests {
             font::Family::Name(intern(set.family("mono").unwrap()))
         );
         let (glyph, font) = material_icon("delete").unwrap().unwrap();
-        assert_eq!(glyph, '\u{e872}');
+        // Match the pinned Material Symbols catalogue, not legacy Material Icons.
+        assert_eq!(glyph, '\u{e92e}');
         assert_eq!(
             font.family,
             font::Family::Name(intern(set.family("icons").unwrap()))
