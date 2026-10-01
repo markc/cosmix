@@ -507,7 +507,9 @@ cannot rot). <code>docs/mix/syntax.md</code> is the mental model; gotchas is the
 corrections. New to the language? Run <code>mix man gotchas</code> first.</li>
 <li>Docs for a behaviour change go in the same commit, in <code>docs/</code>.</li>
 <li>Desktop furniture belongs to compositor-hosted Quoin. Apps use conventional
-CTK menus and purpose-specific controls with compositor-managed window chrome;
+menus and purpose-specific controls with compositor-managed window chrome.
+Studio retains CTK; Tower, BusViewer, Mail, InteractGUI and Media are iced
+migration targets using <code>cosmix-iced-widgets</code> and the shared asset system;
 do not add Quoin-like panel furniture to individual apps. See
 <code>src/desktop/APPS.md</code> for the layout policy and legacy migration scope.</li>
 <li>Version-bump a crate when a consumer would observe the change.</li>

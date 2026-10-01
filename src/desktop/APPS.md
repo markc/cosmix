@@ -41,9 +41,11 @@ Individual applications must not reproduce that furniture or embed a
 Quoin-like shell around their content. The compositor manages window titles,
 borders, caption buttons, movement, resizing and fullscreen presentation.
 
-Apps use shared CTK widgets for conventional menu bars and dropdown menus,
-toolbars, status rows and controls appropriate to their purpose. iced apps
-(`term`, `ced`) use the equivalent `cosmix-iced-widgets` menus instead. Application
+Studio uses shared CTK widgets for conventional menu bars and dropdown menus,
+toolbars, status rows and controls appropriate to its purpose. iced apps
+(`term`, `ced`, `dopus`) use the equivalent `cosmix-iced-widgets` menus. The
+remaining application migration targets use that iced widget layer as they
+are ported. Application
 content can include sidebars, browsers, inspectors and transport controls when
 needed; adding one does not require adopting desktop panel furniture. Reuse
 the widgets and behaviour without imposing the same outer layout on every app.
@@ -56,6 +58,28 @@ and Mail retain their current implementation until deliberately
 updated; their use of `DcsAppShell` is not a template for new app furniture.
 
 ## Registry
+
+### Renderer direction (2026-10-01)
+
+Studio stays on Bevy for its performance-sensitive DAW interface. Wallpaper
+and BG Showcase also retain Bevy for their GPU scenes. Tower, BusViewer,
+Mail, InteractGUI and Media must migrate from Bevy/CTK to iced; these ports
+are pending, so the dependency inventory below still describes their CTK
+implementations. Ports preserve application identities, native Wayland,
+existing Bus contracts and behaviour, and use the shared font/icon assets.
+
+Quoin has both a standalone layer-shell host and an in-process compositor
+implementation. The latter is selected by `cosmix-comp`'s `embedded-quoin`
+feature and installs `EmbeddedQuoinPlugin`; it is not a default compositor
+feature. Quoin's compositor furniture is a separate renderer decision from
+the five application ports and can retain Bevy when embedded.
+
+InteractGUI is the persistent GUI presenter for `interactd` dialogs, registered
+as Bus service `interact-gui`. It renders messages, confirmations, prompts,
+choices, progress cards, file/folder requesters, sliders and text viewers,
+and returns correlated outcomes to the broker. Its current CTK mapping does
+not support multiline prompts or opening multiple files. The iced port
+preserves the presenter lease, reconnect/reseed, progress and result semantics.
 
 | State | Slug | Display name | Role |
 |---|---|---|---|

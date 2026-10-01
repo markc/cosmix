@@ -74,7 +74,9 @@ defaults. Never hardcode an install path.
   corrections. New to the language? Run `mix man gotchas` first.
 - Docs for a behaviour change go in the same commit, in `docs/`.
 - Desktop furniture belongs to compositor-hosted Quoin. Apps use conventional
-  CTK menus and purpose-specific controls with compositor-managed window chrome;
+  menus and purpose-specific controls with compositor-managed window chrome.
+  Studio retains CTK; Tower, BusViewer, Mail, InteractGUI and Media are iced
+  migration targets using `cosmix-iced-widgets` and the shared asset system;
   do not add Quoin-like panel furniture to individual apps. See
   `src/desktop/APPS.md` for the layout policy and legacy migration scope.
 - Version-bump a crate when a consumer would observe the change.
