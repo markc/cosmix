@@ -1,6 +1,6 @@
 # Shared iced widgets
 
-`cosmix-iced-widgets` 0.1.0 provides a single-line `TextField`, a menu bar,
+`cosmix-iced-widgets` 0.1.7 provides a single-line `TextField`, a menu bar,
 context menus, pro-audio controls (fader, pan knob, level meter, toggle), a
 waveform and a piano roll, and a `cosmix-design` colour/metric adapter. It
 uses upstream iced 0.14 component crates, pinned exactly, with defaults
@@ -10,7 +10,23 @@ select `wgpu` or `tiny-skia`. Upstream iced_renderer requires a renderer
 feature for release builds. Only the gallery example uses iced's winit shell
 (Wayland-only).
 
-## Public API (0.1.0)
+## Shared asset defaults
+
+Cosmix iced hosts register the installed asset set before building their UI.
+Use `fonts::default_ui_font()` for the application builder's `.default_font(...)`
+and `fonts::default_mono_font()` for code or technical fields. Registration happens
+once per process, from local verified files. Generic sans, serif and mono queries
+then resolve to the installed roles. Explicit named font choices remain authoritative.
+DOpus, CED and Term already use the adapter; the gallery also uses its UI default.
+
+Fonts and emoji become available to iced text rendering through this registration.
+Icons need a semantic mapping and the icon font: `fonts::material_icon(name)` returns
+the glyph and its font. Existing SVGs and text symbols do not change automatically.
+DOpus maps its 35 icons to Material Symbols Rounded, retaining bundled Lucide icons
+when the installed catalogue is unavailable or incomplete. Other hosts can adopt
+the same API as their icon controls are updated.
+
+## Public API (0.1.7)
 
 This is the whole surface other crates may rely on. Everything else is private.
 

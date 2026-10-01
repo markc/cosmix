@@ -5,6 +5,14 @@ It replaces the deprecated Bevy filemgr; retirement of that app is separate.
 The window is a Wayland client (`dev.cosmix.dopus`) drawn with tiny-skia and
 the shared design tokens. Only dopus consumes the extracted core.
 
+DOpus 0.4.2 uses the installed shared UI and mono fonts and maps all 35 icons
+to Material Symbols Rounded. Toolbar, Places, file rows and drag previews render
+the glyphs through iced's text renderer at the output scale. The shared system
+set lives in `/opt/cosmix/share/assets`; an XDG user set takes precedence. Explicit
+theme font choices remain authoritative. A missing, invalid or incomplete icon
+catalogue uses the retained bundled Lucide icons. Restart after installing a set.
+`dopus.state.appearance` reports the icon mode, asset set and resolved font families.
+
 Each pane has its own directory, history, sort, hidden-file setting, lazy
 directory tree and selection. Click selects one item, Ctrl-click toggles an
 individual item, Shift-click selects a range in visible row order, and
@@ -22,7 +30,7 @@ Show/Hide hidden files. It always acts on the
 active pane and follows Tab, F6 or a pane click; Back/Forward are disabled when
 that pane's corresponding history is empty, and Up is disabled at the root.
 Disabled icons use the theme's muted foreground, matching disabled dialog buttons.
-Lucide `panel-left` and `panel-right` buttons sit at the far left and right of
+Panel-left and panel-right buttons sit at the far left and right of
 the same row, with navigation centred between them. They toggle Places and
 Properties through the same actions as the keyboard and Bus: docked means
 open, undocked means hidden, without floating windows. Open panels have
