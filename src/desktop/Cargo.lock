@@ -3015,22 +3015,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cosmix-bterm"
-version = "0.10.2"
-dependencies = [
- "bevy",
- "cosmix-actions",
- "cosmix-app-identity",
- "cosmix-lib-buildinfo",
- "cosmix-lib-config",
- "cosmix-term-core",
- "ctk",
- "serde_json",
- "term-native-test-broker",
- "tokio",
-]
-
-[[package]]
 name = "cosmix-busviewer"
 version = "0.1.2"
 dependencies = [
@@ -3199,20 +3183,6 @@ version = "0.1.1"
 dependencies = [
  "libc",
  "regex",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "cosmix-filemgr"
-version = "0.9.8"
-dependencies = [
- "bevy",
- "chrono",
- "cosmix-actions",
- "cosmix-lib-buildinfo",
- "cosmix-lib-config",
- "ctk",
  "serde",
  "serde_json",
 ]

@@ -387,25 +387,8 @@ struct TermPaneParams {
     id: Option<u64>,
 }
 
-/// The Bus names a terminal frontend may hold, in preference order.
-///
-/// D1 (TODO-term, 2026-09-21): two binaries cannot both own the global name
-/// `term`, so the Bevy frontend was renamed and now registers as `bterm` and
-/// serves `bterm.*`; `term` / `term.*` is reserved for the incoming iced+wgpu
-/// one. T5's A/B needs both running at once, so these tools RESOLVE the live
-/// frontend instead of hardcoding a name.
-///
-/// **`bterm` is preferred while both are up** (D10, Mark 2026-09-21). It was
-/// `term` on the reasoning that the new frontend is "the default" — true of
-/// the NAME, not yet of the thing holding it: since T2 that is a skeleton
-/// that draws a grid and answers no verbs, so preferring it would point every
-/// MCP term tool at the frontend least able to serve one the moment it starts
-/// registering a partial `term.*`. D6 says bterm stays the default until full
-/// verb parity (T6) plus a month of daily driving, and this list is one of
-/// three places that sentence has to be true — with `cosmix-mix`'s
-/// TERM_FRONTENDS and `scripts/term-desktop.mix`. Flip all three at T6, and
-/// see TODO-term T6a, which exists to make them one list.
-const TERM_SERVICES: [&str; 2] = ["bterm", "term"];
+/// Maintained terminal services. The Bevy BTerm frontend is archived.
+const TERM_SERVICES: [&str; 1] = ["term"];
 
 /// How long a frontend gets to answer the liveness probe.
 ///
@@ -415,13 +398,7 @@ const TERM_SERVICES: [&str; 2] = ["bterm", "term"];
 /// a minute, and does not hide a healthy one behind itself.
 const TERM_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// What to say when nothing is registered. It names both candidates: the most
-/// likely cause of this error for the rest of 2026 is a caller expecting the
-/// pre-rename `term` to be there, and an error that named only one of them
-/// would leave that reader guessing.
-/// Derived from [`TERM_SERVICES`] rather than spelling the names again: this
-/// string said "`term`, then `bterm`" for as long as it took someone to grep
-/// for the other name after the order was flipped ten lines above it.
+/// Explain how to start the maintained frontend when it is absent.
 fn term_no_frontend() -> String {
     format!(
         "no CosMix terminal is registered on the Bus (looked for {}) — start one with `mix --gui`",
@@ -3125,7 +3102,7 @@ mod tests {
                 serde_json::json!({"text":"x","pane":3,"instance":77})
             )
         );
-        // An explicit OTHER service does not inherit the remembered instance.
+        // Explicit requests for the archived frontend are refused locally.
         assert_eq!(
             term_type_request(
                 TermTypeParams {
@@ -3134,8 +3111,8 @@ mod tests {
                 },
                 remembered
             )
-            .unwrap(),
-            ("bterm", serde_json::json!({"text":"x","pane":3}))
+            .unwrap_err(),
+            "service must be one of term"
         );
     }
 
@@ -3166,7 +3143,7 @@ mod tests {
     fn term_translations_and_listing() {
         use super::*;
         // An old frontend listed: no instance to forward, service still pinned.
-        let old: Option<TermPin> = Some(("bterm", None));
+        let old: Option<TermPin> = Some(("term", None));
         let typed = |pane, tab| {
             term_type_request(
                 TermTypeParams {
@@ -3182,15 +3159,15 @@ mod tests {
         assert_eq!(typed(None, None).unwrap_err(), "pane or tab is required");
         assert_eq!(
             typed(Some(3), None).unwrap(),
-            ("bterm", serde_json::json!({"text":"hi\n","pane":3}))
+            ("term", serde_json::json!({"text":"hi\n","pane":3}))
         );
         assert_eq!(
             typed(None, Some(2)).unwrap(),
-            ("bterm", serde_json::json!({"text":"hi\n","tab":2}))
+            ("term", serde_json::json!({"text":"hi\n","tab":2}))
         );
         assert_eq!(
             typed(Some(3), Some(2)).unwrap(),
-            ("bterm", serde_json::json!({"text":"hi\n","pane":3,"tab":2}))
+            ("term", serde_json::json!({"text":"hi\n","pane":3,"tab":2}))
         );
         // Ids start at 1: zero is refused locally, before any Bus call.
         for (pane, tab) in [(Some(0), None), (None, Some(0)), (Some(3), Some(0))] {
@@ -3361,44 +3338,24 @@ mod tests {
         assert_eq!(term_reply(serde_json::Value::Null).unwrap(), "");
     }
 
-    /// D1 (TODO-term, 2026-09-21): the MCP addresses whichever frontend is
-    /// live. D10 (same day) sets which it prefers when both are: `bterm`, the
-    /// verb-complete one, until the iced `term` reaches parity at T6.
-    ///
-    /// This is the SHORTLIST half — which names are candidates and in what
-    /// order. Whether a candidate is actually answering is decided by the
-    /// bounded `INFO` probe in `term_service`, which needs a broker.
-    ///
-    /// Proven able to fail — the pre-sweep code hardcoded `"term"`, which
-    /// fails the bterm-only and neither-registered arms.
+    /// Only Term is eligible, even if an old BTerm remains registered.
     #[test]
     fn term_service_resolves_the_live_frontend() {
         use super::*;
         let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
-        // Both up (the T5 A/B case): the PREFERRED frontend is tried first,
-        // and the other REMAINS a candidate — dropping it here is what would
-        // put the wedged-frontend hang back.
-        //
-        // Preferred is `bterm` until T6 (D10). This assertion is what holds
-        // that: if it failed because you reordered TERM_SERVICES, the test is
-        // doing its job — preferring the iced frontend is a decision that
-        // belongs with verb parity, not a tidy-up.
+        // The retired frontend must not take over the maintained one.
         assert_eq!(
             registered_term_services(&names(&["noded", "bterm", "term"])),
-            ["bterm", "term"]
+            ["term"]
         );
         // Only the iced one.
         assert_eq!(
             registered_term_services(&names(&["noded", "term"])),
             ["term"]
         );
-        // Only the Bevy one — today's state after the rename, before the
-        // iced frontend ships.
-        assert_eq!(
-            registered_term_services(&names(&["noded", "bterm"])),
-            ["bterm"]
-        );
+        // A leftover registration of the archived frontend is ignored.
+        assert!(registered_term_services(&names(&["noded", "bterm"])).is_empty());
         // Neither.
         assert!(registered_term_services(&names(&["noded", "webd"])).is_empty());
         assert!(registered_term_services(&[]).is_empty());
@@ -3537,7 +3494,7 @@ mod tests {
         use super::*;
         let absent = term_no_frontend();
         assert!(
-            absent.contains("`term`") && absent.contains("`bterm`"),
+            absent.contains("`term`") && !absent.contains("`bterm`"),
             "{absent}"
         );
         // The message must state the order it will actually try, not a

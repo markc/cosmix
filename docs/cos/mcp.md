@@ -63,24 +63,14 @@ The self-asserted terminal service is diagnostic pending authenticated
 per-instance identity (P0-I). These tools reuse the Bus client and central
 per-call metrics. Replies are bounded to 1 MiB.
 
-**Which frontend they address is RESOLVED, not fixed (cosmix-mcp 0.5.2).**
-TODO-term D1 split the global Bus name in two: the iced+wgpu frontend is
-`term` / `term.*`, the Bevy one is `bterm` / `bterm.*`, and a frontend
-*refuses* a verb from the other namespace. Before every tool call the MCP asks
-the broker which of `bterm`, then `term`, is registered, and **probes each in
-turn with a bounded `INFO`** — taking the first that actually answers and
-building the verb from that same name.
+**The maintained frontend is Term (cosmix-mcp 0.7.1).** Before each tool call
+the MCP checks whether `term` is registered and probes it with a bounded
+`INFO`. Retired `bterm` registrations are ignored and explicit `bterm`
+requests are refused. `COSMIX_TERM_BIN` controls the binary launched by
+`mix --gui`, not MCP service discovery.
 
-**`bterm` is preferred when both answer (TODO-term D10, cosmix-mcp 0.5.2).**
-It is the frontend with the tabs, the panes and the whole verb surface; the
-iced `term` is a skeleton until it reaches parity at T6. There is no
-environment override for this lane — `COSMIX_TERM_BIN` governs only which
-*binary* `mix --gui` launches, not which *service* these tools drive, so while
-both are running these tools address `bterm`.
-
-Resolution is per call, never cached
-for the process: the MCP outlives any one terminal, and both frontends may be
-up at once for an A/B.
+Resolution is per call, never cached for the process: the MCP outlives any
+one terminal, which may exit or restart between calls.
 
 *Live means answering, not merely registered.* A frontend whose event loop is
 stuck keeps its Bus name, so registration alone would hand every tool call to
@@ -98,7 +88,7 @@ The failure modes are reported distinctly, because they call for different
 actions — start a terminal, find the stuck one, or go and look at the broker:
 
 - nothing registered → `ERROR: no CosMix terminal is registered on the Bus
-  (looked for `bterm`, then `term`) — start one with `mix --gui``
+  (looked for `term`) — start one with `mix --gui``
 - registered but silent → `ERROR: CosMix terminal registered but unresponsive:
   `term` did not answer INFO within 3s (wedged, or shutting down). No other
   frontend is registered. Nothing was sent.`

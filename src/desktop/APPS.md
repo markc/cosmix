@@ -51,8 +51,8 @@ the widgets and behaviour without imposing the same outer layout on every app.
 Media's menu bar, native file requester and unobstructed video area illustrate
 this general direction; Media is not a special exception. The former mandate
 that new apps use `DcsAppShell`, including the instruction to migrate Studio
-when it gains a sidebar, is superseded. Existing consumers such as Tower,
-FileMgr and Mail retain their current implementation until deliberately
+when it gains a sidebar, is superseded. Existing consumers such as Tower
+and Mail retain their current implementation until deliberately
 updated; their use of `DcsAppShell` is not a template for new app furniture.
 
 ## Registry
@@ -60,7 +60,8 @@ updated; their use of `DcsAppShell` is not a template for new app furniture.
 | State | Slug | Display name | Role |
 |---|---|---|---|
 | active | `studio` | CosMix Studio | Recording-studio/DAW north star; drives the `musicd` domain |
-| active | `filemgr` | CosMix FileMgr | Twin-pane file manager; distinct from the `filesd` domain |
+| retired | `filemgr` | CosMix FileMgr | Retired 2026-10-01; replaced by DOpus. Source preserved at tag `archive/filemgr/2026-10-01`; no longer built or installed. |
+| retired | `bterm` | CosMix BTerm | Retired 2026-10-01; replaced by iced Term. Source preserved at tag `archive/bterm/2026-10-01`; no longer built or installed. |
 | retired | `midiseq` | — | Superseded by `studio` 2026-07-24 (slug named the capability, not the destination). State roots under `cosmix/apps/midiseq` were migrated to `cosmix/apps/studio` as a one-time operator step; this slug is never reused. |
 | active | `tray` | CosMix Tray | Plasma StatusNotifierItem — launch apps, start/stop cosmix daemons, mesh health (kind: tray, engine: none) |
 | active | `tower` | CosMix Tower | Mesh mission control — verified node atlas, same-node citizen/daemon controls, live traffic animation, and persisted filters/layout |
@@ -68,6 +69,19 @@ updated; their use of `DcsAppShell` is not a template for new app furniture.
 | active | `mail` | CosMix Mail | Frontend mail reader and composer (Bevy + ctk); reads the `maild` domain, which stays the backend server. Not a reused retired slug: the archived Bus/`ui.*` disp-skia client of the same name was never registered here and was carved out to `_attic/bus-display/` on 2026-07-20. Landed 2026-07-31 as the widget vertical slice — fixture corpus, no JMAP transport yet. |
 | active | `quoin` | CosMix Quoin | Furniture-tier desktop shell: four edge panels; Bus service `shell` |
 | active | `media` | CosMix Media | Native CTK audio/video player; local MP3/MP4 playback and Bus service `media` |
-| active | `term` | CosMix Term | Lightweight Wayland Mix terminal on iced (tiny-skia renderer by default, wgpu optional) over the toolkit-free `cosmix-term-core`: tabs, split panes, a child Mix shell per pane; Bus service `term` with the `term.*` verbs. Its Bevy twin is `bterm` (same core, Bus service `bterm`). Not a reused slug. |
+| active | `term` | CosMix Term | Lightweight Wayland Mix terminal on iced (tiny-skia renderer by default, wgpu optional) over the toolkit-free `cosmix-term-core`: tabs, split panes, a child Mix shell per pane; Bus service `term` with the `term.*` verbs. The former Bevy twin BTerm is archived; Term is the maintained frontend. Not a reused slug. |
 | active | `ced` | CosMix Editor | Desktop text editor on iced (tiny-skia) over the `edit` Bus service (`cosmix-editd`): local echo with single-authority OT, per-origin undo lanes, live agent edits, lsh/Mix-lexer highlighting, recovery via editd. Bus service `ced` (`ced.v1`); binary `ced` (explicit naming exception, like `term`); `app_id` `dev.cosmix.ced`. |
-| active | `dopus` | CosMix DOpus | Twin-pane file manager on iced (tiny-skia) over the headless `cosmix-dopus-core` (the filemgr semantics ported: stale-listing generations, count queue, queued confirm modals, no-overwrite ops). Twin panes + drag divider, Places, per-pane location bars, file operations via keyboard and dialogs. Bus service `dopus` (`dopus.v1`); every `file.*` action is keyboard-only forever — the Bus never mutates the filesystem. The intended REPLACEMENT for `filemgr` (Bevy/ctk), which stays until dopus reaches windowed parity; distinct slug, not a reuse. Binary `cosmix-dopus`; `app_id` `dev.cosmix.dopus`. |
+| active | `dopus` | CosMix DOpus | Twin-pane file manager on iced (tiny-skia) over the headless `cosmix-dopus-core` (the filemgr semantics ported: stale-listing generations, count queue, queued confirm modals, no-overwrite ops). Twin panes + drag divider, Places, per-pane location bars, file operations via keyboard and dialogs. Bus service `dopus` (`dopus.v1`); every `file.*` action is keyboard-only forever — the Bus never mutates the filesystem. The replacement for the archived `filemgr` (Bevy/ctk); distinct slug, not a reuse. Binary `cosmix-dopus`; `app_id` `dev.cosmix.dopus`. |
+
+## CTK consumers after FileMgr and BTerm retirement
+
+Direct application dependencies remain in Studio, Tower, BusViewer, Mail,
+InteractGUI, Quoin, Media, Wallpaper and BG Showcase. Wallpaper and BG Showcase
+select CTK's Bus support without its default widget features. Quoin's rendered
+scene widgets also reach CTK through `cosmix-scene-bevy`.
+
+The two direct library consumers are `cosmix-scene-bevy` and `cosmix-shell`;
+the latter only enables CTK with its optional `chrome-core` feature. The
+compositor inherits CTK when built with embedded Quoin. Term, Ced and DOpus
+use iced and do not depend on CTK. Retirement of FileMgr and BTerm does not
+remove the other applications' Bevy or CTK dependencies.

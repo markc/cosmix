@@ -297,23 +297,23 @@ async fn protocol_service(
             let instance = state.instance.load(Ordering::SeqCst);
             let (rc, body) = match cmd.command.as_str() {
                 "INFO" => (0, json!({"verbs":[]})),
-                "bterm.tabs" => (
+                "term.tabs" => (
                     0,
                     json!(format!(
                         "id=1 active=true title=Shell with spaces cols=80 rows=24 instance={instance}"
                     )),
                 ),
-                "bterm.panes" => (
+                "term.panes" => (
                     0,
                     json!(format!(
                         "id=1 active=true cols=80 rows=24 instance={instance}"
                     )),
                 ),
-                "bterm.type" if cmd.args["instance"].as_u64() != Some(instance) => (
+                "term.type" if cmd.args["instance"].as_u64() != Some(instance) => (
                     10,
                     json!({"error_code":"INVALID_ARGUMENT","message":"instance is not this term process"}),
                 ),
-                "bterm.type" => {
+                "term.type" => {
                     state.mutations.fetch_add(1, Ordering::SeqCst);
                     (0, json!("keys queued"))
                 }
@@ -436,8 +436,7 @@ async fn native_mcp_acceptance() {
 
     let terminal = Arc::new(ServiceState::default());
     terminal.instance.store(55, Ordering::SeqCst);
-    let (term_client, term_task) =
-        protocol_service(&fixture.url(), "bterm", terminal.clone()).await;
+    let (term_client, term_task) = protocol_service(&fixture.url(), "term", terminal.clone()).await;
     fixture.tasks.push(term_task);
     let rejected = fixture
         .call("term_type", json!({"text":"hello", "pane":1}))
@@ -447,7 +446,7 @@ async fn native_mcp_acceptance() {
     assert_eq!(terminal.deliveries.load(Ordering::SeqCst), 0);
     let listing = fixture.call("term_list", json!({})).await;
     let listed = success(&listing, &tools, "term_list");
-    assert_eq!(listed["service"], "bterm");
+    assert_eq!(listed["service"], "term");
     assert_eq!(listed["instance"], 55);
     assert_eq!(listed["tabs"][0]["title"], "Shell with spaces");
     let typed = fixture
@@ -469,15 +468,15 @@ async fn native_mcp_acceptance() {
 
     let deliveries = terminal.deliveries.load(Ordering::SeqCst);
     for args in [
-        json!({"to":"bterm","command":"bterm.type","args":"{"}),
-        json!({"to":"bterm","command":"bterm.type","typo":true}),
+        json!({"to":"term","command":"term.type","args":"{"}),
+        json!({"to":"term","command":"term.type","typo":true}),
     ] {
         let rejected = fixture.call("bus_call", args).await;
         assert!(rejected.is_error.unwrap_or(false));
     }
     assert_eq!(terminal.deliveries.load(Ordering::SeqCst), deliveries);
     let app_error = fixture
-        .call("bus_call", json!({"to":"bterm","command":"unknown"}))
+        .call("bus_call", json!({"to":"term","command":"unknown"}))
         .await;
     assert!(app_error.is_error.unwrap_or(false));
     assert_eq!(

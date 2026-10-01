@@ -1,4 +1,4 @@
--- version: 0.1.0
+-- version: 0.1.1
 -- term-desktop.mix — agentless desktop-workflow launcher for CosMix Term.
 --
 -- Drives CosMix Term over the Bus with NO AI agent in the loop: the desktop
@@ -7,59 +7,18 @@
 -- verbs plus a detached launch. This is the sovereign control path — the same
 -- surface an agent reaches through MCP is reachable here from a plain script.
 --
--- WHICH frontend is resolved, never hardcoded (D1, TODO-term 2026-09-21): the
--- Bevy terminal was renamed and now registers as `bterm` / serves `bterm.*`,
--- and the global name `term` belongs to the iced+wgpu one. Both may be running
--- at once, and cosmix-term-core REFUSES a verb from the other namespace — so
--- the name is resolved once and every verb is built from it.
+-- The maintained iced frontend registers as `term` and serves `term.*`.
+-- BTerm is archived. INFO is probed with a three-second cap inside the
+-- caller's absolute deadline; registration alone does not establish liveness.
 --
 -- usage:
---   mix term-desktop.mix open [DIR]           open Term with its shell in DIR (default: cwd)
---   mix term-desktop.mix focus [DIR]          reuse a running Term (add a tab); else open in DIR
---   mix term-desktop.mix layout NAME [DIR]    ensure Term runs, then build a named project layout
+--   mix term-desktop.mix open [DIR]
+--   mix term-desktop.mix focus [DIR]
+--   mix term-desktop.mix layout split|dev [DIR]
 --
--- Layouts: "split" (split the active pane into two side-by-side panes);
---          "dev" (three tabs for edit / build / run).
---
--- Visual window-raising for `focus` needs a compositor activate verb Comp does
--- not expose yet (comp.window.activate); until it lands, `focus` reuses the
--- running instance by adding a tab rather than spawning a second window — the
--- desktop-legible "don't proliferate windows" half of focus-existing.
-
--- The Bus name of a LIVE CosMix terminal: `bterm` (the Bevy one, the frontend
--- with the verbs) if it answers, else `term` (the iced one), else "" when
--- neither does.
---
--- INFO is answered by any live frontend, so this proves the instance is
--- responsive and not merely registered — this script is about to drive verbs,
--- not just report. Preference order matches `mix --gui`'s binary resolution
--- (bterm, then term — D10) so the launcher drives the same terminal it starts.
---
--- The per-send `timeout=` is load-bearing, not tidiness. Without it a
--- REGISTERED BUT WEDGED first candidate costs the default 60s transport
--- timeout, and that timeout marks Mix's cached Bus connection Lost
--- (cosmix-mix/src/bus.rs, "A transport failure … is an Err → transition to
--- Lost"), so every later form raises `mesh unavailable` — the fallback probe
--- could never reach a perfectly healthy second one. Since D10 that is a
--- wedged `bterm` starving a healthy `term`; before it, the two names sat in
--- each other's roles, which is the point — the hazard belongs to whichever
--- name is probed FIRST, so this paragraph names neither.
--- A per-send timeout returns rc=-2 by cancelling
--- the call in the evaluator instead, leaving the connection usable. Three
--- seconds is comfortably above the frontends' own two-second reply budget.
---
--- `$deadline` is an ABSOLUTE wall-clock instant, and each probe is capped by
--- what is LEFT of it rather than by a fixed 3s. A caller's stated budget must
--- bound the whole resolution, not each probe within it: two wedged frontends
--- at a flat 3s cost 6s per call, which is how a 20s wait loop was measured
--- overrunning to ~25s.
--- Name order is TODO-term D10 (Mark, 2026-09-21): prefer `bterm`, the tabbed
--- verb-complete frontend, over `term`, which since T2 is an iced skeleton.
--- Flip back at T6 together with `cosmix-mix`'s TERM_FRONTENDS and
--- `cosmix-mcp`'s TERM_SERVICES — three lists, one rule, and T6a exists to
--- make them one list.
+-- focus reuses a live terminal by adding a tab; compositor activation is pending.
 fn resolve_term_service($deadline)
-  for $name in ["bterm", "term"]
+  for $name in ["term"]
     $left = $deadline - time()
     if $left <= 0 then return "" end
     if $left > 3 then $left = 3 end
@@ -73,10 +32,7 @@ fn usage()
   raise("TERM_ARGS", "usage: open [DIR] | focus [DIR] | layout NAME [DIR]")
 end
 
--- Every verb is built from the RESOLVED service. `cosmix-term-core`'s
--- canonical_verb() refuses a verb whose namespace is not the frontend's own
--- name, so a hardcoded `term.` prefix sent to bterm is a rejected call, not an
--- untidy one.
+-- Build every verb from the service whose INFO probe answered.
 fn apply_layout($name, $svc)
   -- Unreachable today (every caller either resolved a service or raised), and
   -- the guard is here so it stays that way: an empty name would build the verb
@@ -142,13 +98,7 @@ if $need_launch then
   end
   -- TERM_CWD is inherited by the detached child (space-safe, no shell quoting);
   -- `mix --gui` resolves the Term frontend and the child shell starts in $dir.
-  -- The BINARY resolution lives in `mix --gui` (COSMIX_TERM_BIN, then bterm
-  -- then term at each tier) and is deliberately not duplicated here: a second
-  -- copy of that search would be a second thing to keep in step with the
-  -- first. Note COSMIX_TERM_BIN governs only which BINARY is launched — the
-  -- service this script then drives is resolved separately above, so forcing
-  -- the iced binary still leaves the verbs going to whichever frontend
-  -- answers first.
+  -- mix --gui owns binary resolution, including COSMIX_TERM_BIN.
   export TERM_CWD = $dir
   -- Resolve while this launcher is alive; another Term may answer INFO at once.
   $resolved = run_argv(["readlink", "-f", "/proc/" .. to_string(pid()) .. "/exe"])
@@ -180,7 +130,7 @@ if $need_launch then
     sleep(0.5)
     $service = resolve_term_service($deadline)
   end
-  if $service == "" then raise("TERM_NOREG", "no Term answered on the Bus within 20s (looked for `bterm`, then `term`)") end
+  if $service == "" then raise("TERM_NOREG", "no Term answered on the Bus within 20s (looked for `term`)") end
   print("driving Bus service `" .. $service .. "`")
 end
 

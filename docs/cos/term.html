@@ -442,15 +442,14 @@
 
     <div id="doc-view" class="content-section">
         <div id="content-doc" data-prerendered="cos/term.md"><div class="prose"><h1 id="term--the-lightweight-terminal">term — the lightweight terminal</h1>
-<p>CosMix Term (<code>apps/term</code>, binary <code>term</code>) is the tabbed Mix terminal on iced
-and wgpu. It is the lightweight frontend over <code>cosmix-term-core</code>, the same
-toolkit-free core as the Bevy frontend CosMix BTerm (<code>bterm</code>). The two share
-the PTY, the VT grid, the tab and pane model, the glyph raster and the Bus
-handlers. Only the window differs.</p>
-<p>It registers the Bus name <code>term</code> and serves the <code>term.*</code> verbs. bterm
-registers <code>bterm</code> and serves <code>bterm.*</code>, so both can run at once. <code>mix --gui</code>
-still prefers bterm until term reaches full verb parity (decisions D6 and
-D10). Set <code>COSMIX_TERM_BIN</code> to the <code>term</code> binary to launch this one.</p>
+<p>CosMix Term (<code>apps/term</code>, binary <code>term</code>) is the maintained tabbed Mix terminal
+on iced over the toolkit-free <code>cosmix-term-core</code>. It registers the Bus name
+<code>term</code> and serves <code>term.*</code>. <code>mix --gui</code> selects Term; <code>COSMIX_TERM_BIN</code> remains
+an explicit binary override.</p>
+<p>The Bevy BTerm frontend was retired on 2026-10-01. Its source and historical
+comparison gates are preserved at tag <code>archive/bterm/2026-10-01</code>. References
+to BTerm below describe the former shared-core implementation, not a shipped
+second frontend.</p>
 <h2 id="tabs-and-panes">Tabs and panes</h2>
 <p>The tab strip across the top shows one button per tab and a <code>+</code> that opens a
 new one. Clicking a tab selects it. Each tab holds a tree of split panes, and

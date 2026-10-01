@@ -339,26 +339,8 @@ fn resolve_term(
             "mix --gui: COSMIX_TERM_BIN must name an executable frontend file".to_string()
         });
     }
-    // `bterm` first, then `term`, at each tier before moving to the next — a
-    // $COSMIX dev build must win over an installed one whichever frontend it
-    // is, or `mix --gui` silently runs the system terminal while you are
-    // testing a local one.
-    //
-    // ⚠️ THE NAME ORDER IS A DECISION, NOT A DEFAULT (Mark, 2026-09-21,
-    // TODO-term D10). `bterm` is the tabbed, verb-complete, daily-driven
-    // frontend; `term` is the iced one, which since T2 is a skeleton that
-    // draws a grid and serves no verbs. The moment `apps/term` became a
-    // workspace member again, `setup.mix --desktop` began installing it as
-    // `bin/term` — so a `term`-first list would have made the next routine
-    // install silently replace the daily driver with the skeleton, which is
-    // exactly what D6 forbids until the new frontend has full verb parity
-    // (T6) plus a month of daily driving.
-    //
-    // FLIP THIS BACK AS PART OF T6, not before, and not as a drive-by: the
-    // whole point of D6 is that the switch is a decision someone makes, not
-    // one an installer makes for them. Until then `COSMIX_TERM_BIN=.../term`
-    // is how you reach the iced one deliberately; it still overrides
-    // everything and still fails closed.
+    // The maintained iced frontend is searched in the development, installed
+    // and PATH tiers. An explicit COSMIX_TERM_BIN still overrides them.
     for name in TERM_FRONTENDS {
         if let Some(root) = &cosmix
             && let Some(path) = lookup(&Path::new(root).join("bin").join(name))
@@ -385,13 +367,8 @@ fn resolve_term(
         })
 }
 
-/// The frontend binary names, in resolution order. Shared with [`term_lookup`]
-/// so the PATH tier cannot search for a name the lookup then refuses to treat
-/// as a PATH name — which is exactly what happened to `bterm` between the T1
-/// rename and this fix: the list gained a second name and the lookup's
-/// bare-name exemption did not, so a `bterm` installed only on PATH was looked
-/// for at `<cwd>/bterm` and never found.
-const TERM_FRONTENDS: [&str; 2] = ["bterm", "term"];
+/// Maintained frontend names, shared with PATH lookup. BTerm is archived.
+const TERM_FRONTENDS: [&str; 1] = ["term"];
 
 /// Is `path` an unqualified frontend name — one that must reach `which`
 /// untouched so PATH is actually searched?
@@ -2488,6 +2465,7 @@ mod gui_tests {
         // And a qualified path is still absolutised rather than PATH-searched.
         assert!(!is_bare_frontend_name(Path::new("/opt/cosmix/bin/bterm")));
         assert!(!is_bare_frontend_name(Path::new("./term")));
+        assert!(!is_bare_frontend_name(Path::new("bterm")));
     }
 
     #[test]
@@ -2498,24 +2476,12 @@ mod gui_tests {
             None
         })
         .unwrap_err();
-        // Tier before name: a $COSMIX dev build of EITHER frontend beats an
-        // installed one, so `mix --gui` never silently runs the system
-        // terminal while a local build is what is under test.
-        //
-        // Name order within a tier is D10 and this assertion is what holds it:
-        // `bterm` before `term` keeps the daily driver the daily driver, so
-        // installing the iced skeleton cannot quietly take over `mix --gui`.
-        // If you are here because this test failed after you reordered the
-        // list, that is the test doing its job — flipping the order is a T6
-        // decision, not a refactor.
+        // Development builds precede installed and PATH copies of Term.
         assert_eq!(
             seen,
             [
-                "/test-root/bin/bterm",
                 "/test-root/bin/term",
-                "/opt/cosmix/bin/bterm",
                 "/opt/cosmix/bin/term",
-                "bterm",
                 "term",
             ]
             .map(std::path::PathBuf::from)

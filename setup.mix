@@ -1,4 +1,4 @@
--- version: 0.2.0
+-- version: 0.2.1
 -- setup.mix — CosMix setup, stage 2. Runs under the `mix` that `bootstrap`
 -- just built; re-run it any time to rebuild and reinstall (idempotent).
 --
@@ -274,7 +274,6 @@ if $want_desktop then
   push($launchers, {dir: "quoin", bin: $qship.bin, exec: "cosmix-quoin", id: "dev.cosmix.quoin"})
   push($launchers, {dir: "term", bin: "term", exec: "term", id: "dev.cosmix.term"})
   push($launchers, {dir: "ced", bin: "ced", exec: "ced", id: "dev.cosmix.ced"})
-  push($launchers, {dir: "bterm", bin: "bterm", exec: "bterm", id: "dev.cosmix.bterm"})
   for each $launcher in $launchers
     $qexec = replace($bin .. "/" .. $launcher.bin, "\\", "\\\\\\\\")
     $qexec = replace($qexec, "\"", "\\\\\"")

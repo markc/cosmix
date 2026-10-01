@@ -1,15 +1,14 @@
 # term — the lightweight terminal
 
-CosMix Term (`apps/term`, binary `term`) is the tabbed Mix terminal on iced
-and wgpu. It is the lightweight frontend over `cosmix-term-core`, the same
-toolkit-free core as the Bevy frontend CosMix BTerm (`bterm`). The two share
-the PTY, the VT grid, the tab and pane model, the glyph raster and the Bus
-handlers. Only the window differs.
+CosMix Term (`apps/term`, binary `term`) is the maintained tabbed Mix terminal
+on iced over the toolkit-free `cosmix-term-core`. It registers the Bus name
+`term` and serves `term.*`. `mix --gui` selects Term; `COSMIX_TERM_BIN` remains
+an explicit binary override.
 
-It registers the Bus name `term` and serves the `term.*` verbs. bterm
-registers `bterm` and serves `bterm.*`, so both can run at once. `mix --gui`
-still prefers bterm until term reaches full verb parity (decisions D6 and
-D10). Set `COSMIX_TERM_BIN` to the `term` binary to launch this one.
+The Bevy BTerm frontend was retired on 2026-10-01. Its source and historical
+comparison gates are preserved at tag `archive/bterm/2026-10-01`. References
+to BTerm below describe the former shared-core implementation, not a shipped
+second frontend.
 
 ## Tabs and panes
 

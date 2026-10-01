@@ -1,5 +1,9 @@
 # Term native control
 
+> BTerm was retired on 2026-10-01. Its source and BTerm-specific gate scripts
+> referenced below are preserved at tag `archive/bterm/2026-10-01`. Term is
+> the maintained frontend; shared native-control contracts remain applicable.
+
 > **Two lanes, and only one of them was renamed.** Since 2026-09-21 (TODO-term
 > D1) a frontend's **global registration is its own name** — `term` for the
 > iced+wgpu frontend, `bterm` for the Bevy one — and the verb namespace

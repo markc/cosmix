@@ -2,7 +2,6 @@
 members = [
     "ctk",
     "apps/studio",
-    "apps/filemgr",
     "apps/tray",
     "apps/trayd",
     "apps/tower",
@@ -15,7 +14,6 @@ members = [
     "apps/bg-showcase",
     "apps/capture",
     "apps/media",
-    "apps/bterm",
     "apps/term",
     "apps/ced",
     "apps/dopus",
