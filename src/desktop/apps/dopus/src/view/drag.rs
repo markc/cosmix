@@ -911,7 +911,7 @@ mod tests {
         list.draw(
             &tree,
             &mut renderer,
-            &iced::Theme::default(),
+            &iced::Theme::Light,
             &renderer::Style::default(),
             Layout::new(&node),
             mouse::Cursor::Unavailable,
