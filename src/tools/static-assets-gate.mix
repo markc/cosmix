@@ -34,7 +34,7 @@ else
   if not re_match($control, "test result: ok[.] [1-9][0-9]* passed") then
     raise("GATE_FEATURE", "CTK app control feature tests did not execute")
   end
-  gate(["cargo", "test", "--locked", "-p", "cosmix-comp", "--lib", "decoration_scene::"], $desktop)
+  gate(["cargo", "test", "--locked", "-p", "cosmix-comp", "--bin", "cosmix-comp", "decoration_scene::"], $desktop)
   gate(["cargo", "clippy", "--locked", "-p", "cosmix-bevy-assets", "-p", "cosmix-iced-widgets", "-p", "cosmix-term-core", "-p", "cosmix-ced", "-p", "cosmix-dopus", "-p", "ctk", "-p", "cosmix-comp", "--all-targets", "--features", "ctk/bus,ctk/theme", "--", "-D", "warnings"], $desktop)
   gate(["cargo", "build", "--locked", "--release", "-p", "cosmix-dopus", "-p", "cosmix-ced", "-p", "cosmix-term", "-p", "cosmix-comp"], $desktop)
 end
@@ -54,7 +54,8 @@ if $g.opts["real-assets"] then
     ["ctk", "installed_roles_select_without_system_fonts_and_preserve_overrides"],
     ["cosmix-comp", "installed_chrome_family_and_emoji_chain_resolve_without_system_fonts"]
   ]
-    $result = run_argv_must(["cargo", "test", "--locked", "-p", $test[0], "--lib", $test[1], "--", "--ignored"], {
+    $target = if $test[0] == "cosmix-comp" then ["--bin", "cosmix-comp"] else ["--lib"] end
+    $result = run_argv_must(concat(["cargo", "test", "--locked", "-p", $test[0]], $target, [$test[1], "--", "--ignored"]), {
       cwd: $desktop, timeout: 1800, max_output: 6000000,
       env: {COSMIX_SHARE: $share, XDG_DATA_HOME: $fixture .. "/user-data", XDG_DATA_DIRS: $fixture .. "/system-data"}
     })
