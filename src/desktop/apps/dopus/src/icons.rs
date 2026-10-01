@@ -571,10 +571,14 @@ mod tests {
                     .filter(|pixel| pixel[3] != 0)
                     .collect();
                 assert!(!ink.is_empty(), "{icon:?}: no ink at scale {scale}");
+                // iced-tiny-skia targets a native BGRA surface: GlyphCache
+                // writes ColorU8(b, g, r, alpha), like engine::into_color.
+                // This differs from the RGBA pixmap used by resvg above.
                 assert!(
                     ink.iter()
-                        .all(|pixel| pixel[0] > 0 && pixel[1] == 0 && pixel[2] == 0),
-                    "{icon:?}: tint differs at scale {scale}"
+                        .all(|pixel| pixel[2] > 0 && pixel[1] == 0 && pixel[0] == 0),
+                    "{icon:?}: BGRA tint differs at scale {scale}; first ink {:?}",
+                    ink.first()
                 );
             }
         }
