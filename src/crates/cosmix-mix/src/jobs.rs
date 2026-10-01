@@ -58,6 +58,17 @@ impl JobTable {
         }
     }
 
+    /// True once the controller has admitted a shutdown and will not serve
+    /// another prompt. A table without an interactive controller never
+    /// closes through job control.
+    pub fn closing(&self) -> bool {
+        if let crate::job_control::ExecutionPolicy::Interactive { controller, .. } = &self.policy {
+            controller.closing()
+        } else {
+            false
+        }
+    }
+
     pub fn bg(&self, id: Option<usize>) {
         if let crate::job_control::ExecutionPolicy::Interactive { controller, .. } = &self.policy {
             if let Err(e) = controller.background_job(id) {

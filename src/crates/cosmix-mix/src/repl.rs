@@ -426,6 +426,18 @@ pub fn run_repl() -> i32 {
         // snapshot in readline() is the sane one.
         ensure_interactive_output_mode();
 
+        if job_table.closing() {
+            // HUP shutdown belongs to the job monitor: it will restore the
+            // retained slave from shell_modes, sweep owned children and
+            // will exit(129) (job_control.rs HUP branch). Re-entering the
+            // editor would re-assert raw mode after that restore, so park
+            // without terminal writes and wait for the monitor's exit. The
+            // loop tolerates spurious wakeups.
+            loop {
+                std::thread::park();
+            }
+        }
+
         match rl.readline(&prompt, !line_buf.is_empty()) {
             Ok(input) => {
                 // An admitted submission arrives with its identity already

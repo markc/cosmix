@@ -413,6 +413,47 @@ impl Pty {
         self.send("\x04");
         wait_for(|| self.shell.try_wait().unwrap().is_some());
     }
+    /// Collect output already waiting on the master without blocking. This
+    /// process keeps the slave open, so the master never reaches EOF and a
+    /// blocking read could hang: drain under O_NONBLOCK, then put the
+    /// original flags back for any later use of the same fd. The byte cap
+    /// bounds the drain even if a writer kept the buffer full.
+    fn drain_master(&mut self) -> String {
+        const DRAIN_CAP: usize = 64 * 1024;
+        let fd = self.master.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(
+            flags >= 0,
+            "master F_GETFL: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0,
+            "master F_SETFL O_NONBLOCK"
+        );
+        let mut collected = String::new();
+        let mut buf = [0; 4096];
+        let deadline = Instant::now() + LIMIT;
+        while collected.len() < DRAIN_CAP {
+            assert!(Instant::now() < deadline, "master drain deadline");
+            match self.master.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => collected.push_str(&String::from_utf8_lossy(&buf[..n])),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => panic!("master drain: {e}"),
+            }
+        }
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFL, flags) }, 0);
+        assert!(
+            collected.len() < DRAIN_CAP,
+            "master output exceeds drain cap"
+        );
+        let mut drained = std::mem::take(&mut self.pending);
+        drained.push_str(&collected);
+        drained
+    }
 }
 impl Drop for Pty {
     fn drop(&mut self) {
@@ -816,26 +857,41 @@ fn source_shares_background_controller_and_hup_reaps_owned_jobs() {
 #[test]
 fn hup_restores_retained_slave_after_foreground_raw_leak() {
     let _fixture = fixture_guard();
-    let mut p = Pty::new(&[], false, true);
-    let original = p.initial_modes;
-    p.until(PROMPT);
-    p.send(&format!("{}\n", p.fixture("raw-hold", "raw-hup")));
-    let child = p.report("raw-hup");
-    wait_for(|| p.home.path().join("raw-hup.raw").exists());
-    assert_eq!(tty_modes(p.slave.as_raw_fd()).c_lflag & libc::ICANON, 0);
-    assert_eq!(tty_modes(p.slave.as_raw_fd()).c_oflag & libc::OPOST, 0);
-    unsafe {
-        libc::kill(p.shell.id() as i32, libc::SIGHUP);
+    // Repetition increases the likelihood of exposing the restore/editor
+    // re-entry race; scheduling observations are not proof of its absence.
+    for _ in 0..8 {
+        let mut p = Pty::new(&[], false, true);
+        let original = p.initial_modes;
+        p.until(PROMPT);
+        p.send(&format!("{}\n", p.fixture("raw-hold", "raw-hup")));
+        let child = p.report("raw-hup");
+        wait_for(|| p.home.path().join("raw-hup.raw").exists());
+        assert_eq!(tty_modes(p.slave.as_raw_fd()).c_lflag & libc::ICANON, 0);
+        assert_eq!(tty_modes(p.slave.as_raw_fd()).c_oflag & libc::OPOST, 0);
+        unsafe {
+            libc::kill(p.shell.id() as i32, libc::SIGHUP);
+        }
+        wait_for(|| p.shell.try_wait().unwrap().is_some());
+        assert_eq!(p.shell.wait().unwrap().code(), Some(129));
+        let restored = tty_modes(p.slave.as_raw_fd());
+        assert_eq!(restored.c_iflag, original.c_iflag);
+        assert_eq!(restored.c_oflag, original.c_oflag);
+        assert_eq!(restored.c_cflag, original.c_cflag);
+        assert_eq!(restored.c_lflag, original.c_lflag);
+        assert_eq!(restored.c_cc, original.c_cc);
+        assert!(!alive(child[0]));
+        // Mechanism pin for the re-entry contract: readline emits a
+        // bracketed-paste enable (\x1b[?2004h) on every editor entry, and
+        // the only one so far came with the initial prompt consumed above.
+        // One appearing in the output already available at shell exit
+        // proves the main thread re-entered the editor during HUP shutdown,
+        // which can overwrite the monitor's restored terminal modes.
+        let drained = p.drain_master();
+        assert!(
+            !drained.contains("\x1b[?2004h"),
+            "editor re-entered after HUP restore: {drained:?}"
+        );
     }
-    wait_for(|| p.shell.try_wait().unwrap().is_some());
-    assert_eq!(p.shell.wait().unwrap().code(), Some(129));
-    let restored = tty_modes(p.slave.as_raw_fd());
-    assert_eq!(restored.c_iflag, original.c_iflag);
-    assert_eq!(restored.c_oflag, original.c_oflag);
-    assert_eq!(restored.c_cflag, original.c_cflag);
-    assert_eq!(restored.c_lflag, original.c_lflag);
-    assert_eq!(restored.c_cc, original.c_cc);
-    assert!(!alive(child[0]));
 }
 
 #[test]

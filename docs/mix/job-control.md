@@ -46,6 +46,11 @@ so background terminal reads stop the shell rather than spinning on EINTR.
 The managed-foreground flag changes only after successful terminal transfers;
 a failed reclaim leaves it set.
 
+From Mix 0.109.2, a foreground job reaped during SIGHUP shutdown cannot
+return to another prompt. The evaluator waits for the job monitor's exit
+instead of re-entering the editor and overwriting restored terminal modes.
+The monitor owns the final restoration, owned-child sweep and exit status 129.
+
 On normal shell exit or SIGHUP, Mix sends HUP followed by CONT to its owned
 live jobs and allows 500 ms for exit/reaping. Survivors are reported; there
 is no forced-kill escalation or guarantee about deliberately detached

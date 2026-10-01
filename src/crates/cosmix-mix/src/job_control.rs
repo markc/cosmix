@@ -759,6 +759,12 @@ impl Controller {
                     .any(|m| matches!(m.state, MemberState::Stopped(_)))
             })
     }
+    /// True once shutdown has been admitted — `shutdown()` for a normal
+    /// exit/EOF, `close_jobs` on the HUP path. The monitor reaps jobs in both
+    /// cases; on HUP it also restores the terminal and exits the process.
+    pub fn closing(&self) -> bool {
+        self.shared.state.lock().unwrap().closing
+    }
     pub fn shutdown(&self) {
         let mut state = self.shared.state.lock().unwrap();
         state.closing = true;
