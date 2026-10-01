@@ -79,6 +79,12 @@ defaults. Never hardcode an install path.
   migration targets using `cosmix-iced-widgets` and the shared asset system;
   do not add Quoin-like panel furniture to individual apps. See
   `src/desktop/APPS.md` for the layout policy and legacy migration scope.
+- Avoid duplicate Bevy runtimes for desktop furniture. Quoin must either
+  share the compositor's Bevy renderer through embedding or use iced as a
+  standalone native Wayland shell. A separate Bevy Quoin is not an accepted
+  end state. Studio is the authorised performance exception; any further
+  separate Bevy instance needs a concrete essential workload and measured
+  justification. GPU scene content alone does not justify another runtime.
 - Version-bump a crate when a consumer would observe the change.
 - Every binary answers `--version` and `-V` and exits 0 before any other side
   effect: no async runtime, config read, logging, display check, Bus connect,

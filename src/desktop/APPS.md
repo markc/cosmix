@@ -71,8 +71,18 @@ existing Bus contracts and behaviour, and use the shared font/icon assets.
 Quoin has both a standalone layer-shell host and an in-process compositor
 implementation. The latter is selected by `cosmix-comp`'s `embedded-quoin`
 feature and installs `EmbeddedQuoinPlugin`; it is not a default compositor
-feature. Quoin's compositor furniture is a separate renderer decision from
-the five application ports and can retain Bevy when embedded.
+feature. The accepted Quoin end states are embedded Bevy sharing the
+compositor's renderer, or standalone iced with a native Wayland layer-shell
+host. A separate Bevy Quoin is not an accepted end state. Evaluate the
+existing embedded implementation first, preserving panel behaviour and the
+compositor frame budget; an iced port is the alternative.
+
+Additional standalone Bevy runtimes require an essential workload and
+measured justification. Studio is the authorised performance exception.
+Retaining Bevy for background scene content does not automatically justify
+a separate runtime; sharing the compositor renderer must be evaluated.
+Memory and responsiveness must be measured on matching workloads rather
+than inferred from the toolkit or the number of mixer strips alone.
 
 InteractGUI is the persistent GUI presenter for `interactd` dialogs, registered
 as Bus service `interact-gui`. It renders messages, confirmations, prompts,

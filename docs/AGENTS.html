@@ -512,6 +512,12 @@ Studio retains CTK; Tower, BusViewer, Mail, InteractGUI and Media are iced
 migration targets using <code>cosmix-iced-widgets</code> and the shared asset system;
 do not add Quoin-like panel furniture to individual apps. See
 <code>src/desktop/APPS.md</code> for the layout policy and legacy migration scope.</li>
+<li>Avoid duplicate Bevy runtimes for desktop furniture. Quoin must either
+share the compositor's Bevy renderer through embedding or use iced as a
+standalone native Wayland shell. A separate Bevy Quoin is not an accepted
+end state. Studio is the authorised performance exception; any further
+separate Bevy instance needs a concrete essential workload and measured
+justification. GPU scene content alone does not justify another runtime.</li>
 <li>Version-bump a crate when a consumer would observe the change.</li>
 <li>Every binary answers <code>--version</code> and <code>-V</code> and exits 0 before any other side
 effect: no async runtime, config read, logging, display check, Bus connect,
