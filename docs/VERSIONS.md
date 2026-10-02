@@ -64,7 +64,8 @@ CoS — substrate libraries and daemon family
 | `cosmix-interactd` | 0.5.2 |
 | `cosmix-interaction-broker` | 0.5.0 |
 | `cosmix-interaction-schema` | 0.6.0 |
-| `cosmix-lib-config` | 0.8.6 |
+| `cosmix-lib-assets` | 0.1.0 |
+| `cosmix-lib-config` | 0.8.7 |
 | `cosmix-lib-daemon` | 0.7.1 |
 | `cosmix-lib-davproto` | 0.1.2 |
 | `cosmix-lib-dns` | 0.3.0 |
@@ -93,7 +94,7 @@ CoS — substrate libraries and daemon family
 | `cosmix-nspawnd` | 0.2.3 |
 | `cosmix-powerd` | 0.1.1 |
 | `cosmix-song` | 0.2.0 |
-| `cosmix-webd` | 0.12.0 |
+| `cosmix-webd` | 0.12.1 |
 | `cosmix-wgd` | 0.4.3 |
 
 ## desktop
@@ -102,40 +103,41 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 
 | crate | version |
 |---|---|
+| `cosmix-bevy-assets` | 0.1.0 |
 | `cosmix-bg-boing` | 0.1.0 |
 | `cosmix-bg-showcase` | 0.2.6 |
 | `cosmix-busviewer` | 0.1.2 |
 | `cosmix-capture` | 0.2.4 |
-| `cosmix-ced` | 0.1.4 |
-| `cosmix-comp` | 0.72.4 |
+| `cosmix-ced` | 0.1.5 |
+| `cosmix-comp` | 0.72.5 |
 | `cosmix-deco` | 0.4.1 |
 | `cosmix-design` | 0.17.1 |
-| `cosmix-dopus` | 0.3.3 |
-| `cosmix-dopus-core` | 0.3.2 |
+| `cosmix-dopus` | 0.4.2 |
+| `cosmix-dopus-core` | 0.4.0 |
 | `cosmix-flock` | 0.1.0 |
-| `cosmix-iced-widgets` | 0.1.5 |
+| `cosmix-iced-widgets` | 0.1.7 |
 | `cosmix-imeprobe` | 0.2.1 |
 | `cosmix-interactgui` | 0.1.3 |
 | `cosmix-mail` | 0.1.1 |
 | `cosmix-media` | 0.1.3 |
-| `cosmix-quoin` | 0.20.2 |
+| `cosmix-quoin` | 0.20.3 |
 | `cosmix-scene` | 0.6.0 |
 | `cosmix-scene-bevy` | 0.7.1 |
 | `cosmix-shell` | 0.19.0 |
 | `cosmix-shell-host` | 0.11.2 |
 | `cosmix-studio` | 0.4.8 |
-| `cosmix-term` | 0.3.3 |
-| `cosmix-term-core` | 0.8.3 |
+| `cosmix-term` | 0.3.4 |
+| `cosmix-term-core` | 0.8.4 |
 | `cosmix-tower` | 0.5.5 |
 | `cosmix-tray` | 0.3.2 |
 | `cosmix-trayd` | 0.6.3 |
 | `cosmix-wallpaper` | 0.2.1 |
 | `cosmix-wgpu-dmabuf` | 0.16.2 |
 | `cosmix-wl-dnd` | 0.4.3 |
-| `ctk` | 0.58.1 |
+| `ctk` | 0.58.2 |
 | `spike-wl-dnd` | 0.1.1 |
 | `term-native-test-broker` | 0.0.0 |
 
 ---
 
-55 crates in `$COSMIX/src` and 35 in the separate `$COSMIX/src/desktop` workspace.
+56 crates in `$COSMIX/src` and 34 in the separate `$COSMIX/src/desktop` workspace.
