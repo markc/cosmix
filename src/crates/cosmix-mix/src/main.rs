@@ -317,6 +317,61 @@ async fn shutdown_signal() -> i32 {
     signal
 }
 
+/// Longest a non-interactive mix may outlive a SIGTERM before the backstop
+/// forces it out. Must exceed the slowest graceful path: `--serve` spends up
+/// to `DEREGISTER_GRACE` (5 s) + `CLASSC_DRAIN_GRACE` (5 s) + the owned-spawn
+/// `SWEEP_GRACE` (2 s). `MIX_SIGTERM_BACKSTOP_SECS` overrides it.
+const SIGTERM_BACKSTOP_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Make SIGTERM final in non-interactive modes (script, `-c`, `--serve`).
+///
+/// tokio's SIGTERM handler replaces the default terminate disposition, and
+/// on the current-thread runtime delivery is only a wake-up for the
+/// `shutdown_signal()` arm of a `select!`. A builtin blocked in a synchronous
+/// syscall — `append_file` opening a FIFO nobody reads — holds that one
+/// thread, the arm is never polled, and the process ignores SIGTERM for ever
+/// (`desk_scenes_gate.mix` sat a week under `timeout 10`, 2026-10-02).
+///
+/// This thread hears the same signal through signal_hook (it chains with
+/// tokio's handler), gives the graceful path its grace, then sweeps owned
+/// children and exits 128+SIGTERM. A graceful exit inside the grace never
+/// reaches it. The REPL is not armed: an interactive shell ignores SIGTERM.
+fn arm_sigterm_backstop() {
+    static ARMED: std::sync::Once = std::sync::Once::new();
+    ARMED.call_once(|| {
+        let grace = env::var("MIX_SIGTERM_BACKSTOP_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(std::time::Duration::from_secs)
+            .unwrap_or(SIGTERM_BACKSTOP_GRACE);
+        let mut signals = match signal_hook::iterator::Signals::new([libc::SIGTERM]) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("mix: failed to arm SIGTERM backstop: {e}");
+                return;
+            }
+        };
+        let spawned = std::thread::Builder::new()
+            .name("mix-sigterm-backstop".into())
+            .spawn(move || {
+                if signals.forever().next().is_none() {
+                    return;
+                }
+                std::thread::sleep(grace);
+                eprintln!(
+                    "mix: SIGTERM not honoured within {}s (evaluation blocked in a system call); forcing exit",
+                    grace.as_secs()
+                );
+                owned_spawns_sweep();
+                session_task::sweep();
+                process::exit(128 + libc::SIGTERM);
+            });
+        if let Err(e) = spawned {
+            eprintln!("mix: failed to arm SIGTERM backstop: {e}");
+        }
+    });
+}
+
 fn print_help() {
     // Single source of truth shared with the `mix help` subcommand / REPL:
     // a markdown-friendly discovery overview that signposts `mix builtins`
@@ -627,6 +682,7 @@ fn run_source(
     // Remember the source (keyed by the same filename the frames carry) so an
     // uncaught error can show its offending line.
     set_entry_source(filename.map(str::to_string), source);
+    arm_sigterm_backstop();
     let rt = build_runtime();
 
     // SPEC 18 Phase 2 WS3-C.7d — wrap the whole `block_on` body in a
@@ -762,6 +818,7 @@ fn run_command_line(
     // `-c`/stdin has no file, so its frames carry `file: None`; store under
     // `None` to match, enabling the offending-line footer for `-c` too.
     set_entry_source(None, code);
+    arm_sigterm_backstop();
     let rt = build_runtime();
     let local = tokio::task::LocalSet::new();
     let (exit_code, stats) = rt.block_on(local.run_until(async {
@@ -1309,6 +1366,7 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
     // subscriber guards + the live-reload handle. Dropping it on
     // `run_serve` return flushes pending log writes.
     let _log = init_serve_tracing();
+    arm_sigterm_backstop();
 
     // Anchor the script path to an absolute one BEFORE any script code runs:
     // a citizen's init body may `chdir`, and RELOAD re-reads this path — a
