@@ -10,6 +10,7 @@
 use cosmix_mix::value::Value;
 use std::fs;
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use tar::{Builder, Header};
@@ -42,6 +43,32 @@ fn tmpdir(tag: &str) -> PathBuf {
     ));
     fs::create_dir_all(&d).unwrap();
     d
+}
+
+/// Append ONE raw 512-byte tar header block (hand-packed so hostile names
+/// the Builder refuses — absolute, `..` — can still be crafted) plus its
+/// data and the two zero end-blocks.
+fn append_raw_member(mut w: impl Write, name: &str, data: &[u8]) {
+    let mut h = [0u8; 512];
+    h[..name.len()].copy_from_slice(name.as_bytes());
+    h[100..108].copy_from_slice(b"0000644\0"); // mode
+    h[108..116].copy_from_slice(b"0000000\0"); // uid
+    h[116..124].copy_from_slice(b"0000000\0"); // gid
+    let size = format!("{:011o}\0", data.len());
+    h[124..136].copy_from_slice(size.as_bytes());
+    h[136..148].copy_from_slice(b"00000000000\0"); // mtime
+    h[148..156].copy_from_slice(b"        "); // chksum placeholder: spaces
+    h[156] = b'0'; // typeflag: regular
+    h[257..263].copy_from_slice(b"ustar\0");
+    h[263..265].copy_from_slice(b"00");
+    let sum: u32 = h.iter().map(|&b| b as u32).sum();
+    let chk = format!("{:06o}\0 ", sum);
+    h[148..156].copy_from_slice(chk.as_bytes());
+    w.write_all(&h).unwrap();
+    w.write_all(data).unwrap();
+    let pad = (512 - data.len() % 512) % 512;
+    w.write_all(&vec![0u8; pad]).unwrap();
+    w.write_all(&[0u8; 1024]).unwrap(); // two end blocks
 }
 
 /// Build a plain-tar archive from (name, bytes, mode) triples.
@@ -93,8 +120,8 @@ async fn roundtrip_all_codecs() {
         ))
         .await;
         let names = match list {
-            Value::List(items) => items
-                .into_iter()
+            Value::List(ref items) => items
+                .iter()
                 .map(|v| match v {
                     Value::Map(m) => m.get("name").unwrap().to_mix_string(),
                     other => panic!("entry not a map: {other:?}"),
@@ -150,7 +177,8 @@ async fn pack_is_deterministic() {
 async fn refuse_parent_traversal() {
     let d = tmpdir("trav");
     let arc = d.join("evil.tar");
-    build_plain(&arc, &[("../escape.txt", b"gotcha", 0o644)]);
+    let f = fs::File::create(&arc).unwrap();
+    append_raw_member(f, "../escape.txt", b"gotcha");
     let err = run_err(&format!(
         "tar_unpack(\"{}\", \"{}\", {{codec:\"none\"}})",
         arc.display(),
@@ -165,7 +193,8 @@ async fn refuse_parent_traversal() {
 async fn refuse_absolute_member() {
     let d = tmpdir("abs");
     let arc = d.join("evil.tar");
-    build_plain(&arc, &[("/etc/gotcha", b"no", 0o644)]);
+    let f = fs::File::create(&arc).unwrap();
+    append_raw_member(f, "/etc/gotcha", b"no");
     let err = run_err(&format!(
         "tar_unpack(\"{}\", \"{}\", {{codec:\"none\"}})",
         arc.display(),
@@ -288,7 +317,11 @@ async fn refuse_truncated_gzip() {
     let d = tmpdir("trunc");
     let src = d.join("src");
     fs::create_dir_all(&src).unwrap();
-    fs::write(src.join("data"), vec![7u8; 50_000]).unwrap();
+    let mut payload = Vec::with_capacity(50_000);
+    for i in 0..50_000u32 {
+        payload.push(((i * 31 + (i >> 3) * 7) % 251) as u8);
+    }
+    fs::write(src.join("data"), &payload).unwrap();
     let arc = d.join("data.tar.gz");
     run_ok(&format!(
         "tar_pack(\"{}\", \"{}\", {{codec:\"gzip\"}})",
@@ -297,6 +330,7 @@ async fn refuse_truncated_gzip() {
     ))
     .await;
     let full = fs::read(&arc).unwrap();
+    assert!(full.len() > 400, "gzip payload too small to truncate: {}", full.len());
     fs::write(&arc, &full[..full.len() - 200]).unwrap();
     let err = run_err(&format!(
         "tar_unpack(\"{}\", \"{}\", {{codec:\"gzip\"}})",
@@ -447,7 +481,7 @@ async fn capability_roundtrip_as_root() {
         let c = std::ffi::CString::new(prog.as_os_str().as_bytes()).unwrap();
         let r = libc::setxattr(
             c.as_ptr(),
-            b"security.capability\0".as_ptr() as *const libc::c_char,
+            c"security.capability".as_ptr(),
             cap.as_ptr() as *const libc::c_void,
             cap.len(),
             0,
@@ -477,7 +511,7 @@ async fn capability_roundtrip_as_root() {
         let c = std::ffi::CString::new(dest.join("prog").as_os_str().as_bytes()).unwrap();
         libc::getxattr(
             c.as_ptr(),
-            b"security.capability\0".as_ptr() as *const libc::c_char,
+            c"security.capability".as_ptr(),
             got.as_mut_ptr() as *mut libc::c_void,
             got.len(),
         )

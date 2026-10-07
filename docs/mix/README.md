@@ -54,6 +54,7 @@ rot. `mix man syntax` is the mental model; gotchas is the corrections.
 - **[dates & time](datetime.md)** — `time`/`date_format`/`now_iso`/`duration_format`.
 - **[http](http.md)** — `http_get`/`http_post`/`http_request`, deadlines.
 - **[datastar](datastar.md)** — `ds_*` SSE event framing.
+- **[archives](tar.md)** — `tar_list`/`tar_unpack`/`tar_pack`, zstd/gzip/none, safe staged extraction.
 
 ## Mesh & runtime
 

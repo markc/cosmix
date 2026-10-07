@@ -33,9 +33,6 @@ url = ["dep:url"]
 crypto = ["dep:blake3", "dep:sha2", "dep:sha1", "dep:md-5", "dep:base64", "dep:uuid", "dep:bcrypt", "dep:sha-crypt", "dep:ring", "dep:rustls-pemfile"]
 http = ["dep:ureq", "dep:webpki-roots", "dep:rustls-pemfile", "dep:blake3"]
 sqlite = ["dep:rusqlite"]
-tar = { version = "0.4.46", optional = true }
-structured-zstd = { version = "0.0.58", optional = true }
-flate2 = { version = "1.1", default-features = true, optional = true }
 # `tokio-sleep` is an alias-only feature kept for backwards
 # compatibility with consumers that still list
 # `features = ["tokio-sleep"]`. tokio itself is now unconditional
@@ -170,6 +167,9 @@ ureq = { version = "2", optional = true }
 webpki-roots = { version = "0.26", optional = true }
 rustls-pemfile = { version = "2", optional = true }
 rusqlite = { workspace = true, optional = true }
+tar = { version = "0.4.46", optional = true }
+structured-zstd = { version = "0.0.58", optional = true }
+flate2 = { version = "1.1", default-features = true, optional = true }
 url = { version = "2", optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
 # `dkim` feature only — keygen path. Pinned to the same 0.7 line as

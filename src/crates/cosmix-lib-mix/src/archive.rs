@@ -36,12 +36,12 @@
 //! second frame never decodes, so only the source position can see it).
 
 use crate::builtins::{opt_invalid, sanitize_for_diag};
-use crate::error::MixError;
+use crate::error::{MixError, MixResult};
 use crate::value::Value;
 use indexmap::IndexMap;
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
@@ -116,10 +116,11 @@ fn count_opt(caller: &str, name: &str, v: Option<&Value>) -> Result<Option<u64>,
     }
 }
 
-/// structured-zstd 0.0.58 exposes named presets, not a 1..=22 continuum —
-/// accept the preset numbers only; the receipt names the preset used, never
-/// a fictional level.
-const ZSTD_PRESETS: &[i32] = &[1, 3, 7, 11];
+/// zstd levels 1..=22 (C numbering, `CompressionLevel::Level`). 22 is the
+/// cap because its window (2^27) is exactly the pinned builtin decoder's
+/// ceiling — anything the builtin PACKS, the builtin can unpack.
+const ZSTD_MIN_LEVEL: i32 = 1;
+const ZSTD_MAX_LEVEL: i32 = 22;
 
 struct UnpackOpts {
     codec: Codec,
@@ -192,7 +193,12 @@ impl Read for LimitedRead<'_> {
 
 enum VerifiedDecode {
     Zstd {
-        dec: structured_zstd::decoding::StreamingDecoder<BufReader<File>>,
+        dec: Box<
+            structured_zstd::decoding::StreamingDecoder<
+                BufReader<File>,
+                structured_zstd::decoding::FrameDecoder,
+            >,
+        >,
     },
     Gzip {
         dec: flate2::read::GzDecoder<BufReader<File>>,
@@ -209,9 +215,15 @@ impl VerifiedDecode {
         let br = BufReader::with_capacity(1 << 20, file);
         Ok(match codec {
             Codec::Zstd => VerifiedDecode::Zstd {
-                dec: structured_zstd::decoding::StreamingDecoder::new(br).map_err(|e| {
-                    runtime(format!("{caller}: zstd init '{}': {e}", path.display()))
-                })?,
+                dec: Box::new(
+                    structured_zstd::decoding::StreamingDecoder::new(br)
+                        .map_err(|e| {
+                            runtime(format!(
+                                "{caller}: zstd init '{}': {e}",
+                                path.display()
+                            ))
+                        })?,
+                ),
             },
             Codec::Gzip => VerifiedDecode::Gzip {
                 dec: flate2::read::GzDecoder::new(br),
@@ -360,10 +372,10 @@ pub fn builtin_tar_list(args: Vec<Value>) -> MixResult<Option<Value>> {
                 count_opt(caller, "max_stream_bytes", m.get("max_stream_bytes"))?
                     .unwrap_or(opts.max_stream_bytes);
             opts.max_name =
-                count_opt(caller, "max_name", m.get("max_name"))?.unwrap_or(opts.max_name) as usize;
+                count_opt(caller, "max_name", m.get("max_name"))?.unwrap_or(opts.max_name as u64) as usize;
             known_keys_check(caller, m, &["codec", "max_stream_bytes", "max_name"])?;
         }
-        other => {
+        Some(other) => {
             return Err(opt_invalid(
                 caller,
                 format!("options must be a map or nil, got {}", other.type_name()),
@@ -372,19 +384,20 @@ pub fn builtin_tar_list(args: Vec<Value>) -> MixResult<Option<Value>> {
     }
 
     let mut dec = VerifiedDecode::open(Path::new(&path), opts.codec, caller)?;
-    let mut limited = LimitedRead {
-        inner: &mut dec,
-        remaining: opts.max_stream_bytes,
-        caller: caller.to_string(),
-    };
-    let mut archive = Archive::new(&mut limited);
     let mut out: Vec<Value> = Vec::new();
     let mut count: u64 = 0;
-    let iter = archive
-        .entries()
-        .map_err(|e| runtime(format!("{caller}: {e}")))?;
-    for entry in iter {
-        let entry = entry.map_err(|e| runtime(format!("{caller}: {e}")))?;
+    {
+        let mut limited = LimitedRead {
+            inner: &mut dec,
+            remaining: opts.max_stream_bytes,
+            caller: caller.to_string(),
+        };
+        let mut archive = Archive::new(&mut limited);
+        let iter = archive
+            .entries()
+            .map_err(|e| runtime(format!("{caller}: {e}")))?;
+        for entry in iter {
+            let entry = entry.map_err(|e| runtime(format!("{caller}: {e}")))?;
         count += 1;
         if count > opts.max_entries {
             return Err(runtime(format!(
@@ -415,11 +428,11 @@ pub fn builtin_tar_list(args: Vec<Value>) -> MixResult<Option<Value>> {
             "kind".to_string(),
             Value::String(kind_str(header.entry_type()).to_string()),
         );
-        out.push(Value::Map(map));
+        out.push(Value::Map(std::rc::Rc::new(map)));
+        }
     }
-    drop(archive);
     dec.drain(caller)?;
-    Ok(Some(Value::List(out)))
+    Ok(Some(Value::List(std::rc::Rc::new(out))))
 }
 
 fn kind_str(t: EntryType) -> &'static str {
@@ -467,7 +480,7 @@ pub fn builtin_tar_unpack(args: Vec<Value>) -> MixResult<Option<Value>> {
             opts.max_bytes =
                 count_opt(caller, "max_bytes", m.get("max_bytes"))?.unwrap_or(opts.max_bytes);
             opts.max_name =
-                count_opt(caller, "max_name", m.get("max_name"))?.unwrap_or(opts.max_name) as usize;
+                count_opt(caller, "max_name", m.get("max_name"))?.unwrap_or(opts.max_name as u64) as usize;
             opts.max_stream_bytes =
                 count_opt(caller, "max_stream_bytes", m.get("max_stream_bytes"))?
                     .unwrap_or(opts.max_stream_bytes);
@@ -486,7 +499,7 @@ pub fn builtin_tar_unpack(args: Vec<Value>) -> MixResult<Option<Value>> {
                 ],
             )?;
         }
-        other => {
+        Some(other) => {
             return Err(opt_invalid(
                 caller,
                 format!("options must be a map or nil, got {}", other.type_name()),
@@ -526,7 +539,7 @@ pub fn builtin_tar_unpack(args: Vec<Value>) -> MixResult<Option<Value>> {
                 let _ = fs::remove_dir_all(&staging);
                 runtime(format!("{caller}: commit '{dest}': {e}"))
             })?;
-            Ok(Some(Value::Map(receipt)))
+            Ok(Some(Value::Map(std::rc::Rc::new(receipt))))
         }
         Err(e) => {
             let _ = fs::remove_dir_all(&staging);
@@ -555,16 +568,6 @@ fn unpack_staged(
     caller: &str,
 ) -> MixResult<IndexMap<String, Value>> {
     let mut dec = VerifiedDecode::open(Path::new(path), opts.codec, caller)?;
-    let mut limited = LimitedRead {
-        inner: &mut dec,
-        remaining: opts.max_stream_bytes,
-        caller: caller.to_string(),
-    };
-    let mut archive = Archive::new(&mut limited);
-    let iter = archive
-        .entries()
-        .map_err(|e| runtime(format!("{caller}: {e}")))?;
-
     let mut files: u64 = 0;
     let mut dirs: u64 = 0;
     let mut symlinks: u64 = 0;
@@ -575,6 +578,16 @@ fn unpack_staged(
     let mut symlinks_created: HashSet<PathBuf> = HashSet::new();
     let mut extracted_files: HashSet<PathBuf> = HashSet::new();
     let mut deferred: Vec<DeferredMeta> = Vec::new();
+    {
+    let mut limited = LimitedRead {
+        inner: &mut dec,
+        remaining: opts.max_stream_bytes,
+        caller: caller.to_string(),
+    };
+    let mut archive = Archive::new(&mut limited);
+    let iter = archive
+        .entries()
+        .map_err(|e| runtime(format!("{caller}: {e}")))?;
 
     for entry in iter {
         let mut entry = entry.map_err(|e| runtime(format!("{caller}: {e}")))?;
@@ -660,11 +673,12 @@ fn unpack_staged(
             EntryType::Symlink => {
                 let target = entry
                     .link_name()
+                    .map_err(|e| runtime(format!("{caller}: link name: {e}")))?
                     .ok_or_else(|| {
                         runtime(format!("{caller}: symlink '{}' has no target", rel.display()))
                     })?
                     .clone();
-                let clean = clean_link_target(caller, &rel.to_string_lossy(), &target, opts.max_name)?;
+                let clean = clean_link_target(caller, &rel.to_string_lossy(), target.as_os_str(), opts.max_name)?;
                 std::os::unix::fs::symlink(&clean, &target_abs)
                     .map_err(|e| runtime(format!("{caller}: symlink '{}': {e}", rel.display())))?;
                 symlinks += 1;
@@ -676,11 +690,12 @@ fn unpack_staged(
             EntryType::Link => {
                 let target = entry
                     .link_name()
+                    .map_err(|e| runtime(format!("{caller}: link name: {e}")))?
                     .ok_or_else(|| {
                         runtime(format!("{caller}: hardlink '{}' has no target", rel.display()))
                     })?
                     .clone();
-                let clean_target = clean_member(caller, &target.to_path_buf(), opts.max_name)?;
+                let clean_target = clean_member(caller, &target, opts.max_name)?;
                 if !extracted_files.contains(&clean_target) {
                     return Err(runtime(format!(
                         "{caller}: hardlink '{}' targets '{}' which is not an earlier \
@@ -702,7 +717,7 @@ fn unpack_staged(
             }
         }
     }
-    drop(archive);
+    }
     let trailing = dec.drain(caller)?;
 
     // Deferred metadata, children-first so directory mtimes stick, never
@@ -753,7 +768,7 @@ fn apply_pax_xattrs<E: Read>(
     };
     let mut restored = 0u64;
     for kv in pax.flatten() {
-        let key = kv.key();
+        let key = kv.key_bytes();
         if !key.starts_with(b"SCHILY.xattr.") {
             continue;
         }
@@ -767,12 +782,13 @@ fn apply_pax_xattrs<E: Read>(
         };
         let cpath = std::ffi::CString::new(target_abs.as_os_str().as_bytes())
             .map_err(|_| runtime(format!("{caller}: member path contains NUL")))?;
+        let value = kv.value_bytes();
         let rc = unsafe {
             libc::lsetxattr(
                 cpath.as_ptr(),
                 cname.as_ptr(),
-                kv.value().as_ptr() as *const libc::c_void,
-                kv.value().len(),
+                value.as_ptr() as *const libc::c_void,
+                value.len(),
                 0,
             )
         };
@@ -851,15 +867,19 @@ pub fn builtin_tar_pack(args: Vec<Value>) -> MixResult<Option<Value>> {
             }
             if let Some(v) = m.get("level") {
                 match v {
-                    Value::Number(n) if ZSTD_PRESETS.contains(&(*n as i32)) => {
+                    Value::Number(n)
+                        if *n >= ZSTD_MIN_LEVEL as f64
+                            && *n <= ZSTD_MAX_LEVEL as f64
+                            && n.fract() == 0.0 =>
+                    {
                         opts.level = *n as i32;
                     }
                     _ => {
                         return Err(opt_invalid(
                             caller,
                             format!(
-                                "level must be one of the structured-zstd presets 1/3/7/11 \
-                                 (gzip clamps 11 to 9), got {}",
+                                "level must be a whole number 1..=22 (C zstd numbering; \
+                                 gzip clamps above 9), got {}",
                                 v.type_name()
                             ),
                         ));
@@ -871,7 +891,7 @@ pub fn builtin_tar_pack(args: Vec<Value>) -> MixResult<Option<Value>> {
             }
             known_keys_check(caller, m, &["codec", "level", "keep_special_bits"])?;
         }
-        other => {
+        Some(other) => {
             return Err(opt_invalid(
                 caller,
                 format!("options must be a map or nil, got {}", other.type_name()),
@@ -885,13 +905,13 @@ pub fn builtin_tar_pack(args: Vec<Value>) -> MixResult<Option<Value>> {
         )));
     }
     let out_path = Path::new(&path);
-    if let Some(parent) = out_path.parent() {
-        if !parent.is_dir() {
-            return Err(runtime(format!(
-                "{caller}: output parent '{}' does not exist",
-                parent.display()
-            )));
-        }
+    if let Some(parent) = out_path.parent()
+        && !parent.is_dir()
+    {
+        return Err(runtime(format!(
+            "{caller}: output parent '{}' does not exist",
+            parent.display()
+        )));
     }
 
     let file = OpenOptions::new()
@@ -902,7 +922,7 @@ pub fn builtin_tar_pack(args: Vec<Value>) -> MixResult<Option<Value>> {
         .map_err(|e| runtime(format!("{caller}: create '{path}': {e}")))?;
     let buf = BufWriter::with_capacity(1 << 20, file);
     match pack_stream(source_path, buf, &opts, caller) {
-        Ok(receipt) => Ok(Some(Value::Map(receipt))),
+        Ok(receipt) => Ok(Some(Value::Map(std::rc::Rc::new(receipt)))),
         Err(e) => {
             let _ = fs::remove_file(out_path);
             Err(e)
@@ -911,8 +931,8 @@ pub fn builtin_tar_pack(args: Vec<Value>) -> MixResult<Option<Value>> {
 }
 
 enum PackSink {
-    Zstd(structured_zstd::encoding::StreamingEncoder<BufWriter<File>>),
-    Gzip(flate2::write::GzEncoder<BufWriter<File>>),
+    Zstd(Box<structured_zstd::encoding::StreamingEncoder<BufWriter<File>>>),
+    Gzip(Box<flate2::write::GzEncoder<BufWriter<File>>>),
     None(BufWriter<File>),
 }
 
@@ -955,20 +975,16 @@ fn pack_stream(
 ) -> MixResult<IndexMap<String, Value>> {
     let sink = match opts.codec {
         Codec::Zstd => {
-            let preset = match opts.level {
-                1 => structured_zstd::encoding::CompressionLevel::Fastest,
-                3 => structured_zstd::encoding::CompressionLevel::Fast,
-                11 => structured_zstd::encoding::CompressionLevel::Best,
-                _ => structured_zstd::encoding::CompressionLevel::Default,
-            };
-            let enc = structured_zstd::encoding::StreamingEncoder::new(buf, preset)
-                .map_err(|e| runtime(format!("{caller}: zstd encode: {e}")))?;
-            PackSink::Zstd(enc)
+            let level =
+                structured_zstd::encoding::CompressionLevel::Level(opts.level);
+            let enc =
+                structured_zstd::encoding::StreamingEncoder::new(buf, level);
+            PackSink::Zstd(Box::new(enc))
         }
-        Codec::Gzip => PackSink::Gzip(flate2::write::GzEncoder::new(
+        Codec::Gzip => PackSink::Gzip(Box::new(flate2::write::GzEncoder::new(
             buf,
             flate2::Compression::new(opts.level.min(9) as u32),
-        )),
+        ))),
         Codec::None => PackSink::None(buf),
     };
     walk_and_append(source, sink, opts, caller)
@@ -1016,7 +1032,7 @@ fn walk_and_append(
                 })?;
                 // Contained targets only, so packed archives always
                 // round-trip through the safe unpacker.
-                clean_link_target(caller, &rel.to_string_lossy(), &target, 4096)?;
+                clean_link_target(caller, &rel.to_string_lossy(), target.as_os_str(), 4096)?;
                 let mut header = Header::new_gnu();
                 header.set_size(0);
                 header.set_entry_type(EntryType::Symlink);
@@ -1030,9 +1046,11 @@ fn walk_and_append(
                 symlinks += 1;
             } else if meta.is_file() {
                 if let Some(raw) = xattr_security_capability(&child) {
-                    append_pax_xattr(&mut builder, rel, &raw).map_err(|e| {
-                        runtime(format!("{caller}: pax xattr '{}': {e}", rel.display()))
-                    })?;
+                    builder
+                        .append_pax_extensions([("SCHILY.xattr.security.capability", raw.as_slice())])
+                        .map_err(|e| {
+                            runtime(format!("{caller}: pax xattr '{}': {e}", rel.display()))
+                        })?;
                     caps += 1;
                 }
                 let mut header = Header::new_gnu();
@@ -1072,56 +1090,18 @@ fn walk_and_append(
 }
 
 fn set_header_meta(header: &mut Header, meta: &fs::Metadata, opts: &PackOpts) {
-    let mode = PermissionsExt::from(&meta.permissions()).mode();
+    let mode = meta.permissions().mode();
     let masked = if opts.keep_special_bits {
         mode
     } else {
         mode & !0o6000
     };
     header.set_mode(masked & 0o7777);
-    header.set_uid(meta.uid());
-    header.set_gid(meta.gid());
+    header.set_uid(u64::from(meta.uid()));
+    header.set_gid(u64::from(meta.gid()));
     header.set_mtime(meta.mtime().max(0) as u64);
     if meta.is_dir() {
         header.set_entry_type(EntryType::Directory);
-    }
-}
-
-/// Emit one PAX extended-header entry (`typeflag 'x'`) carrying a single
-/// `SCHILY.xattr.security.capability=<raw bytes>` record for the member
-/// that FOLLOWS it — the same form GNU tar --xattrs writes (RAW value
-/// bytes; PAX records are length-delimited, so binary values are legal) and
-/// `apply_pax_xattrs` reads back. Framing: the record is
-/// `<len> <key>=<value>\n` where `<len>` counts itself, the space, the
-/// key=value and the newline.
-fn append_pax_xattr<W: Write>(
-    builder: &mut Builder<W>,
-    next_member: &Path,
-    raw: &[u8],
-) -> std::io::Result<()> {
-    let key = b"SCHILY.xattr.security.capability=";
-    let payload = key.len() + raw.len() + 1;
-    let mut digits = 1usize;
-    loop {
-        let total = digits + 1 + payload;
-        if total.to_string().len() == digits {
-            let mut body = Vec::with_capacity(total);
-            body.extend_from_slice(total.to_string().as_bytes());
-            body.push(b' ');
-            body.extend_from_slice(key);
-            body.extend_from_slice(raw);
-            body.push(b'\n');
-            let mut h = Header::new_gnu();
-            h.set_size(body.len() as u64);
-            h.set_entry_type(EntryType::XHeader);
-            h.set_mode(0o644);
-            h.set_uid(0);
-            h.set_gid(0);
-            h.set_mtime(0);
-            let name = format!("PaxHeaders/mix/{}", next_member.display());
-            return builder.append_data(&mut h, name, std::io::Cursor::new(body));
-        }
-        digits += 1;
     }
 }
 
@@ -1129,7 +1109,7 @@ fn append_pax_xattr<W: Write>(
 /// VFS_CAP_REVISION_3 values (~1 KB) into corrupt capabilities.
 fn xattr_security_capability(path: &Path) -> Option<Vec<u8>> {
     let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
-    let name = b"security.capability\0".as_ptr() as *const libc::c_char;
+    let name = c"security.capability".as_ptr();
     let size = unsafe { libc::getxattr(c.as_ptr(), name, std::ptr::null_mut(), 0) };
     if size <= 0 {
         return None;

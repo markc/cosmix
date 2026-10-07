@@ -1559,7 +1559,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-mix"
-version = "0.109.1"
+version = "0.110.0"
 dependencies = [
  "base64 0.22.1",
  "bcrypt",
@@ -1567,6 +1567,7 @@ dependencies = [
  "chrono",
  "cosmix-lib-mix",
  "datastar",
+ "flate2",
  "futures-util",
  "indexmap",
  "jaq-core",
@@ -1591,6 +1592,8 @@ dependencies = [
  "sha1",
  "sha2 0.10.9",
  "signal-hook",
+ "structured-zstd",
+ "tar",
  "tokio",
  "toml",
  "tracing",
@@ -1890,7 +1893,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-mix"
-version = "0.109.4"
+version = "0.110.0"
 dependencies = [
  "blake3",
  "chrono",
@@ -7138,6 +7141,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
+name = "structured-zstd"
+version = "0.0.58"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a19112515370199811e7e499f32b633b93a2525ea2cf6f7aa3b1e758d65fd932"
+dependencies = [
+ "fastrand",
+ "twox-hash",
+]
+
+[[package]]
 name = "strum"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7275,7 +7288,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -7843,6 +7856,12 @@ dependencies = [
  "sha1",
  "thiserror 2.0.20",
 ]
+
+[[package]]
+name = "twox-hash"
+version = "2.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86a801b3cea342a06d468c8710662aa29e5e05e4f5c0d62f00bbb7f2ad7941c2"
 
 [[package]]
 name = "typed-arena"

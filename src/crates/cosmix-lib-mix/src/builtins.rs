@@ -35572,6 +35572,7 @@ mod man_topic_tests {
     #[test]
     fn every_emitted_topic_names_a_real_page() {
         const PAGES: &[&str] = &[
+            "tar",
             "buffer", "bus", "collections", "data", "datastar", "datetime",
             "http", "io", "math", "regex", "remote", "strings", "system",
         ];
