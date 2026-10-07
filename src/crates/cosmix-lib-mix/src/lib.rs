@@ -23,6 +23,9 @@ pub mod stats;
 pub mod token;
 pub mod value;
 
+#[cfg(feature = "archive")]
+mod archive;
+
 #[cfg(feature = "crypto")]
 mod jwt;
 

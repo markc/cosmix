@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-lib-mix"
-version = "0.109.1"
+version = "0.110.0"
 edition = "2024"
 license = "MIT"
 
@@ -33,6 +33,9 @@ url = ["dep:url"]
 crypto = ["dep:blake3", "dep:sha2", "dep:sha1", "dep:md-5", "dep:base64", "dep:uuid", "dep:bcrypt", "dep:sha-crypt", "dep:ring", "dep:rustls-pemfile"]
 http = ["dep:ureq", "dep:webpki-roots", "dep:rustls-pemfile", "dep:blake3"]
 sqlite = ["dep:rusqlite"]
+tar = { version = "0.4.46", optional = true }
+structured-zstd = { version = "0.0.58", optional = true }
+flate2 = { version = "1.1", default-features = true, optional = true }
 # `tokio-sleep` is an alias-only feature kept for backwards
 # compatibility with consumers that still list
 # `features = ["tokio-sleep"]`. tokio itself is now unconditional
@@ -78,6 +81,18 @@ yaml = ["dep:yaml-rust2"]
 # `{insecure: true}` arm's no-verify TLS config (self-signed device certs
 # — the case that motivated the builtin).
 ws = ["dep:tungstenite", "dep:rustls", "dep:webpki-roots", "tokio/net"]
+# `tar_list` / `tar_unpack` / `tar_pack` builtins — the archive surface the
+# MixOS distribution story needs end-to-end in-language: signed manifest ->
+# hash_file -> tar_unpack, plus app-pack reading inside MixOS machines where
+# no external tar/zstd exists at all. tar >= 0.4.46 floor per
+# RUSTSEC-2026-0067 (0.4.45 fixed the symlink permission-change and
+# PAX-size interpretation issues); structured-zstd is the pure-Rust RFC 8878
+# implementation (both directions, SIMD, CI interop with reference zstd) —
+# pinned exactly (0.0.x semver); flate2 provides gzip framing over its
+# default Rust backend (miniz_oxide). No C codec in the shipped binary; the
+# zstd encoder-window profile contract (<= decoder 128 MiB ceiling, no
+# dictionaries, single frame) lives in docs/mix/tar.md.
+archive = ["dep:tar", "dep:structured-zstd", "dep:flate2"]
 
 [dependencies]
 indexmap = "2"
@@ -170,7 +185,7 @@ quick-xml = { version = "0.41.0", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time", "test-util", "net", "io-util"] }
-cosmix-lib-mix = { path = ".", features = ["json", "regex", "toml", "datetime", "url", "crypto", "http", "sqlite", "tokio-sleep", "datastar", "xml", "yaml", "ws"] }
+cosmix-lib-mix = { path = ".", features = ["json", "regex", "toml", "datetime", "url", "crypto", "http", "sqlite", "tokio-sleep", "datastar", "xml", "yaml", "ws", "archive"] }
 # Property-based testing for the lexer/parser (P1 of the mix tokenizer
 # fuzz/property corpus — _doc/planned/mix-tokenizer-fuzz-corpus.md in the cosmix
 # hub). Test-only; never linked into the shipped library.
