@@ -165,7 +165,10 @@ fn retirement_signing_is_explicit_and_never_a_live_routing_authority() {
     let signed = dir.path().join("retired.signed");
     let genesis_pub = dir.path().join("genesis.pub");
     let prefix = strings(&[
-        "--secrets-db", db.to_str().unwrap(), "--mesh", "example.internal",
+        "--secrets-db",
+        db.to_str().unwrap(),
+        "--mesh",
+        "example.internal",
     ]);
     let mut genesis = prefix.clone();
     genesis.push("genesis".into());
@@ -185,30 +188,59 @@ fn retirement_signing_is_explicit_and_never_a_live_routing_authority() {
     std::fs::write(&authored, source).unwrap();
     let mut sign = prefix;
     sign.extend(strings(&[
-        "sign", authored.to_str().unwrap(), "--out", signed.to_str().unwrap(),
-        "--recovery-generation", "0",
+        "sign",
+        authored.to_str().unwrap(),
+        "--out",
+        signed.to_str().unwrap(),
+        "--recovery-generation",
+        "0",
     ]));
     assert!(!run(&sign).status.success());
-    assert!(!signed.exists(), "ordinary signing published a route-free inventory");
+    assert!(
+        !signed.exists(),
+        "ordinary signing published a route-free inventory"
+    );
     sign.push("--retirement".into());
     let output = run(&sign);
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let mut verify = strings(&[
-        "--secrets-db", "/definitely/not/a/secrets.db", "verify",
-        signed.to_str().unwrap(), "--genesis-pub", genesis_pub.to_str().unwrap(),
-        "--expected-mesh", "example.internal", "--json", "--include-payload",
-        "--against-authored", authored.to_str().unwrap(),
+        "--secrets-db",
+        "/definitely/not/a/secrets.db",
+        "verify",
+        signed.to_str().unwrap(),
+        "--genesis-pub",
+        genesis_pub.to_str().unwrap(),
+        "--expected-mesh",
+        "example.internal",
+        "--json",
+        "--include-payload",
+        "--against-authored",
+        authored.to_str().unwrap(),
     ]);
     let ordinary = run(&verify);
     assert!(!ordinary.status.success());
-    assert_eq!(json_stdout(&ordinary)["error"]["code"], "routing_view_invalid");
+    assert_eq!(
+        json_stdout(&ordinary)["error"]["code"],
+        "routing_view_invalid"
+    );
     verify.push("--retirement".into());
     let retired = run(&verify);
-    assert!(retired.status.success(), "{}", String::from_utf8_lossy(&retired.stdout));
+    assert!(
+        retired.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retired.stdout)
+    );
     let report = json_stdout(&retired);
     assert_eq!(report["retirement"], true);
     assert_eq!(report["routing_view"]["live"], false);
-    assert_eq!(report["routing_view"]["members"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        report["routing_view"]["members"].as_array().unwrap().len(),
+        2
+    );
     assert_eq!(report["against_authored"]["matches"], true);
     assert_eq!(report["payload"]["recovery_generation"], 0);
     assert_eq!(report["via_recovery"], false);
@@ -216,30 +248,48 @@ fn retirement_signing_is_explicit_and_never_a_live_routing_authority() {
     // The specialised mode retains cryptographic and authored-byte checks.
     let changed = dir.path().join("changed.mix");
     std::fs::write(&changed, source.replace("epoch: 8", "epoch: 9")).unwrap();
-    let authored_arg = verify.iter().position(|arg| arg == "--against-authored").unwrap() + 1;
+    let authored_arg = verify
+        .iter()
+        .position(|arg| arg == "--against-authored")
+        .unwrap()
+        + 1;
     verify[authored_arg] = changed.to_str().unwrap().into();
     let mismatch = run(&verify);
     assert!(!mismatch.status.success());
-    assert_eq!(json_stdout(&mismatch)["error"]["code"], "authoring_mismatch");
+    assert_eq!(
+        json_stdout(&mismatch)["error"]["code"],
+        "authoring_mismatch"
+    );
     verify[authored_arg] = authored.to_str().unwrap().into();
     let mut envelope: Value = serde_json::from_slice(&std::fs::read(&signed).unwrap()).unwrap();
     envelope["payload"]["epoch"] = json!(9);
     std::fs::write(&signed, serde_json::to_vec(&envelope).unwrap()).unwrap();
     let tampered = run(&verify);
     assert!(!tampered.status.success());
-    assert_eq!(json_stdout(&tampered)["error"]["code"], "verification_failed");
+    assert_eq!(
+        json_stdout(&tampered)["error"]["code"],
+        "verification_failed"
+    );
 }
 
 #[test]
 fn retirement_verification_refuses_a_live_inventory() {
     let fixture = Fixture::new();
     let output = run(&strings(&[
-        "--secrets-db", "/definitely/not/a/secrets.db", "verify",
-        fixture.signed.to_str().unwrap(), "--genesis-pub",
-        fixture.genesis_pub.to_str().unwrap(), "--retirement", "--json",
+        "--secrets-db",
+        "/definitely/not/a/secrets.db",
+        "verify",
+        fixture.signed.to_str().unwrap(),
+        "--genesis-pub",
+        fixture.genesis_pub.to_str().unwrap(),
+        "--retirement",
+        "--json",
     ]));
     assert!(!output.status.success());
-    assert_eq!(json_stdout(&output)["error"]["code"], "routing_view_invalid");
+    assert_eq!(
+        json_stdout(&output)["error"]["code"],
+        "routing_view_invalid"
+    );
 }
 
 #[test]

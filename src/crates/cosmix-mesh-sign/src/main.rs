@@ -214,7 +214,11 @@ fn main() -> Result<()> {
             &inventory,
             &out,
             valid_days,
-            SignOptions { recovery, recovery_generation, retirement },
+            SignOptions {
+                recovery,
+                recovery_generation,
+                retirement,
+            },
         ),
         Cmd::Verify {
             signed,
@@ -559,7 +563,11 @@ fn cmd_sign(
     valid_days: i64,
     options: SignOptions,
 ) -> Result<()> {
-    let SignOptions { recovery, recovery_generation, retirement } = options;
+    let SignOptions {
+        recovery,
+        recovery_generation,
+        retirement,
+    } = options;
     if retirement && recovery.is_some() {
         bail!("retirement receipts must be normal successor inventories, not recovery");
     }
@@ -826,16 +834,15 @@ fn cmd_verify(
             format!("verification FAILED for {}: {e}", signed_path.display()),
         )
     })?;
-    let routing_view = inventory_view(&signed.payload, options.retirement)
-        .map_err(|e| {
-            VerifyCommandError::new(
-                "routing_view_invalid",
-                format!(
-                    "authenticated routing view FAILED for {}: {e}",
-                    signed_path.display()
-                ),
-            )
-        })?;
+    let routing_view = inventory_view(&signed.payload, options.retirement).map_err(|e| {
+        VerifyCommandError::new(
+            "routing_view_invalid",
+            format!(
+                "authenticated routing view FAILED for {}: {e}",
+                signed_path.display()
+            ),
+        )
+    })?;
 
     if let Some(expected) = options.expected_mesh
         && signed.payload.mesh != expected
@@ -1259,8 +1266,15 @@ mod tests {
     fn sign_refuses_out_of_subnet_active_member_before_writing() {
         let (db, inventory, out) = signing_fixture("routing-reject", "198.51.100.5");
 
-        let error =
-            cmd_sign(&db, "example.internal", &inventory, &out, 90, SignOptions::default()).unwrap_err();
+        let error = cmd_sign(
+            &db,
+            "example.internal",
+            &inventory,
+            &out,
+            90,
+            SignOptions::default(),
+        )
+        .unwrap_err();
         let message = format!("{error:#}");
 
         assert!(
@@ -1280,8 +1294,15 @@ mod tests {
             .replace("name: \"alpha\"", "name: \"Beta\"");
         std::fs::write(&inventory, source).unwrap();
 
-        let error =
-            cmd_sign(&db, "example.internal", &inventory, &out, 90, SignOptions::default()).unwrap_err();
+        let error = cmd_sign(
+            &db,
+            "example.internal",
+            &inventory,
+            &out,
+            90,
+            SignOptions::default(),
+        )
+        .unwrap_err();
         let message = format!("{error:#}");
 
         assert!(
@@ -1301,8 +1322,15 @@ mod tests {
             .replace("bus: true", "bus: true, noded_port: 0");
         std::fs::write(&inventory, source).unwrap();
 
-        let error =
-            cmd_sign(&db, "example.internal", &inventory, &out, 90, SignOptions::default()).unwrap_err();
+        let error = cmd_sign(
+            &db,
+            "example.internal",
+            &inventory,
+            &out,
+            90,
+            SignOptions::default(),
+        )
+        .unwrap_err();
         let message = format!("{error:#}");
 
         assert!(
@@ -1322,7 +1350,15 @@ mod tests {
             .replace("bus: true", "bus: true, noded_port: 4300");
         std::fs::write(&inventory, source).unwrap();
 
-        cmd_sign(&db, "example.internal", &inventory, &out, 90, SignOptions::default()).unwrap();
+        cmd_sign(
+            &db,
+            "example.internal",
+            &inventory,
+            &out,
+            90,
+            SignOptions::default(),
+        )
+        .unwrap();
 
         let signed = SignedInventory::parse(&std::fs::read(&out).unwrap()).unwrap();
         let view = strict_routing_view(&signed.payload.members, &signed.payload.subnet).unwrap();
@@ -1340,7 +1376,18 @@ mod tests {
     fn sign_stamps_normal_recovery_generation_without_recovery_marker() {
         let (db, inventory, out) = signing_fixture("normal-generation", "192.0.2.5");
 
-        cmd_sign(&db, "example.internal", &inventory, &out, 90, SignOptions { recovery_generation: Some(0), ..SignOptions::default() }).unwrap();
+        cmd_sign(
+            &db,
+            "example.internal",
+            &inventory,
+            &out,
+            90,
+            SignOptions {
+                recovery_generation: Some(0),
+                ..SignOptions::default()
+            },
+        )
+        .unwrap();
 
         let signed = SignedInventory::parse(&std::fs::read(&out).unwrap()).unwrap();
         assert_eq!(signed.payload.recovery, None);
@@ -1370,14 +1417,33 @@ mod tests {
 
     #[test]
     fn retirement_refuses_recovery_at_cli_and_library_boundaries() {
-        assert!(Cli::try_parse_from([
-            "cosmix-mesh-sign", "sign", "inventory.mix", "--out", "inventory.signed",
-            "--retirement", "--recovery", "1",
-        ]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "cosmix-mesh-sign",
+                "sign",
+                "inventory.mix",
+                "--out",
+                "inventory.signed",
+                "--retirement",
+                "--recovery",
+                "1",
+            ])
+            .is_err()
+        );
         let (db, inventory, out) = signing_fixture("retirement-recovery", "192.0.2.5");
-        let error = cmd_sign(&db, "example.internal", &inventory, &out, 90,
-            SignOptions { recovery: Some(1), retirement: true, ..SignOptions::default() }
-        ).unwrap_err();
+        let error = cmd_sign(
+            &db,
+            "example.internal",
+            &inventory,
+            &out,
+            90,
+            SignOptions {
+                recovery: Some(1),
+                retirement: true,
+                ..SignOptions::default()
+            },
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("normal successor"));
         assert!(!out.exists());
     }

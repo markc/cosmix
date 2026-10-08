@@ -261,7 +261,9 @@ fn membership_view(
 
     if retirement {
         if view.is_empty()
-            || view.iter().any(|entry| !matches!(entry, RoutingMember::Tombstoned { .. }))
+            || view
+                .iter()
+                .any(|entry| !matches!(entry, RoutingMember::Tombstoned { .. }))
         {
             return Err(RoutingViewError::IncompleteRetirement);
         }
@@ -549,7 +551,10 @@ mod tests {
             {"name":"beta","status":"tombstoned"}
         ]);
         assert_eq!(strict_retirement_view(&retired, SUBNET).unwrap().len(), 2);
-        assert_eq!(strict_routing_view(&retired, SUBNET), Err(RoutingViewError::ZeroActiveBus));
+        assert_eq!(
+            strict_routing_view(&retired, SUBNET),
+            Err(RoutingViewError::ZeroActiveBus)
+        );
         for invalid in [
             json!([]),
             json!([{"name":"alpha","status":"active","mesh_ip":"192.0.2.5","bus":true}]),
