@@ -335,7 +335,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let mds = Arc::new(cosmix_mds::SqliteCasMds::open(&tmp.path().join("mds")).unwrap());
+        let mds = Arc::new(cosmix_mds::SqliteCasMds::open(tmp.path().join("mds")).unwrap());
         let store = Arc::new(SqliteMailStore::new(mds));
         for account in [sender.id, local.id] {
             crate::props::accounts::seed_default_mailboxes_idempotent(&store, account).unwrap();
