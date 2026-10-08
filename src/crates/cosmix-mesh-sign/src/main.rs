@@ -31,7 +31,7 @@ use cosmix_mesh_trust::inventory::{
     ALG_ED25519, CANONICAL_ENCODING_V1, InvSignature, InventoryPayload, KeyStatus, NodeTrustState,
     SIGNER_OWNED_FIELDS, SignedInventory, TrustedKey, authoring_blake3_for_value,
 };
-use cosmix_mesh_trust::routing::{RoutingMember, strict_routing_view};
+use cosmix_mesh_trust::routing::{RoutingMember, strict_retirement_view, strict_routing_view};
 use ed25519_dalek::{Signer, SigningKey};
 use rand::rngs::OsRng;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -101,6 +101,10 @@ enum Cmd {
         /// only, never a security gate).
         #[arg(long, default_value = "90")]
         valid_days: i64,
+        /// Sign a wholly tombstoned offline retirement receipt. Not a live
+        /// routing authority; every member must be retired and recovery is forbidden.
+        #[arg(long, conflicts_with = "recovery")]
+        retirement: bool,
         /// Emit a RECOVERY inventory (§6.4): sets `recovery: true` +
         /// `recovery_generation: <N>`. A genesis-signed recovery supersedes
         /// the epoch axis (a node accepts it even at a lower epoch), so use
@@ -152,6 +156,10 @@ enum Cmd {
         /// strict-data inventory.
         #[arg(long, value_name = "PATH")]
         against_authored: Option<PathBuf>,
+        /// Verify a wholly tombstoned offline retirement receipt rather than
+        /// a live routing authority. Ordinary verification remains unchanged.
+        #[arg(long)]
+        retirement: bool,
     },
     /// Print the genesis PUBLIC verify key (base64) — the value to
     /// provision out-of-band to each node as `/etc/cosmix/noded/genesis.pub`
@@ -197,6 +205,7 @@ fn main() -> Result<()> {
             inventory,
             out,
             valid_days,
+            retirement,
             recovery,
             recovery_generation,
         } => cmd_sign(
@@ -205,8 +214,7 @@ fn main() -> Result<()> {
             &inventory,
             &out,
             valid_days,
-            recovery,
-            recovery_generation,
+            SignOptions { recovery, recovery_generation, retirement },
         ),
         Cmd::Verify {
             signed,
@@ -216,6 +224,7 @@ fn main() -> Result<()> {
             json,
             include_payload,
             against_authored,
+            retirement,
         } => emit_verify(
             &db,
             &cli.mesh,
@@ -227,6 +236,7 @@ fn main() -> Result<()> {
                 expected_mesh: expected_mesh.as_deref(),
                 include_payload,
                 against_authored: against_authored.as_deref(),
+                retirement,
             },
         ),
         Cmd::Pubkey => {
@@ -534,15 +544,25 @@ fn cmd_d2pubkey(db: &Path, mesh: &str, node: &str) -> Result<()> {
 // sign / verify
 // ---------------------------------------------------------------------
 
+#[derive(Default)]
+struct SignOptions {
+    recovery: Option<u64>,
+    recovery_generation: Option<u64>,
+    retirement: bool,
+}
+
 fn cmd_sign(
     db: &Path,
     mesh: &str,
     inventory: &Path,
     out: &Path,
     valid_days: i64,
-    recovery: Option<u64>,
-    recovery_generation: Option<u64>,
+    options: SignOptions,
 ) -> Result<()> {
+    let SignOptions { recovery, recovery_generation, retirement } = options;
+    if retirement && recovery.is_some() {
+        bail!("retirement receipts must be normal successor inventories, not recovery");
+    }
     if recovery.is_some() {
         eprintln!(
             "WARNING: --recovery does not check fleet epoch history; choose the next normal epoch deliberately after recovery (recovery_generation is the security barrier)."
@@ -603,7 +623,7 @@ fn cmd_sign(
     // The signed inventory is also the shared routing authority. Apply the
     // exact semantic gate noded and wgd use before creating a signature, so
     // an authenticated but unroutable epoch cannot be published.
-    let routing_view = strict_routing_view(&payload.members, &payload.subnet)
+    let routing_view = inventory_view(&payload, retirement)
         .map_err(|e| anyhow!("inventory routing view is unusable: {e}"))?;
 
     // Sign the canonical bytes (the one shared canonicaliser).
@@ -674,6 +694,18 @@ struct VerifyOptions<'a> {
     expected_mesh: Option<&'a str>,
     include_payload: bool,
     against_authored: Option<&'a Path>,
+    retirement: bool,
+}
+
+fn inventory_view(payload: &InventoryPayload, retirement: bool) -> Result<Vec<RoutingMember>> {
+    if retirement {
+        if payload.recovery == Some(true) {
+            bail!("retirement receipts must be normal successor inventories, not recovery");
+        }
+        Ok(strict_retirement_view(&payload.members, &payload.subnet)?)
+    } else {
+        Ok(strict_routing_view(&payload.members, &payload.subnet)?)
+    }
 }
 
 fn emit_verify(
@@ -794,7 +826,7 @@ fn cmd_verify(
             format!("verification FAILED for {}: {e}", signed_path.display()),
         )
     })?;
-    let routing_view = strict_routing_view(&signed.payload.members, &signed.payload.subnet)
+    let routing_view = inventory_view(&signed.payload, options.retirement)
         .map_err(|e| {
             VerifyCommandError::new(
                 "routing_view_invalid",
@@ -872,8 +904,10 @@ fn cmd_verify(
         "canonical_blake3": canonical_blake3,
         "authoring_blake3": signed_authoring_blake3,
         "member_count": member_count,
+        "retirement": options.retirement,
         "routing_view": {
             "valid": true,
+            "live": !options.retirement,
             "members": routing_view.iter().map(RoutingMember::to_json).collect::<Vec<_>>(),
         },
     });
@@ -1226,7 +1260,7 @@ mod tests {
         let (db, inventory, out) = signing_fixture("routing-reject", "198.51.100.5");
 
         let error =
-            cmd_sign(&db, "example.internal", &inventory, &out, 90, None, None).unwrap_err();
+            cmd_sign(&db, "example.internal", &inventory, &out, 90, SignOptions::default()).unwrap_err();
         let message = format!("{error:#}");
 
         assert!(
@@ -1247,7 +1281,7 @@ mod tests {
         std::fs::write(&inventory, source).unwrap();
 
         let error =
-            cmd_sign(&db, "example.internal", &inventory, &out, 90, None, None).unwrap_err();
+            cmd_sign(&db, "example.internal", &inventory, &out, 90, SignOptions::default()).unwrap_err();
         let message = format!("{error:#}");
 
         assert!(
@@ -1268,7 +1302,7 @@ mod tests {
         std::fs::write(&inventory, source).unwrap();
 
         let error =
-            cmd_sign(&db, "example.internal", &inventory, &out, 90, None, None).unwrap_err();
+            cmd_sign(&db, "example.internal", &inventory, &out, 90, SignOptions::default()).unwrap_err();
         let message = format!("{error:#}");
 
         assert!(
@@ -1288,7 +1322,7 @@ mod tests {
             .replace("bus: true", "bus: true, noded_port: 4300");
         std::fs::write(&inventory, source).unwrap();
 
-        cmd_sign(&db, "example.internal", &inventory, &out, 90, None, None).unwrap();
+        cmd_sign(&db, "example.internal", &inventory, &out, 90, SignOptions::default()).unwrap();
 
         let signed = SignedInventory::parse(&std::fs::read(&out).unwrap()).unwrap();
         let view = strict_routing_view(&signed.payload.members, &signed.payload.subnet).unwrap();
@@ -1306,7 +1340,7 @@ mod tests {
     fn sign_stamps_normal_recovery_generation_without_recovery_marker() {
         let (db, inventory, out) = signing_fixture("normal-generation", "192.0.2.5");
 
-        cmd_sign(&db, "example.internal", &inventory, &out, 90, None, Some(0)).unwrap();
+        cmd_sign(&db, "example.internal", &inventory, &out, 90, SignOptions { recovery_generation: Some(0), ..SignOptions::default() }).unwrap();
 
         let signed = SignedInventory::parse(&std::fs::read(&out).unwrap()).unwrap();
         assert_eq!(signed.payload.recovery, None);
@@ -1332,6 +1366,20 @@ mod tests {
         assert!(message.contains("cannot be used with"), "{message}");
         assert!(message.contains("--recovery"), "{message}");
         assert!(message.contains("--recovery-generation"), "{message}");
+    }
+
+    #[test]
+    fn retirement_refuses_recovery_at_cli_and_library_boundaries() {
+        assert!(Cli::try_parse_from([
+            "cosmix-mesh-sign", "sign", "inventory.mix", "--out", "inventory.signed",
+            "--retirement", "--recovery", "1",
+        ]).is_err());
+        let (db, inventory, out) = signing_fixture("retirement-recovery", "192.0.2.5");
+        let error = cmd_sign(&db, "example.internal", &inventory, &out, 90,
+            SignOptions { recovery: Some(1), retirement: true, ..SignOptions::default() }
+        ).unwrap_err();
+        assert!(error.to_string().contains("normal successor"));
+        assert!(!out.exists());
     }
 
     #[test]

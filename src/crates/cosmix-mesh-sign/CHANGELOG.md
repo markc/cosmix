@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.2 — 2026-10-08
+
+- Add explicit `sign --retirement` and `verify --retirement` for non-empty,
+  wholly tombstoned offline receipts using the existing signature and canonical
+  inventory format. Refuse recovery inventories in this mode.
+- Keep ordinary signing, verification and live routing consumers' zero-active
+  member rejection. JSON retirement reports state `routing_view.live: false`.
+
 ## 0.7.3 — 2026-08-16
 
 - Refuse signing when an active Bus member carries a `noded_port` outside the

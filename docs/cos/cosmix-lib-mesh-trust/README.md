@@ -6,7 +6,7 @@
 
 - Cargo package: `cosmix-lib-mesh-trust`
 - Rust library: `cosmix_mesh_trust`
-- Current crate version: `0.4.3`
+- Current crate version: `0.10.1`
 - Binary targets: none
 - Default posture: core verification plus the `cosmix` integration feature
 
@@ -70,6 +70,13 @@ Invalid or unknown entries in the unsigned signature bag do not invalidate an ot
 On success, `AcceptedInventory` returns the epoch and recovery generation to persist, whether recovery authorised the result, the trusted keys whose signatures verified, and the verify-key set to adopt. Persistence remains the caller's responsibility.
 
 Inventory `signed_at` and `valid_until` values are advisory. The verifier does not use wall-clock time as a security gate.
+
+Live consumers use `routing::strict_routing_view` after signature verification;
+it rejects an inventory with no active Bus member. Offline cleanup receipts may
+use `routing::strict_retirement_view`, which requires a non-empty set consisting
+entirely of unique, valid tombstones. Both validators share the strict member and
+subnet parser. A retirement receipt supplies no live routing authority and does
+not change a running broker's accepted epoch.
 
 ## Admission
 

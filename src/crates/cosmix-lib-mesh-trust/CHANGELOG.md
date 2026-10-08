@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.10.1 — 2026-10-08
+
+- Add `strict_retirement_view` for offline receipts containing only unique,
+  valid tombstones. Reuse the strict membership parser and subnet validation.
+- Preserve `strict_routing_view`'s requirement for an active Bus member.
+
 ## 0.10.0 — 2026-08-16
 
 - Interpret optional active-member `noded_port` as the authoritative signed

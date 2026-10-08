@@ -70,7 +70,8 @@ cosmix-mesh-sign [GLOBAL OPTIONS] sign \
   <INVENTORY> \
   --out <PATH> \
   [--valid-days <DAYS>] \
-  [--recovery <GENERATION>]
+  [--recovery <GENERATION> | --recovery-generation <GENERATION>] \
+  [--retirement]
 ```
 
 Arguments and options:
@@ -81,6 +82,8 @@ Arguments and options:
 | `-o`, `--out <PATH>` | Required output path for the signed artifact. |
 | `--valid-days <DAYS>` | Set `valid_until` to this many days after signing. Defaults to `90`. |
 | `--recovery <GENERATION>` | Emit a recovery inventory with the supplied generation. |
+| `--recovery-generation <GENERATION>` | Carry the current recovery floor on a normal successor, without marking it as recovery. |
+| `--retirement` | Sign a non-empty, wholly tombstoned offline receipt. Conflicts with `--recovery`. |
 
 Example:
 
@@ -109,17 +112,32 @@ Before writing, the command serialises, reparses, and verifies the exact output 
 
 The self-check uses an epoch and recovery-generation baseline of zero. It proves cryptographic and structural validity, but does not prove freshness relative to a node's stored state.
 
+Ordinary signing requires an active Bus member. Use `--retirement` only for an
+offline cleanup receipt after all members in the authored inventory have been
+tombstoned. The same canonical format, genesis signature, strict labels and
+subnet validation apply. This flag does not publish membership or reload a live
+broker; live consumers continue to reject a zero-active-member routing view.
+
 ## `verify`
 
 Verify a signed inventory against the genesis public key derived from the stored signing key.
 
 ```text
-cosmix-mesh-sign [GLOBAL OPTIONS] verify <SIGNED>
+cosmix-mesh-sign [GLOBAL OPTIONS] verify <SIGNED> [--retirement]
 ```
 
 `<SIGNED>` is the path to a signed JSON inventory.
 
 The command parses the artifact with `SignedInventory::parse` and verifies it against a trust state containing the active genesis key. Success prints the accepted epoch, recovery status, and verifying key identifiers.
+
+An offline retirement receipt requires `verify --retirement`. This mode refuses
+active members, empty member sets and recovery inventories. It supports the
+same public-key-only `--genesis-pub <PATH>` or `--genesis-pub-base64 <KEY>`,
+`--expected-mesh`, `--against-authored`, `--json` and `--include-payload`
+verification options. Its JSON report contains `retirement: true` and
+`routing_view.live: false`. Verification without the flag still rejects a
+retirement receipt. Neither mode checks freshness against a broker's persisted
+epoch; the caller must bind a cleanup receipt to the preceding live inventory.
 
 ## `pubkey`
 

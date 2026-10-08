@@ -483,7 +483,8 @@ generation alone does not enrol a node or configure a WireGuard interface.</p>
   &lt;INVENTORY&gt; \
   --out &lt;PATH&gt; \
   [--valid-days &lt;DAYS&gt;] \
-  [--recovery &lt;GENERATION&gt;]
+  [--recovery &lt;GENERATION&gt; | --recovery-generation &lt;GENERATION&gt;] \
+  [--retirement]
 </code></pre>
 <p>Arguments and options:</p>
 <table><thead><tr><th>Surface</th><th>Meaning</th></tr></thead><tbody>
@@ -491,6 +492,8 @@ generation alone does not enrol a node or configure a WireGuard interface.</p>
 <tr><td><code>-o</code>, <code>--out &lt;PATH&gt;</code></td><td>Required output path for the signed artifact.</td></tr>
 <tr><td><code>--valid-days &lt;DAYS&gt;</code></td><td>Set <code>valid_until</code> to this many days after signing. Defaults to <code>90</code>.</td></tr>
 <tr><td><code>--recovery &lt;GENERATION&gt;</code></td><td>Emit a recovery inventory with the supplied generation.</td></tr>
+<tr><td><code>--recovery-generation &lt;GENERATION&gt;</code></td><td>Carry the current recovery floor on a normal successor, without marking it as recovery.</td></tr>
+<tr><td><code>--retirement</code></td><td>Sign a non-empty, wholly tombstoned offline receipt. Conflicts with <code>--recovery</code>.</td></tr>
 </tbody></table>
 <p>Example:</p>
 <pre><code class="language-text">cosmix-mesh-sign \
@@ -512,12 +515,25 @@ generation alone does not enrol a node or configure a WireGuard interface.</p>
 <p>The output contains one Ed25519 signature identified by the genesis key ID.</p>
 <p>Before writing, the command serialises, reparses, and verifies the exact output text through <code>SignedInventory</code>. Failure leaves no newly written output from this invocation.</p>
 <p>The self-check uses an epoch and recovery-generation baseline of zero. It proves cryptographic and structural validity, but does not prove freshness relative to a node's stored state.</p>
+<p>Ordinary signing requires an active Bus member. Use <code>--retirement</code> only for an
+offline cleanup receipt after all members in the authored inventory have been
+tombstoned. The same canonical format, genesis signature, strict labels and
+subnet validation apply. This flag does not publish membership or reload a live
+broker; live consumers continue to reject a zero-active-member routing view.</p>
 <h2 id="verify"><code>verify</code></h2>
 <p>Verify a signed inventory against the genesis public key derived from the stored signing key.</p>
-<pre><code class="language-text">cosmix-mesh-sign [GLOBAL OPTIONS] verify &lt;SIGNED&gt;
+<pre><code class="language-text">cosmix-mesh-sign [GLOBAL OPTIONS] verify &lt;SIGNED&gt; [--retirement]
 </code></pre>
 <p><code>&lt;SIGNED&gt;</code> is the path to a signed JSON inventory.</p>
 <p>The command parses the artifact with <code>SignedInventory::parse</code> and verifies it against a trust state containing the active genesis key. Success prints the accepted epoch, recovery status, and verifying key identifiers.</p>
+<p>An offline retirement receipt requires <code>verify --retirement</code>. This mode refuses
+active members, empty member sets and recovery inventories. It supports the
+same public-key-only <code>--genesis-pub &lt;PATH&gt;</code> or <code>--genesis-pub-base64 &lt;KEY&gt;</code>,
+<code>--expected-mesh</code>, <code>--against-authored</code>, <code>--json</code> and <code>--include-payload</code>
+verification options. Its JSON report contains <code>retirement: true</code> and
+<code>routing_view.live: false</code>. Verification without the flag still rejects a
+retirement receipt. Neither mode checks freshness against a broker's persisted
+epoch; the caller must bind a cleanup receipt to the preceding live inventory.</p>
 <h2 id="pubkey"><code>pubkey</code></h2>
 <p>Print the genesis public verify key.</p>
 <pre><code class="language-text">cosmix-mesh-sign [GLOBAL OPTIONS] pubkey

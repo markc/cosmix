@@ -158,6 +158,91 @@ fn json_stdout(output: &Output) -> Value {
 }
 
 #[test]
+fn retirement_signing_is_explicit_and_never_a_live_routing_authority() {
+    let dir = TempDir::new("retirement");
+    let db = dir.path().join("secrets.db");
+    let authored = dir.path().join("retired.mix");
+    let signed = dir.path().join("retired.signed");
+    let genesis_pub = dir.path().join("genesis.pub");
+    let prefix = strings(&[
+        "--secrets-db", db.to_str().unwrap(), "--mesh", "example.internal",
+    ]);
+    let mut genesis = prefix.clone();
+    genesis.push("genesis".into());
+    assert!(run(&genesis).status.success());
+    let mut pubkey = prefix.clone();
+    pubkey.push("pubkey".into());
+    let public = run(&pubkey);
+    assert!(public.status.success());
+    std::fs::write(&genesis_pub, public.stdout).unwrap();
+    let source = concat!(
+        "inventory: {schema_version: 1, mesh: \"example.internal\", ",
+        "subnet: \"192.0.2.0/24\", epoch: 8, hub: [], members: [",
+        "{name: \"alpha\", status: \"tombstoned\", last_touched_epoch: 8},",
+        "{name: \"beta\", status: \"tombstoned\", last_touched_epoch: 8}",
+        "], unsigned: true}\n",
+    );
+    std::fs::write(&authored, source).unwrap();
+    let mut sign = prefix;
+    sign.extend(strings(&[
+        "sign", authored.to_str().unwrap(), "--out", signed.to_str().unwrap(),
+        "--recovery-generation", "0",
+    ]));
+    assert!(!run(&sign).status.success());
+    assert!(!signed.exists(), "ordinary signing published a route-free inventory");
+    sign.push("--retirement".into());
+    let output = run(&sign);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let mut verify = strings(&[
+        "--secrets-db", "/definitely/not/a/secrets.db", "verify",
+        signed.to_str().unwrap(), "--genesis-pub", genesis_pub.to_str().unwrap(),
+        "--expected-mesh", "example.internal", "--json", "--include-payload",
+        "--against-authored", authored.to_str().unwrap(),
+    ]);
+    let ordinary = run(&verify);
+    assert!(!ordinary.status.success());
+    assert_eq!(json_stdout(&ordinary)["error"]["code"], "routing_view_invalid");
+    verify.push("--retirement".into());
+    let retired = run(&verify);
+    assert!(retired.status.success(), "{}", String::from_utf8_lossy(&retired.stdout));
+    let report = json_stdout(&retired);
+    assert_eq!(report["retirement"], true);
+    assert_eq!(report["routing_view"]["live"], false);
+    assert_eq!(report["routing_view"]["members"].as_array().unwrap().len(), 2);
+    assert_eq!(report["against_authored"]["matches"], true);
+    assert_eq!(report["payload"]["recovery_generation"], 0);
+    assert_eq!(report["via_recovery"], false);
+
+    // The specialised mode retains cryptographic and authored-byte checks.
+    let changed = dir.path().join("changed.mix");
+    std::fs::write(&changed, source.replace("epoch: 8", "epoch: 9")).unwrap();
+    let authored_arg = verify.iter().position(|arg| arg == "--against-authored").unwrap() + 1;
+    verify[authored_arg] = changed.to_str().unwrap().into();
+    let mismatch = run(&verify);
+    assert!(!mismatch.status.success());
+    assert_eq!(json_stdout(&mismatch)["error"]["code"], "authoring_mismatch");
+    verify[authored_arg] = authored.to_str().unwrap().into();
+    let mut envelope: Value = serde_json::from_slice(&std::fs::read(&signed).unwrap()).unwrap();
+    envelope["payload"]["epoch"] = json!(9);
+    std::fs::write(&signed, serde_json::to_vec(&envelope).unwrap()).unwrap();
+    let tampered = run(&verify);
+    assert!(!tampered.status.success());
+    assert_eq!(json_stdout(&tampered)["error"]["code"], "verification_failed");
+}
+
+#[test]
+fn retirement_verification_refuses_a_live_inventory() {
+    let fixture = Fixture::new();
+    let output = run(&strings(&[
+        "--secrets-db", "/definitely/not/a/secrets.db", "verify",
+        fixture.signed.to_str().unwrap(), "--genesis-pub",
+        fixture.genesis_pub.to_str().unwrap(), "--retirement", "--json",
+    ]));
+    assert!(!output.status.success());
+    assert_eq!(json_stdout(&output)["error"]["code"], "routing_view_invalid");
+}
+
+#[test]
 fn genesis_pub_wrong_key_fails_without_opening_secrets_db() {
     let fixture = Fixture::new();
     let output = run(&strings(&[

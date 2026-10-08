@@ -447,7 +447,7 @@
 <ul>
 <li>Cargo package: <code>cosmix-lib-mesh-trust</code></li>
 <li>Rust library: <code>cosmix_mesh_trust</code></li>
-<li>Current crate version: <code>0.4.3</code></li>
+<li>Current crate version: <code>0.10.1</code></li>
 <li>Binary targets: none</li>
 <li>Default posture: core verification plus the <code>cosmix</code> integration feature</li>
 </ul>
@@ -497,6 +497,12 @@
 <p>Invalid or unknown entries in the unsigned signature bag do not invalidate an otherwise valid payload. Unknown fields and duplicate keys inside signed payload data fail closed.</p>
 <p>On success, <code>AcceptedInventory</code> returns the epoch and recovery generation to persist, whether recovery authorised the result, the trusted keys whose signatures verified, and the verify-key set to adopt. Persistence remains the caller's responsibility.</p>
 <p>Inventory <code>signed_at</code> and <code>valid_until</code> values are advisory. The verifier does not use wall-clock time as a security gate.</p>
+<p>Live consumers use <code>routing::strict_routing_view</code> after signature verification;
+it rejects an inventory with no active Bus member. Offline cleanup receipts may
+use <code>routing::strict_retirement_view</code>, which requires a non-empty set consisting
+entirely of unique, valid tombstones. Both validators share the strict member and
+subnet parser. A retirement receipt supplies no live routing authority and does
+not change a running broker's accepted epoch.</p>
 <h2 id="admission">Admission</h2>
 <p><code>AdmissionTranscript::canonical_bytes</code> uses a fixed field order with a domain tag and length-prefixed byte fields. The transcript binds a proof to the mesh, claimed source node, verifying broker, inventory epoch, session identifier, server nonce, client ephemeral value, and channel-binding hash.</p>
 <p><code>select_d2_pubkeys</code> and <code>select_wg_pubkeys</code> return every matching credential in the half-open epoch interval <code>[from_epoch, until_epoch)</code>. Missing or malformed bounds and non-32-byte public keys are skipped.</p>

@@ -83,6 +83,8 @@ pub enum RoutingViewError {
     },
     #[error("member set contains zero active bus routing members")]
     ZeroActiveBus,
+    #[error("retirement requires a non-empty member set containing only tombstones")]
+    IncompleteRetirement,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -151,6 +153,24 @@ impl Subnet {
 pub fn strict_routing_view(
     members: &serde_json::Value,
     subnet: &str,
+) -> Result<Vec<RoutingMember>, RoutingViewError> {
+    membership_view(members, subnet, false)
+}
+
+/// Validate an offline retirement receipt, never a live routing authority.
+/// Every member must be a unique valid tombstone. The ordinary live validator
+/// still rejects a view with no active Bus member.
+pub fn strict_retirement_view(
+    members: &serde_json::Value,
+    subnet: &str,
+) -> Result<Vec<RoutingMember>, RoutingViewError> {
+    membership_view(members, subnet, true)
+}
+
+fn membership_view(
+    members: &serde_json::Value,
+    subnet: &str,
+    retirement: bool,
 ) -> Result<Vec<RoutingMember>, RoutingViewError> {
     let subnet_cidr = Subnet::parse(subnet).map_err(|reason| RoutingViewError::BadSubnet {
         subnet: subnet.to_string(),
@@ -239,7 +259,13 @@ pub fn strict_routing_view(
         }
     }
 
-    if !view
+    if retirement {
+        if view.is_empty()
+            || view.iter().any(|entry| !matches!(entry, RoutingMember::Tombstoned { .. }))
+        {
+            return Err(RoutingViewError::IncompleteRetirement);
+        }
+    } else if !view
         .iter()
         .any(|entry| matches!(entry, RoutingMember::ActiveBus { .. }))
     {
@@ -514,5 +540,26 @@ mod tests {
         )
         .expect_err("zero active bus must reject");
         assert_eq!(err, RoutingViewError::ZeroActiveBus);
+    }
+
+    #[test]
+    fn retirement_is_explicit_and_never_a_live_routing_view() {
+        let retired = json!([
+            {"name":"alpha","status":"tombstoned"},
+            {"name":"beta","status":"tombstoned"}
+        ]);
+        assert_eq!(strict_retirement_view(&retired, SUBNET).unwrap().len(), 2);
+        assert_eq!(strict_routing_view(&retired, SUBNET), Err(RoutingViewError::ZeroActiveBus));
+        for invalid in [
+            json!([]),
+            json!([{"name":"alpha","status":"active","mesh_ip":"192.0.2.5","bus":true}]),
+            json!([{"name":"alpha","status":"active","mesh_ip":"192.0.2.5","bus":false}]),
+            json!([{"name":"alpha","status":"tombstoned"},{"name":"alpha","status":"tombstoned"}]),
+            json!([{"name":"Alpha","status":"tombstoned"}]),
+            json!([{"name":"alpha","status":"retired"}]),
+        ] {
+            assert!(strict_retirement_view(&invalid, SUBNET).is_err());
+        }
+        assert!(strict_retirement_view(&retired, "invalid").is_err());
     }
 }
