@@ -517,7 +517,8 @@ also fit the configured server message limit.</p>
 outbound queue and DKIM signing pipeline. A successful receipt reports
 <code>status: "accepted"</code>, the operation, submission, email and message IDs, recipient
 count, and <code>delivery_confirmed: false</code>. Acceptance does not prove remote delivery.</p>
-<p>The durable key is the Bus actor plus operation ID. Repeating the same typed
+<p>The durable key is the canonical submitting account plus operation ID; the
+original Bus actor is retained for audit. Repeating the same typed
 payload returns the saved receipt without another delivery or queue entry;
 reusing that key with another payload is rejected. A reservation without a
 saved receipt means the outcome is uncertain, including after a process crash.

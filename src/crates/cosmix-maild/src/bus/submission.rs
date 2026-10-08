@@ -63,17 +63,17 @@ fn address(value: &str) -> Result<()> {
 
 enum Admission { New, Replay(String), Uncertain }
 
-fn reserve(conn: &Connection, actor: &str, operation: &str, digest: &str) -> Result<Admission> {
+fn reserve(conn: &Connection, account: &str, actor: &str, operation: &str, digest: &str) -> Result<Admission> {
     let existing: Option<(String, Option<String>)> = conn.query_row(
-        "SELECT payload_hash, receipt FROM bus_submissions WHERE actor=?1 AND operation_id=?2",
-        params![actor, operation], |row| Ok((row.get(0)?, row.get(1)?)),
+        "SELECT payload_hash, receipt FROM bus_submissions WHERE account=?1 AND operation_id=?2",
+        params![account, operation], |row| Ok((row.get(0)?, row.get(1)?)),
     ).optional()?;
     if let Some((prior, receipt)) = existing {
         ensure!(prior == digest, "operation_id conflicts with previous payload");
         return Ok(receipt.map_or(Admission::Uncertain, Admission::Replay));
     }
-    conn.execute("INSERT INTO bus_submissions(actor,operation_id,payload_hash) VALUES(?1,?2,?3)",
-        params![actor, operation, digest])?;
+    conn.execute("INSERT INTO bus_submissions(account,actor,operation_id,payload_hash) VALUES(?1,?2,?3,?4)",
+        params![account, actor, operation, digest])?;
     Ok(Admission::New)
 }
 
@@ -98,15 +98,29 @@ async fn submit(cmd: &IncomingCommand, db: &Db, store: &Arc<SqliteMailStore>,
     let from = request.from.as_deref().unwrap_or(&account.email);
     ensure!(crate::props::aliases::sender_authorized(aliases, from, &account.email).await,
         "sender is not authorised for submitting account");
+    let message_id = format!("{}.{}@{}", blake3::hash(account.email.as_bytes()).to_hex(),
+        blake3::hash(request.operation_id.as_bytes()).to_hex(), from.split_once('@').expect("validated address").1);
+    let bytes = mail_builder::MessageBuilder::new().from(from)
+        .to(request.to.iter().map(String::as_str).collect::<Vec<_>>())
+        .subject(request.subject.as_str()).message_id(message_id.as_str())
+        .text_body(request.text.as_str()).write_to_vec()?;
+    ensure!(bytes.len() <= max_message_size, "rendered message exceeds server byte bound");
+    let ms = store.clone();
+    let account_id = account.id;
+    let drafts = tokio::task::spawn_blocking(move || -> Result<_> {
+        ms.mailbox_by_role(account_id, MailboxRole::Drafts)?
+            .ok_or_else(|| anyhow::anyhow!("submitting account has no Drafts mailbox"))
+    }).await??;
     // Hash the typed request, not generated Date/Message-ID bytes. Identical
     // retries remain identical after reconnect or process restart.
     let digest = blake3::hash(&serde_json::to_vec(&request)?).to_hex().to_string();
     let actor = cmd.from.clone();
+    let canonical_account = account.email.clone();
     let operation = request.operation_id.clone();
     let conn = db.conn.clone();
     let reservation = tokio::task::spawn_blocking(move || {
         let conn = conn.lock().map_err(|_| anyhow::anyhow!("submission database lock poisoned"))?;
-        reserve(&conn, &actor, &operation, &digest)
+        reserve(&conn, &canonical_account, &actor, &operation, &digest)
     }).await??;
     match reservation {
         Admission::Replay(receipt) => return Ok(receipt),
@@ -115,18 +129,9 @@ async fn submit(cmd: &IncomingCommand, db: &Db, store: &Arc<SqliteMailStore>,
     }
     // After reservation, every failure is potentially ambiguous. Keep the
     // reservation permanently; caller retries may inspect, never resend it.
-    let message_id = format!("{}.{}@{}", blake3::hash(cmd.from.as_bytes()).to_hex(),
-        blake3::hash(request.operation_id.as_bytes()).to_hex(), from.split_once('@').expect("validated address").1);
-    let bytes = mail_builder::MessageBuilder::new().from(from)
-        .to(request.to.iter().map(String::as_str).collect::<Vec<_>>())
-        .subject(request.subject.as_str()).message_id(message_id.as_str())
-        .text_body(request.text.as_str()).write_to_vec()?;
-    ensure!(bytes.len() <= max_message_size, "rendered message exceeds server byte bound; reserved operation will not be resent");
     let ms = store.clone();
     let account_id = account.id;
     let email_id = tokio::task::spawn_blocking(move || -> Result<_> {
-        let drafts = ms.mailbox_by_role(account_id, MailboxRole::Drafts)?
-            .ok_or_else(|| anyhow::anyhow!("submitting account has no Drafts mailbox; operation is reserved"))?;
         let hash = ms.mds().put_blob(&bytes)?;
         let parsed = mail_parser::MessageParser::default().parse(&bytes)
             .ok_or_else(|| anyhow::anyhow!("rendered message parse failed"))?;
@@ -141,13 +146,13 @@ async fn submit(cmd: &IncomingCommand, db: &Db, store: &Arc<SqliteMailStore>,
         "submission_id":submission_id.to_string(),"email_id":email_id.to_string(),
         "message_id":message_id,"recipient_count":request.to.len(),"delivery_confirmed":false}).to_string();
     let saved = receipt.clone();
-    let actor = cmd.from.clone();
+    let canonical_account = account.email;
     let operation = request.operation_id;
     let conn = db.conn.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {
         let conn = conn.lock().map_err(|_| anyhow::anyhow!("submission database lock poisoned"))?;
-        ensure!(conn.execute("UPDATE bus_submissions SET receipt=?3 WHERE actor=?1 AND operation_id=?2 AND receipt IS NULL",
-            params![actor,operation,saved])? == 1, "submission receipt persistence failed");
+        ensure!(conn.execute("UPDATE bus_submissions SET receipt=?3 WHERE account=?1 AND operation_id=?2 AND receipt IS NULL",
+            params![canonical_account,operation,saved])? == 1, "submission receipt persistence failed");
         Ok(())
     }).await??;
     Ok(receipt)
@@ -180,8 +185,12 @@ mod tests {
             args:Value::Null,headers:Default::default(),body:json!({"operation_id":"once-1",
                 "account":"sender@example.test","to":["local@example.test","remote@outside.test"],
                 "subject":"Native test","text":"Plain text ✓"}).to_string() };
+        assert_eq!(dispatch(&cmd,&db,&store,&aliases,1).await.0,10);
+        assert_eq!(db.conn.lock().unwrap().query_row("SELECT count(*) FROM bus_submissions",[],|row| row.get::<_,i64>(0)).unwrap(),0);
         let first = dispatch(&cmd,&db,&store,&aliases,1024*1024).await;
         assert_eq!(first.0,0,"{}",first.1);
+        assert_eq!(dispatch(&cmd,&db,&store,&aliases,1024*1024).await,first);
+        cmd.from = "reconnected-native-test".into();
         assert_eq!(dispatch(&cmd,&db,&store,&aliases,1024*1024).await,first);
         let queued = crate::smtp::queue::list(&db.conn,10).await.unwrap();
         assert_eq!(queued.len(),1);
@@ -218,12 +227,12 @@ mod tests {
     #[test]
     fn reservation_fences_replay_conflicts_and_ambiguous_restarts() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE bus_submissions(actor TEXT,operation_id TEXT,payload_hash TEXT,receipt TEXT,PRIMARY KEY(actor,operation_id));").unwrap();
-        assert!(matches!(reserve(&conn,"actor","op","hash").unwrap(),Admission::New));
-        assert!(matches!(reserve(&conn,"actor","op","hash").unwrap(),Admission::Uncertain));
-        assert!(reserve(&conn,"actor","op","other").is_err());
+        conn.execute_batch("CREATE TABLE bus_submissions(account TEXT,actor TEXT,operation_id TEXT,payload_hash TEXT,receipt TEXT,PRIMARY KEY(account,operation_id));").unwrap();
+        assert!(matches!(reserve(&conn,"account","actor","op","hash").unwrap(),Admission::New));
+        assert!(matches!(reserve(&conn,"account","new-actor","op","hash").unwrap(),Admission::Uncertain));
+        assert!(reserve(&conn,"account","new-actor","op","other").is_err());
         conn.execute("UPDATE bus_submissions SET receipt='accepted'",[]).unwrap();
-        assert!(matches!(reserve(&conn,"actor","op","hash").unwrap(),Admission::Replay(value) if value=="accepted"));
-        assert!(matches!(reserve(&conn,"other","op","hash").unwrap(),Admission::New));
+        assert!(matches!(reserve(&conn,"account","new-actor","op","hash").unwrap(),Admission::Replay(value) if value=="accepted"));
+        assert!(matches!(reserve(&conn,"other-account","actor","op","hash").unwrap(),Admission::New));
     }
 }
