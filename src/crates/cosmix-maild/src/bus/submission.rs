@@ -111,13 +111,12 @@ enum Admission {
     Uncertain,
 }
 
-fn reserve(
+fn lookup(
     conn: &Connection,
     account: &str,
-    actor: &str,
     operation: &str,
     digest: &str,
-) -> Result<Admission> {
+) -> Result<Option<Admission>> {
     let existing: Option<(String, Option<String>)> = conn.query_row(
         "SELECT payload_hash, receipt FROM bus_submissions WHERE account=?1 AND operation_id=?2",
         params![account, operation], |row| Ok((row.get(0)?, row.get(1)?)),
@@ -127,8 +126,13 @@ fn reserve(
             prior == digest,
             "operation_id conflicts with previous payload"
         );
-        return Ok(receipt.map_or(Admission::Uncertain, Admission::Replay));
+        return Ok(Some(receipt.map_or(Admission::Uncertain, Admission::Replay)));
     }
+    Ok(None)
+}
+
+fn reserve(conn: &Connection, account: &str, actor: &str, operation: &str, digest: &str) -> Result<Admission> {
+    if let Some(existing) = lookup(conn,account,operation,digest)? { return Ok(existing); }
     conn.execute(
         "INSERT INTO bus_submissions(account,actor,operation_id,payload_hash) VALUES(?1,?2,?3,?4)",
         params![account, actor, operation, digest],
@@ -173,6 +177,24 @@ async fn submit(
     let request: Request =
         serde_json::from_value(super::try_resolve_args(cmd).map_err(anyhow::Error::msg)?)?;
     request.validate()?;
+    // Existing outcomes precede mutable account, alias, mailbox and size
+    // checks. They report an earlier send, never authorise a new one.
+    let digest = blake3::hash(&serde_json::to_vec(&request)?).to_hex().to_string();
+    let canonical_account = request.account.to_ascii_lowercase();
+    let conn = db.conn.clone();
+    let prior_account = canonical_account.clone();
+    let prior_digest = digest.clone();
+    let prior_operation = request.operation_id.clone();
+    let prior = tokio::task::spawn_blocking(move || {
+        let conn = conn.lock().map_err(|_| anyhow::anyhow!("submission database lock poisoned"))?;
+        lookup(&conn,&prior_account,&prior_operation,&prior_digest)
+    }).await??;
+    match prior {
+        Some(Admission::Replay(receipt)) => return Ok(receipt),
+        Some(Admission::Uncertain) => anyhow::bail!("submission outcome uncertain; operation is reserved and will not be resent"),
+        None => {},
+        Some(Admission::New) => unreachable!("lookup never admits new work"),
+    }
     let account = crate::db::account::get_by_email(&db.conn, &request.account.to_ascii_lowercase())
         .await?
         .ok_or_else(|| anyhow::anyhow!("submitting account not found"))?;
@@ -211,11 +233,7 @@ async fn submit(
     .await??;
     // Hash the typed request, not generated Date/Message-ID bytes. Identical
     // retries remain identical after reconnect or process restart.
-    let digest = blake3::hash(&serde_json::to_vec(&request)?)
-        .to_hex()
-        .to_string();
     let actor = cmd.from.clone();
-    let canonical_account = account.email.clone();
     let operation = request.operation_id.clone();
     let conn = db.conn.clone();
     let reservation = tokio::task::spawn_blocking(move || {
@@ -262,7 +280,7 @@ async fn submit(
         "message_id":message_id,"recipient_count":request.to.len(),"delivery_confirmed":false})
     .to_string();
     let saved = receipt.clone();
-    let canonical_account = account.email;
+    let canonical_account = request.account.to_ascii_lowercase();
     let operation = request.operation_id;
     let conn = db.conn.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {
@@ -333,6 +351,7 @@ mod tests {
         );
         let first = dispatch(&cmd, &db, &store, &aliases, 1024 * 1024).await;
         assert_eq!(first.0, 0, "{}", first.1);
+        assert_eq!(dispatch(&cmd,&db,&store,&aliases,1).await,first);
         assert_eq!(
             dispatch(&cmd, &db, &store, &aliases, 1024 * 1024).await,
             first
