@@ -288,3 +288,27 @@ async fn lookup_reports_transport_failure_and_emit_remains_nonfatal() {
     wait_trace_count(&dir, "emit|", emits + 2, HARD).await;
     wait_trace_count(&dir, "emitm|", emitms + 2, HARD).await;
 }
+
+#[tokio::test]
+async fn uncaught_interruption_text_is_a_reported_serve_error() {
+    let _g = lock().await;
+    let dir = Dir::new("interruption-error");
+    let broker = Broker::start();
+    let node_conf = dir.write("node.conf.mix", &node_conf_text(broker_tcp_port(&broker)));
+    let script = dir.write("svc.mix", r#"raise("PROBE_REFUSAL", json_encode({interrupted:false,error:"not a signal"}))"#);
+    let mut citizen = Citizen::spawn(
+        Path::new(env!("CARGO_BIN_EXE_mix")),
+        &dir,
+        &node_conf,
+        &script,
+    );
+    let deadline = Instant::now() + HARD;
+    let status = loop {
+        if let Some(status) = citizen.child.try_wait().unwrap() { break status; }
+        assert!(Instant::now() < deadline, "serve error did not terminate");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(status.code(), Some(1));
+    let stderr = dir.read("citizen.stderr");
+    assert!(stderr.contains("PROBE_REFUSAL") && stderr.contains("script error"), "{stderr}");
+}

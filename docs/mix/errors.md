@@ -451,8 +451,12 @@ end
 Two things to know about the sentinels: the **negative** `rc` values (`-1`
 timeout, `-2` interrupt) can never collide with a real child exit (`0..255`,
 including `128+sig`); and an **interrupt is a stop request, not a recoverable
-error** — after Ctrl-C the interpreter winds the script down and the process
-exits cleanly (0), so don't build recovery logic on catching `run: interrupted`
+error** — after Ctrl-C the interpreter winds the script down. Non-interactive
+scripts and `-c` exit 130 for SIGINT or 143 for SIGTERM; SIGINT on an interactive
+terminal retains exit 0. These outcomes come from actual signal arrival,
+never from an error message or a script-defined error code. An ordinary uncaught
+error containing `interrupted`, including JSON with `interrupted:false`, prints
+its diagnostic and exits 1. Don't build recovery logic on catching `run: interrupted`
 or branching on `.interrupted` (later statements may not run).
 
 The opts map is validated loudly (and catchably): an unknown key raises

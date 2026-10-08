@@ -807,8 +807,12 @@ end
 <p>Two things to know about the sentinels: the <strong>negative</strong> <code>rc</code> values (<code>-1</code>
 timeout, <code>-2</code> interrupt) can never collide with a real child exit (<code>0..255</code>,
 including <code>128+sig</code>); and an <strong>interrupt is a stop request, not a recoverable
-error</strong> — after Ctrl-C the interpreter winds the script down and the process
-exits cleanly (0), so don't build recovery logic on catching <code>run: interrupted</code>
+error</strong> — after Ctrl-C the interpreter winds the script down. Non-interactive
+scripts and <code>-c</code> exit 130 for SIGINT or 143 for SIGTERM; SIGINT on an interactive
+terminal retains exit 0. These outcomes come from actual signal arrival,
+never from an error message or a script-defined error code. An ordinary uncaught
+error containing <code>interrupted</code>, including JSON with <code>interrupted:false</code>, prints
+its diagnostic and exits 1. Don't build recovery logic on catching <code>run: interrupted</code>
 or branching on <code>.interrupted</code> (later statements may not run).</p>
 <p>The opts map is validated loudly (and catchably): an unknown key raises
 <code>run_rc: unknown opt "bogus" (supported: timeout)</code>, and a surplus argument raises

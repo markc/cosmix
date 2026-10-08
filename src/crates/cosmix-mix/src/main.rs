@@ -323,6 +323,23 @@ async fn shutdown_signal() -> i32 {
 /// `SWEEP_GRACE` (2 s). `MIX_SIGTERM_BACKSTOP_SECS` overrides it.
 const SIGTERM_BACKSTOP_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
 
+// The evaluator consumes its cooperative flag before returning an error.
+// Keep the actual CLI signal separate from both that flag and error prose.
+static SIGINT_RECEIVED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn received_sigint() -> bool {
+    SIGINT_RECEIVED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn signal_exit_code(signal: i32, framed: bool) -> i32 {
+    if !framed && signal == libc::SIGINT && std::io::stdin().is_terminal() {
+        0
+    } else {
+        128 + signal
+    }
+}
+
 /// Make SIGTERM final in non-interactive modes (script, `-c`, `--serve`).
 ///
 /// tokio's SIGTERM handler replaces the default terminate disposition, and
@@ -339,6 +356,15 @@ const SIGTERM_BACKSTOP_GRACE: std::time::Duration = std::time::Duration::from_se
 fn arm_sigterm_backstop() {
     static ARMED: std::sync::Once = std::sync::Once::new();
     ARMED.call_once(|| {
+        // SAFETY: the handler only stores into a static atomic. Record arrival
+        // before the evaluator's handler can consume its own interrupt flag.
+        if let Err(error) = unsafe {
+            signal_hook::low_level::register(libc::SIGINT, || {
+                SIGINT_RECEIVED.store(true, std::sync::atomic::Ordering::Relaxed);
+            })
+        } {
+            eprintln!("mix: failed to record SIGINT: {error}");
+        }
         let grace = env::var("MIX_SIGTERM_BACKSTOP_SECS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -769,20 +795,12 @@ fn run_source(
         // one historical carve-out: SIGINT on an interactive terminal
         // keeps the clean 0 (Ctrl-C at a TTY is the operator, not a
         // cancellation).
-        ScriptOutcome::Signal(sig) => {
-            if sig == libc::SIGINT && std::io::stdin().is_terminal() {
-                0
-            } else {
-                128 + sig
-            }
-        }
+        ScriptOutcome::Signal(sig) => signal_exit_code(sig, false),
         ScriptOutcome::Ran(Ok(_)) => 0,
         ScriptOutcome::Ran(Err(cosmix_mix::error::MixError::ExitRequest { code })) => code,
         ScriptOutcome::Ran(Err(e)) => {
-            let msg = format!("{e}");
-            if msg.contains("interrupted") {
-                // Clean exit on interrupt
-                0
+            if received_sigint() {
+                signal_exit_code(libc::SIGINT, false)
             } else {
                 print_uncaught(&e);
                 1
@@ -992,20 +1010,10 @@ fn run_command_line(
                     // too, with the one historical carve-out — SIGINT on an
                     // interactive terminal (Ctrl-C at a TTY is the
                     // operator, not a cancellation).
-                    Err(signal) => {
-                        if framed
-                            || signal != libc::SIGINT
-                            || !std::io::stdin().is_terminal()
-                        {
-                            128 + signal
-                        } else {
-                            0
-                        }
-                    }
+                    Err(signal) => signal_exit_code(signal, framed),
                     Ok(Ok(_)) => 0,
                     Ok(Err(cosmix_mix::error::MixError::ExitRequest { code })) => code,
-                    // Match run_source: a Ctrl-C interrupt is a clean exit.
-                    Ok(Err(e)) if format!("{e}").contains("interrupted") => 0,
+                    Ok(Err(_)) if received_sigint() => signal_exit_code(libc::SIGINT, framed),
                     Ok(Err(e)) => {
                         print_uncaught(&e);
                         1
@@ -1018,38 +1026,23 @@ fn run_command_line(
                 // Race against Ctrl-C like the MixCode arm; exit 0 on success,
                 // 1 on a Mix runtime error (the function's own `$rc`/side effects
                 // carry the real command status, exactly as a paren call would).
-                let res: Result<(), cosmix_mix::error::MixError> = tokio::select! {
+                let res: Result<Result<(), cosmix_mix::error::MixError>, i32> = tokio::select! {
                     biased;
-                    // B6: the signal number travels in a structured error so
-                    // the exit-code match below can apply the same TTY
-                    // carve-out as every other path.
-                    sig = shutdown_signal() => Err(cosmix_mix::error::MixError::structured(
-                        "SIGNAL_INTERRUPT",
-                        sig.to_string(),
-                    )),
+                    sig = shutdown_signal() => Err(sig),
                     r = async {
                         eval.call_function_by_name_with_args(&name, &args).await?;
                         if eval.handler_count() > 0 {
                             eval.run_event_pump().await?;
                         }
                         Ok(())
-                    } => r,
+                    } => Ok(r),
                 };
                 match res {
-                    Ok(_) => 0,
-                    Err(cosmix_mix::error::MixError::ExitRequest { code }) => code,
-                    Err(cosmix_mix::error::MixError::Structured(info))
-                        if info.code == "SIGNAL_INTERRUPT" =>
-                    {
-                        let sig: i32 = info.message.parse().unwrap_or(libc::SIGTERM);
-                        if sig == libc::SIGINT && std::io::stdin().is_terminal() {
-                            0
-                        } else {
-                            128 + sig
-                        }
-                    }
-                    Err(e) if format!("{e}").contains("interrupted") => 0,
-                    Err(e) => {
+                    Err(signal) => signal_exit_code(signal, false),
+                    Ok(Ok(_)) => 0,
+                    Ok(Err(cosmix_mix::error::MixError::ExitRequest { code })) => code,
+                    Ok(Err(_)) if received_sigint() => signal_exit_code(libc::SIGINT, false),
+                    Ok(Err(e)) => {
                         print_uncaught(&e);
                         1
                     }
@@ -1621,7 +1614,7 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
                     }
                     Err(e) => {
                         let msg = format!("{e}");
-                        if msg.contains("interrupted") {
+                        if received_sigint() {
                             ServeOutcome::Interrupted
                         } else {
                             tracing::error!(
