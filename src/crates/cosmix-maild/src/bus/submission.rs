@@ -126,13 +126,23 @@ fn lookup(
             prior == digest,
             "operation_id conflicts with previous payload"
         );
-        return Ok(Some(receipt.map_or(Admission::Uncertain, Admission::Replay)));
+        return Ok(Some(
+            receipt.map_or(Admission::Uncertain, Admission::Replay),
+        ));
     }
     Ok(None)
 }
 
-fn reserve(conn: &Connection, account: &str, actor: &str, operation: &str, digest: &str) -> Result<Admission> {
-    if let Some(existing) = lookup(conn,account,operation,digest)? { return Ok(existing); }
+fn reserve(
+    conn: &Connection,
+    account: &str,
+    actor: &str,
+    operation: &str,
+    digest: &str,
+) -> Result<Admission> {
+    if let Some(existing) = lookup(conn, account, operation, digest)? {
+        return Ok(existing);
+    }
     conn.execute(
         "INSERT INTO bus_submissions(account,actor,operation_id,payload_hash) VALUES(?1,?2,?3,?4)",
         params![account, actor, operation, digest],
@@ -179,20 +189,27 @@ async fn submit(
     request.validate()?;
     // Existing outcomes precede mutable account, alias, mailbox and size
     // checks. They report an earlier send, never authorise a new one.
-    let digest = blake3::hash(&serde_json::to_vec(&request)?).to_hex().to_string();
+    let digest = blake3::hash(&serde_json::to_vec(&request)?)
+        .to_hex()
+        .to_string();
     let canonical_account = request.account.to_ascii_lowercase();
     let conn = db.conn.clone();
     let prior_account = canonical_account.clone();
     let prior_digest = digest.clone();
     let prior_operation = request.operation_id.clone();
     let prior = tokio::task::spawn_blocking(move || {
-        let conn = conn.lock().map_err(|_| anyhow::anyhow!("submission database lock poisoned"))?;
-        lookup(&conn,&prior_account,&prior_operation,&prior_digest)
-    }).await??;
+        let conn = conn
+            .lock()
+            .map_err(|_| anyhow::anyhow!("submission database lock poisoned"))?;
+        lookup(&conn, &prior_account, &prior_operation, &prior_digest)
+    })
+    .await??;
     match prior {
         Some(Admission::Replay(receipt)) => return Ok(receipt),
-        Some(Admission::Uncertain) => anyhow::bail!("submission outcome uncertain; operation is reserved and will not be resent"),
-        None => {},
+        Some(Admission::Uncertain) => anyhow::bail!(
+            "submission outcome uncertain; operation is reserved and will not be resent"
+        ),
+        None => {}
         Some(Admission::New) => unreachable!("lookup never admits new work"),
     }
     let account = crate::db::account::get_by_email(&db.conn, &request.account.to_ascii_lowercase())
@@ -351,7 +368,7 @@ mod tests {
         );
         let first = dispatch(&cmd, &db, &store, &aliases, 1024 * 1024).await;
         assert_eq!(first.0, 0, "{}", first.1);
-        assert_eq!(dispatch(&cmd,&db,&store,&aliases,1).await,first);
+        assert_eq!(dispatch(&cmd, &db, &store, &aliases, 1).await, first);
         assert_eq!(
             dispatch(&cmd, &db, &store, &aliases, 1024 * 1024).await,
             first

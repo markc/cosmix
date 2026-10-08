@@ -13,8 +13,8 @@
 //! drives the same entry point.
 
 pub mod attachments;
-pub mod blob_lane;
 pub mod auth;
+pub mod blob_lane;
 pub mod bus;
 pub mod config;
 pub mod dav;
