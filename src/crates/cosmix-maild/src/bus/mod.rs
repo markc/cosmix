@@ -322,7 +322,12 @@ fn verb_manifest() -> Vec<cosmix_bus::VerbDescriptor> {
     use cosmix_bus::VerbDescriptor;
     vec![
         VerbDescriptor::new("HELP", &[], "List all commands this service accepts", true),
-        VerbDescriptor::new("maild.submit", &["operation_id", "account", "from", "to", "subject", "text"], "Submit typed plain-text mail once through the existing mail pipeline", false),
+        VerbDescriptor::new(
+            "maild.submit",
+            &["operation_id", "account", "from", "to", "subject", "text"],
+            "Submit typed plain-text mail once through the existing mail pipeline",
+            false,
+        ),
         VerbDescriptor::new(
             "maild.props.get",
             &["namespace", "key"],

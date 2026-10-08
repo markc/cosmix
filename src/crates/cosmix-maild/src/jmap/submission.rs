@@ -31,7 +31,8 @@ pub async fn set(
     // Handle create
     if let Some(create) = args.get("create").and_then(|v| v.as_object()) {
         for (client_id, obj) in create {
-            let result = create_submission(db, mailstore, aliases_runtime, account_id, obj, false).await;
+            let result =
+                create_submission(db, mailstore, aliases_runtime, account_id, obj, false).await;
             match result {
                 Ok(submission_id) => {
                     created_map.insert(
@@ -249,11 +250,15 @@ async fn create_submission(
                     tracing::info!(from = %from_addr, to = %addr, "Local delivery completed");
                 }
                 Ok(Err(e)) => {
-                    if strict_local { return Err(e.into()); }
+                    if strict_local {
+                        return Err(e.into());
+                    }
                     tracing::warn!(error = %e, from = %from_addr, to = %addr, "Local delivery failed");
                 }
                 Err(e) => {
-                    if strict_local { return Err(e.into()); }
+                    if strict_local {
+                        return Err(e.into());
+                    }
                     tracing::warn!(error = %e, from = %from_addr, to = %addr, "Local delivery spawn_blocking failed");
                 }
             }
