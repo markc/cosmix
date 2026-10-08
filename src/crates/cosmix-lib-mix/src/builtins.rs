@@ -374,7 +374,7 @@ builtin_table! {
     ("hash_md5", CapabilityClass::Pure,        "system",  "MD5 hash of a string/bytes/buffer → lowercase hex; {raw:true} → bytes. ⚠ CRYPTOGRAPHICALLY BROKEN (collisions since 2004) — legacy interop only (Content-MD5, mail dedup keys, checksums against existing tools), NEVER a security decision; use hash_sha256/hash_blake3 for those (v0.66.0)", contract!((s: any_of(string, bytes, buffer), opts?: any_of(map, nil)) -> any_of(string, bytes); failure[raises])),
     ("hash_sha1", CapabilityClass::Pure,       "system",  "SHA-1 hash of a string/bytes/buffer → lowercase hex; {raw:true} → bytes. ⚠ CRYPTOGRAPHICALLY BROKEN (SHAttered, 2017) — legacy interop only (git object ids, older ETags/APIs), NEVER a security decision; use hash_sha256/hash_blake3 for those (v0.66.0)", contract!((s: any_of(string, bytes, buffer), opts?: any_of(map, nil)) -> any_of(string, bytes); failure[raises])),
     ("hmac_sha256", CapabilityClass::Pure,     "system",  "HMAC-SHA256 (RFC 2104) of a message with a secret key → lowercase hex; {raw:true} → the 32 MAC bytes (v0.66.0) — webhook signature verification (Stripe-Signature etc). Accepts string/bytes/buffer for both args (requires crypto feature)", contract!((key: any_of(string, bytes, buffer), msg: any_of(string, bytes, buffer), opts?: any_of(map, nil)) -> any_of(string, bytes); failure[raises])),
-    ("password_hash", CapabilityClass::Pure,   "system",  "Hash a password: password_hash(plaintext[, cost]) → bcrypt $2b$… string (cost 4-31, default 12; input over 72 bytes raises), or password_hash(plaintext, {scheme: \"sha512-crypt\"[, rounds]}) → $6$… for Dovecot/NS passdbs (rounds 1000-999999999, default 5000). Client-side hashing before writing maild.accounts.password over the Bus — a raw props.set stores the field verbatim (requires crypto feature; v0.71.0, sha512-crypt v0.102.6)", contract!((plaintext: string, opts?: any_of(number, map, nil)) -> string; failure[raises])),
+    ("password_hash", CapabilityClass::Pure,   "system",  "Hash a password: password_hash(plaintext[, cost]) → bcrypt $2b$… string (cost 4-31, default 12; input over 72 bytes raises), or password_hash(plaintext, {scheme: \"sha512-crypt\"[, rounds]}) → $6$… for Dovecot/NS passdbs (rounds 1000-999999999, default 5000; 16-char salt; default rounds emit the implicit glibc `$6$salt$hash` form — 120 chars with the {SHA512-CRYPT} prefix — while any other rounds value adds `rounds=N$` and no longer fits the NS vmails.password varchar(127)). Client-side hashing before writing maild.accounts.password over the Bus — a raw props.set stores the field verbatim (requires crypto feature; v0.71.0, sha512-crypt v0.102.6)", contract!((plaintext: string, opts?: any_of(number, map, nil)) -> string; failure[raises])),
     ("password_verify", CapabilityClass::Pure, "system",  "Check a plaintext password against a hash: bcrypt (any $2a$/$2b$/$2y$ form) or SHA-crypt ($6$/$5$, incl. the Dovecot {SHA512-CRYPT} prefix) → bool. A malformed hash RAISES rather than answering false — a corrupt stored hash is a config fault, not a wrong password (requires crypto feature; v0.71.0, sha-crypt v0.102.6)", contract!((plaintext: string, hash: string) -> bool; failure[raises])),
     ("constant_time_eq", CapabilityClass::Pure, "system",  "Timing-safe equality for secrets/MACs: compares full length with no early exit (plain == leaks a timing oracle). Use for webhook signature comparison. Accepts string/bytes/buffer", contract!((a: any_of(string, bytes, buffer), b: any_of(string, bytes, buffer)) -> bool)),
     ("jwt_rs256_sign", CapabilityClass::Pure, "system", "Sign JSON object claims with a PEM RSA private key using RS256; optional JSON object headers, alg pinned to RS256. Returns a compact JWT; crypto feature. No token exchange or expiry/audience policy", contract!((claims_json: string, private_pem: string, header_json?: any_of(string, nil)) -> string; failure[raises])),
@@ -19726,8 +19726,33 @@ fn builtin_password_hash(args: Vec<Value>) -> MixResult<Option<Value>> {
                     msg: format!("password_hash(): {e}"),
                 })?;
                 let hasher = ShaCrypt::new(sha_crypt::Algorithm::Sha512Crypt, params);
-                match hasher.hash_password(plaintext.as_bytes()) {
-                    Ok(h) => Ok(Some(Value::String(h.to_string()))),
+                // Salt: 12 random bytes = exactly 16 crypt-base64 chars, the
+                // SHA-crypt salt cap. sha-crypt 0.6's own hash_password()
+                // draws 16 bytes (22 chars), hashes only the first 16 — and
+                // EMITS all 22, so glibc/Dovecot recompute with the 16-char
+                // salt, get a different string, and never verify it (found
+                // 2026-10-09 provisioning rca mailboxes). Our own
+                // password_verify truncated the same way, so the round trip
+                // agreed with itself and hid it.
+                let mut salt = [0u8; 12];
+                {
+                    use rand::{RngCore, TryRngCore, rngs::OsRng};
+                    OsRng.unwrap_err().fill_bytes(&mut salt);
+                }
+                match hasher.hash_password_with_salt(plaintext.as_bytes(), &salt) {
+                    Ok(h) => {
+                        let mut s = h.to_string();
+                        // Default rounds → the implicit `$6$salt$hash` form
+                        // glibc/mkpasswd/doveadm emit (identical digest; the
+                        // spec only prints rounds= when it differs). Keeps
+                        // `{SHA512-CRYPT}` + hash at 120 chars, inside the NS
+                        // `vmails.password varchar(127)` that the explicit
+                        // form (132) silently overflowed.
+                        if rounds == sha_crypt::Params::RECOMMENDED_ROUNDS {
+                            s = s.replacen("$6$rounds=5000$", "$6$", 1);
+                        }
+                        Ok(Some(Value::String(s)))
+                    }
                     Err(e) => Err(MixError::RuntimeError {
                         span: None,
                         msg: format!("password_hash(): sha512-crypt failed: {e}"),
@@ -19855,6 +19880,23 @@ fn builtin_password_verify(args: Vec<Value>) -> MixResult<Option<Value>> {
 #[cfg(feature = "crypto")]
 fn verify_sha_crypt(plaintext: &str, hash: &str, algorithm: sha_crypt::Algorithm) -> MixResult<Option<Value>> {
     use sha_crypt::{PasswordVerifier, ShaCrypt};
+    // A salt field over 16 chars is a hash glibc/Dovecot can never verify
+    // (they hash the first 16 and emit those 16, so the string never
+    // matches). The crate truncates the same way and would answer `true`,
+    // which is exactly how pre-0.110.1 password_hash() output passed our own
+    // checks while every passdb rejected it. Raise, like any malformed hash,
+    // so an audit surfaces those rows instead of blessing them.
+    let fields: Vec<&str> = hash.split('$').collect();
+    let salt = match fields.get(2) {
+        Some(f) if f.starts_with("rounds=") => fields.get(3).copied(),
+        other => other.copied(),
+    };
+    if salt.is_some_and(|s| s.len() > 16) && fields.len() >= 4 {
+        return Err(MixError::RuntimeError {
+            span: None,
+            msg: "password_verify(): invalid sha-crypt hash: salt longer than 16 chars — glibc/Dovecot cannot verify it (re-hash; pre-0.110.1 password_hash bug)".to_string(),
+        });
+    }
     let verifier = ShaCrypt::new(algorithm, sha_crypt::Params::RECOMMENDED);
     match verifier.verify_password(plaintext.as_bytes(), hash) {
         Ok(()) => Ok(Some(Value::Bool(true))),
