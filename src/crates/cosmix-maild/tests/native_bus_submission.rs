@@ -25,7 +25,7 @@ impl Drop for Broker {
 #[ignore = "requires an exact built native broker and persistent fixture directory"]
 fn native_bus_submission_replays_across_actors_without_duplicate_mail() -> Result<()> {
     if std::env::var("COSMIX_NATIVE_MAIL_CHILD").as_deref() == Ok("1") {
-        return tokio::runtime::Runtime::new()?.block_on(run_child());
+        return tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?.block_on(run_child());
     }
     let binary = std::env::var("COSMIX_NATIVE_MAIL_NODED")?;
     let artifact_dir = std::env::var("COSMIX_NATIVE_MAIL_FIXTURE_DIR")?;
@@ -74,6 +74,7 @@ async fn call(client:&NodedClient,command:&str,args:serde_json::Value)->Result<s
 }
 
 async fn run_child() -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let root = std::env::var("COSMIX_NATIVE_MAIL_ROOT")?;
     let root = Path::new(&root);
     let url = std::env::var("COSMIX_NATIVE_MAIL_URL")?;
