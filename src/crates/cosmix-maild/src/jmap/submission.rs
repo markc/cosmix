@@ -251,7 +251,7 @@ async fn create_submission(
                 }
                 Ok(Err(e)) => {
                     if strict_local {
-                        return Err(e.into());
+                        return Err(e);
                     }
                     tracing::warn!(error = %e, from = %from_addr, to = %addr, "Local delivery failed");
                 }
