@@ -178,6 +178,37 @@ end
 
 // ---------- fault observability: raise, survive, OBSERVABLE ----------
 
+#[tokio::test]
+async fn handler_lambdas_capture_locals_and_keep_globals_live() {
+    let source = r#"
+$recorded = nil
+$escaped = nil
+$global_value = "before"
+on closure.msg
+  $names = map([{name: "alpha"}, {name: "beta"}], fn($s) = $s.name)
+  $recorded = all(["alpha", "beta"], fn($s) = contains($names, $s))
+  $escaped = fn($unused) = map($names, fn($name) = $name .. $global_value)
+end
+"#;
+    let mut s = setup(source).await;
+    s.eval
+        .dispatch_event(mk_event("closure.msg", "", &[]))
+        .await
+        .unwrap();
+    assert_eq!(s.eval.get_global("recorded").unwrap().to_mix_string(), "true");
+    let source = r#"
+$global_value = "after"
+print($escaped(nil))
+"#;
+    let mut lexer = Lexer::new(source);
+    let stmts = Parser::new(lexer.tokenize().unwrap(), source)
+        .parse_program()
+        .unwrap();
+    s.eval.execute(&stmts).await.unwrap();
+    assert_eq!(s.stdout.to_string_lossy(), "[alphaafter, betaafter]\n");
+    assert!(s.stderr.to_string_lossy().is_empty(), "{}", s.stderr.to_string_lossy());
+}
+
 /// Test double capturing the health hook.
 struct RecordingRuntime {
     faults: RefCell<Vec<String>>,

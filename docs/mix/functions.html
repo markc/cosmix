@@ -671,6 +671,10 @@ print($count)
 </code></pre>
 <p>Return a <strong>map</strong> to update several values at once, then destructure at the call site. Net result: pure, self-contained functions — a helper can't accidentally read or stomp a caller's same-named variable.</p>
 <h2 id="closures--capture-for-reads">Closures — capture for reads</h2>
+<p>Lambdas defined inside an <code>on</code> handler capture its local variables by value,
+including callbacks passed to <code>map</code> and <code>all</code> and nested callbacks. Those
+locals remain available if the closure escapes the handler. Global variables
+continue to be read live; capturing handler locals does not freeze globals.</p>
 <p>A lambda <strong>captures its defining scope</strong> for reads, so it carries state. Define a lambda where <code>$base</code> is in scope and it stays bound to <code>$base</code> even after the lambda escapes:</p>
 <pre><code class="language-mix">$base = 100
 $add = function($x) return $x + $base end

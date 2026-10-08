@@ -316,6 +316,11 @@ Return a **map** to update several values at once, then destructure at the call 
 
 ## Closures — capture for reads
 
+Lambdas defined inside an `on` handler capture its local variables by value,
+including callbacks passed to `map` and `all` and nested callbacks. Those
+locals remain available if the closure escapes the handler. Global variables
+continue to be read live; capturing handler locals does not freeze globals.
+
 A lambda **captures its defining scope** for reads, so it carries state. Define a lambda where `$base` is in scope and it stays bound to `$base` even after the lambda escapes:
 
 ```mix

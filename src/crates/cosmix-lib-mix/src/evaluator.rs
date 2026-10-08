@@ -14740,14 +14740,14 @@ impl Evaluator {
 
                 Expr::FunctionLiteral { params, body } => {
                     self.track_keyword_attempt("function");
-                    // Capture-by-value only inside function frames.
-                    // At function_depth == 0 the lambda will see globals
+                    // Capture-by-value inside function and handler frames.
+                    // Outside either frame the lambda will see globals
                     // live via the normal frame-isolation path; snapshotting
                     // there is redundant and would freeze subsequent global
                     // updates. At depth > 0 the inner function frame becomes
                     // unreachable after return, so capture is the only way
                     // to preserve its locals.
-                    let captures = if self.ctx.function_depth > 0 {
+                    let captures = if self.ctx.function_depth > 0 || self.ctx.in_handler > 0 {
                         // Free-variable capture: snapshot only the frame
                         // entries this lambda actually references, not the
                         // whole frame. A large in-scope value (e.g. a
@@ -14771,7 +14771,7 @@ impl Evaluator {
                             }
                         };
                         // Keep `Some(snap)` even when the snapshot is empty.
-                        // At function_depth > 0 the lambda MUST stay isolated
+                        // Inside a function or handler the lambda MUST stay isolated
                         // — it may see only its own params plus globals, never
                         // the caller's live locals. Collapsing an empty
                         // capture to `None` would re-enable the frameless sync

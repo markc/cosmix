@@ -252,6 +252,41 @@ task_start("probe_emits", json_encode({}))
 "#;
 
 #[tokio::test]
+async fn served_handler_callbacks_capture_invocation_locals() {
+    let _g = lock().await;
+    let dir = Dir::new("closure");
+    let broker = Broker::start();
+    let node_conf = dir.write("node.conf.mix", &node_conf_text(broker_tcp_port(&broker)));
+    let script = dir.write("svc.mix", r#"-- version: 0.1.0
+on rel.state
+  reply(0, "{}")
+end
+on capture
+  $names = map($event.args.services, fn($s) = $s.name)
+  $ready = all($event.args.required, fn($s) = contains($names, $s))
+  $nested = map($event.args.required, fn($s) = map($names, fn($name) = $s .. ":" .. $name))
+  reply(0, json_encode({ready: $ready, nested: $nested}))
+end
+"#);
+    let _citizen = Citizen::spawn(
+        Path::new(env!("CARGO_BIN_EXE_mix")),
+        &dir,
+        &node_conf,
+        &script,
+    );
+    let c = connect(&broker).await;
+    wait_service(&c, HARD).await;
+    for (name, required, ready) in [("alpha", "alpha", true), ("beta", "alpha", false)] {
+        let result = call(&c, "capture", json!({
+            "services": [{"name": name}], "required": [required]
+        })).await.expect("handler must reply without HANDLER_FAULT");
+        assert_eq!(result["ready"], ready);
+        assert_eq!(result["nested"], json!([[format!("{required}:{name}")]]));
+    }
+    assert!(!dir.read("citizen.stderr").contains("handler fault"));
+}
+
+#[tokio::test]
 async fn lookup_reports_transport_failure_and_emit_remains_nonfatal() {
     let _g = lock().await;
     let dir = Dir::new("honesty");
