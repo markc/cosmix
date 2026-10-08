@@ -417,6 +417,17 @@ CREATE VIRTUAL TABLE IF NOT EXISTS emails_fts USING fts5(
 );
 
 -- email_submissions — JMAP EmailSubmission tracking
+-- Native Bus at-most-once admission. NULL receipt is deliberately uncertain:
+-- restart/retry must not repeat external side effects after reservation.
+CREATE TABLE IF NOT EXISTS bus_submissions (
+    actor TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    payload_hash TEXT NOT NULL,
+    receipt TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (actor, operation_id)
+);
+
 CREATE TABLE IF NOT EXISTS email_submissions (
     id              TEXT PRIMARY KEY,
     account_id      INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,

@@ -24,6 +24,7 @@ pub mod retention;
 pub mod rules;
 pub mod search;
 pub mod stats;
+pub mod submission;
 pub mod subscribe_granter;
 pub mod tls;
 pub mod verdict;
@@ -147,6 +148,7 @@ pub async fn run(
     mailstore: Arc<SqliteMailStore>,
     overrides_runtime: Arc<Runtime>,
     accounts_runtime: Arc<Runtime>,
+    aliases_runtime: Arc<Runtime>,
     dkim_state: dkim::DkimState,
     tls_state: tls::TlsReloadState,
     stats_state: stats::StatsState,
@@ -271,6 +273,7 @@ pub async fn run(
             mailstore.clone(),
             overrides_runtime.clone(),
             accounts_runtime.clone(),
+            aliases_runtime.clone(),
             dkim_state.clone(),
             tls_state.clone(),
             stats_state.clone(),
@@ -319,6 +322,7 @@ fn verb_manifest() -> Vec<cosmix_bus::VerbDescriptor> {
     use cosmix_bus::VerbDescriptor;
     vec![
         VerbDescriptor::new("HELP", &[], "List all commands this service accepts", true),
+        VerbDescriptor::new("maild.submit", &["operation_id", "account", "from", "to", "subject", "text"], "Submit typed plain-text mail once through the existing mail pipeline", false),
         VerbDescriptor::new(
             "maild.props.get",
             &["namespace", "key"],
@@ -618,6 +622,7 @@ async fn dispatch_loop(
     mailstore: Arc<SqliteMailStore>,
     overrides_runtime: Arc<Runtime>,
     accounts_runtime: Arc<Runtime>,
+    aliases_runtime: Arc<Runtime>,
     dkim_state: dkim::DkimState,
     tls_state: tls::TlsReloadState,
     stats_state: stats::StatsState,
@@ -722,7 +727,9 @@ async fn dispatch_loop(
             discovery: client.as_ref(),
             max_message_size,
         };
-        let (rc, body) = if let Some(action) = cmd.command.strip_prefix("maild.rules.") {
+        let (rc, body) = if cmd.command == "maild.submit" {
+            submission::dispatch(&cmd, &db, &mailstore, &aliases_runtime, max_message_size).await
+        } else if let Some(action) = cmd.command.strip_prefix("maild.rules.") {
             rules::dispatch(
                 action,
                 &cmd,

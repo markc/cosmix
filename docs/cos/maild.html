@@ -491,6 +491,7 @@ so reverse DNS, SPF/iprev, rate limiting and logging use the same peer address.<
 <ul>
 <li><strong>Protocol ports:</strong> SMTP <code>25</code>, SMTPS submission <code>465</code>, IMAPS <code>993</code>, and JMAP over HTTP (dev default <code>127.0.0.1:8088</code>); CalDAV/CardDAV share the HTTP surface.</li>
 <li><strong>Bus management surface</strong> — the operational verbs, grouped:</li>
+<li>submission: <code>maild.submit</code></li>
 <li>accounts: <code>maild.accounts.seed_mailboxes</code>, <code>maild.accounts.seed_content</code>, <code>maild.accounts.revoke_tokens</code></li>
 <li>stats: <code>maild.stats.server</code>, <code>maild.stats.account</code>, <code>maild.stats.mailboxes</code>, <code>maild.stats.online</code>, <code>maild.stats.top</code></li>
 <li>rules: <code>maild.rules.reload</code>, <code>maild.rules.explain</code>, <code>maild.rules.stats</code></li>
@@ -501,6 +502,27 @@ so reverse DNS, SPF/iprev, rate limiting and logging use the same peer address.<
 <li>search / tls: <code>maild.search.rebuild</code>, <code>maild.tls.reload</code></li>
 <li><strong>Property surface:</strong> the SPEC 12 <code>maild.props.*</code> namespace (<code>list</code> / <code>set</code> / <code>delete</code> / <code>watch</code>), with change events on the <code>maild.props.records.changed</code> topic.</li>
 </ul>
+<h3 id="native-plain-text-submission">Native plain-text submission</h3>
+<p><code>maild.submit</code> accepts a JSON object with <code>operation_id</code>, <code>account</code>, <code>to</code>
+(an array of mailbox addresses), <code>subject</code> and <code>text</code>; optional <code>from</code> defaults
+to the named account. The account must exist and be unlocked. A different
+sender must be an enabled alias authorised for that account. The verb uses the
+same native Bus administrative access as the other management verbs.</p>
+<p>The operation ID is 1–128 ASCII letters, digits, hyphens, underscores or dots.
+There must be 1–32 distinct recipients. The subject is limited to 4096 bytes
+and cannot contain line breaks; text is limited to 256 KiB. Unknown fields,
+raw messages, headers and attachments are rejected. The rendered message must
+also fit the configured server message limit.</p>
+<p>Submission creates a CAS-backed email and uses the existing local delivery,
+outbound queue and DKIM signing pipeline. A successful receipt reports
+<code>status: "accepted"</code>, the operation, submission, email and message IDs, recipient
+count, and <code>delivery_confirmed: false</code>. Acceptance does not prove remote delivery.</p>
+<p>The durable key is the Bus actor plus operation ID. Repeating the same typed
+payload returns the saved receipt without another delivery or queue entry;
+reusing that key with another payload is rejected. A reservation without a
+saved receipt means the outcome is uncertain, including after a process crash.
+It is retained and never automatically resent. Do not use a new operation ID
+to retry an uncertain send without first establishing whether it was delivered.</p>
 <h3 id="bayesian-corpus-rebuild">Bayesian corpus rebuild</h3>
 <p><code>maild.bayesian.rebuild</code> accepts <code>account_id</code> (an integer or digit string),
 <code>snapshot</code> (optional, default <code>true</code>), <code>wait</code> (optional, default <code>false</code>), and

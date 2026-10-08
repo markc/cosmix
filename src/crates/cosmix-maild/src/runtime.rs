@@ -722,6 +722,7 @@ pub async fn build_runtime(cfg: &Config, opts: RuntimeOpts) -> Result<BuiltMaild
             mailstore.clone(),
             overrides_runtime.clone(),
             accounts_runtime.clone(),
+            aliases_runtime.clone(),
             dkim_state,
             tls_state,
             stats_state,

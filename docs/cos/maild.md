@@ -59,6 +59,7 @@ so reverse DNS, SPF/iprev, rate limiting and logging use the same peer address.
 
 - **Protocol ports:** SMTP `25`, SMTPS submission `465`, IMAPS `993`, and JMAP over HTTP (dev default `127.0.0.1:8088`); CalDAV/CardDAV share the HTTP surface.
 - **Bus management surface** — the operational verbs, grouped:
+- submission: `maild.submit`
 - accounts: `maild.accounts.seed_mailboxes`, `maild.accounts.seed_content`, `maild.accounts.revoke_tokens`
 - stats: `maild.stats.server`, `maild.stats.account`, `maild.stats.mailboxes`, `maild.stats.online`, `maild.stats.top`
 - rules: `maild.rules.reload`, `maild.rules.explain`, `maild.rules.stats`
@@ -68,6 +69,32 @@ so reverse DNS, SPF/iprev, rate limiting and logging use the same peer address.
 - retention: `maild.retention.run`, `maild.retention.status`
 - search / tls: `maild.search.rebuild`, `maild.tls.reload`
 - **Property surface:** the SPEC 12 `maild.props.*` namespace (`list` / `set` / `delete` / `watch`), with change events on the `maild.props.records.changed` topic.
+
+### Native plain-text submission
+
+`maild.submit` accepts a JSON object with `operation_id`, `account`, `to`
+(an array of mailbox addresses), `subject` and `text`; optional `from` defaults
+to the named account. The account must exist and be unlocked. A different
+sender must be an enabled alias authorised for that account. The verb uses the
+same native Bus administrative access as the other management verbs.
+
+The operation ID is 1–128 ASCII letters, digits, hyphens, underscores or dots.
+There must be 1–32 distinct recipients. The subject is limited to 4096 bytes
+and cannot contain line breaks; text is limited to 256 KiB. Unknown fields,
+raw messages, headers and attachments are rejected. The rendered message must
+also fit the configured server message limit.
+
+Submission creates a CAS-backed email and uses the existing local delivery,
+outbound queue and DKIM signing pipeline. A successful receipt reports
+`status: "accepted"`, the operation, submission, email and message IDs, recipient
+count, and `delivery_confirmed: false`. Acceptance does not prove remote delivery.
+
+The durable key is the Bus actor plus operation ID. Repeating the same typed
+payload returns the saved receipt without another delivery or queue entry;
+reusing that key with another payload is rejected. A reservation without a
+saved receipt means the outcome is uncertain, including after a process crash.
+It is retained and never automatically resent. Do not use a new operation ID
+to retry an uncertain send without first establishing whether it was delivered.
 
 ### Bayesian corpus rebuild
 

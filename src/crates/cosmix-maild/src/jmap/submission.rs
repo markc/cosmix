@@ -31,7 +31,7 @@ pub async fn set(
     // Handle create
     if let Some(create) = args.get("create").and_then(|v| v.as_object()) {
         for (client_id, obj) in create {
-            let result = create_submission(db, mailstore, aliases_runtime, account_id, obj).await;
+            let result = create_submission(db, mailstore, aliases_runtime, account_id, obj, false).await;
             match result {
                 Ok(submission_id) => {
                     created_map.insert(
@@ -72,12 +72,23 @@ pub async fn set(
 }
 
 /// Create a single email submission — load the email blob and queue it.
+pub(crate) async fn create_submission_strict(
+    db: &Db,
+    mailstore: &Arc<SqliteMailStore>,
+    aliases_runtime: &Arc<cosmix_props::Runtime>,
+    account_id: i32,
+    obj: &serde_json::Value,
+) -> Result<Uuid> {
+    create_submission(db, mailstore, aliases_runtime, account_id, obj, true).await
+}
+
 async fn create_submission(
     db: &Db,
     mailstore: &Arc<SqliteMailStore>,
     aliases_runtime: &Arc<cosmix_props::Runtime>,
     account_id: i32,
     obj: &serde_json::Value,
+    strict_local: bool,
 ) -> Result<Uuid> {
     #[derive(Deserialize)]
     struct SubmissionCreate {
@@ -238,9 +249,11 @@ async fn create_submission(
                     tracing::info!(from = %from_addr, to = %addr, "Local delivery completed");
                 }
                 Ok(Err(e)) => {
+                    if strict_local { return Err(e.into()); }
                     tracing::warn!(error = %e, from = %from_addr, to = %addr, "Local delivery failed");
                 }
                 Err(e) => {
+                    if strict_local { return Err(e.into()); }
                     tracing::warn!(error = %e, from = %from_addr, to = %addr, "Local delivery spawn_blocking failed");
                 }
             }
