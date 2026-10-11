@@ -25,6 +25,8 @@ pub fn verb_manifest() -> Vec<cosmix_bus::VerbDescriptor> {
     vec![
         VerbDescriptor::new("HELP", &[], "List all commands this service accepts", true),
         VerbDescriptor::new("input.query", &[], "Read the keymap and input mode", true),
+        VerbDescriptor::new(crate::witness::SNAPSHOT, &[], "Read owning passthrough device/config/cursor evidence; not hardware origin", true),
+        VerbDescriptor::new(crate::witness::WAIT, &["fence", "after", "timeout_ms"], "Wait for bounded successful grab-reader writes under an exact snapshot fence", true),
         VerbDescriptor::new(
             "input.bind",
             &["body"],

@@ -221,6 +221,7 @@ pub fn run_grab(
     resolver: Shared,
     fire_tx: UnboundedSender<FiredVerb>,
     timeout: Option<Duration>,
+    witness: std::sync::Arc<crate::witness::Witness>,
 ) -> std::io::Result<()> {
     // Open the device; keep the owned File (its fd close releases the grab) and
     // grab an extra copy of the raw fd for the ioctl.
@@ -236,6 +237,10 @@ pub fn run_grab(
     // re-emitted to a device nothing is reading yet and be lost. We are NOT
     // grabbed during this sleep, so the keyboard keeps working meanwhile.
     std::thread::sleep(Duration::from_millis(300));
+    // Capture the actual owned descriptor identities before taking the grab.
+    // Failure cannot leave the keyboard captured, and names are not proof.
+    let ingress = crate::witness::Device::from_file(&dev, std::path::Path::new(device))?;
+    let output = uinput.output_identity()?;
 
     // Grab exclusively. After this the compositor sees nothing on `device` until
     // release. If the ioctl fails we drop `uinput` (destroying it) and return.
@@ -254,6 +259,7 @@ pub fn run_grab(
             std::process::exit(0);
         });
     }
+    let witness = witness.reader(ingress, output);
     eprintln!(
         "cosmix-inputd: GRAB active on {device} — re-emitting via uinput, firing bound verbs. \
          Release: kill this process (SIGKILL ok){}.",
@@ -287,8 +293,11 @@ pub fn run_grab(
     // and recomputing at repeat could fire a different action than the press.
     let mut held: HashMap<u16, HeldKey> = HashMap::new();
     let mut mods = SideModifiers::NONE;
+    let mut ingress_sequence = 0;
     loop {
         dev.read_exact(&mut buffer)?;
+        ingress_sequence += 1;
+        let read_monotonic_ns = crate::witness::monotonic_ns();
         let event_type = u16::from_ne_bytes([buffer[16], buffer[17]]);
         let code = u16::from_ne_bytes([buffer[18], buffer[19]]);
         let value = i32::from_ne_bytes([buffer[20], buffer[21], buffer[22], buffer[23]]);
@@ -298,7 +307,7 @@ pub fn run_grab(
         // our device only advertises EV_SYN + EV_KEY).
         if event_type != EV_KEY {
             if event_type == EV_SYN {
-                uinput.emit(&buffer)?;
+                emit_passthrough(&mut uinput, &buffer, &witness, &resolver, ingress_sequence, read_monotonic_ns)?;
             }
             continue;
         }
@@ -307,7 +316,7 @@ pub fn run_grab(
         // modifier state stays correct; they are never resolved as chord keys and
         // never enter the latch.
         if set_modifier(&mut mods, code, value != 0) {
-            uinput.emit(&buffer)?;
+            emit_passthrough(&mut uinput, &buffer, &witness, &resolver, ingress_sequence, read_monotonic_ns)?;
             continue;
         }
 
@@ -345,7 +354,7 @@ pub fn run_grab(
                     },
                 );
                 if !swallow {
-                    uinput.emit(&buffer)?;
+                    emit_passthrough(&mut uinput, &buffer, &witness, &resolver, ingress_sequence, read_monotonic_ns)?;
                 }
             }
             // Repeat: follow the latched decision — re-fire the latched repeat
@@ -360,7 +369,7 @@ pub fn run_grab(
                     // swallowed on press → swallow the repeat too (no re-emit)
                 }
                 // Emitted on press, or never-seen: pass the repeat through.
-                _ => uinput.emit(&buffer)?,
+                _ => emit_passthrough(&mut uinput, &buffer, &witness, &resolver, ingress_sequence, read_monotonic_ns)?,
             },
             // Release: apply the LATCHED decision, ignoring the current resolver
             // verdict (which may differ if modifiers/keymap/mode changed mid-hold).
@@ -369,12 +378,21 @@ pub fn run_grab(
                 Some(h) if h.swallowed => {}
                 // Emitted on press, or a release with no recorded press → emit, so
                 // downstream never keeps a dangling key-down.
-                _ => uinput.emit(&buffer)?,
+                _ => emit_passthrough(&mut uinput, &buffer, &witness, &resolver, ingress_sequence, read_monotonic_ns)?,
             },
             // Unknown value: pass through rather than swallow.
-            _ => uinput.emit(&buffer)?,
+            _ => emit_passthrough(&mut uinput, &buffer, &witness, &resolver, ingress_sequence, read_monotonic_ns)?,
         }
     }
+}
+
+fn emit_passthrough(output: &mut UinputDevice, event: &[u8; EVENT_SIZE], witness: &crate::witness::ReaderGuard, resolver: &Shared, ingress_sequence: u64, read_monotonic_ns: u64) -> std::io::Result<()> {
+    let live = resolver.lock().expect("resolver poisoned");
+    output.emit(event)?;
+    // Publish only after write_all succeeded, with the generation held stable
+    // throughout the write. Service/API injection never uses this function.
+    witness.written(ingress_sequence, read_monotonic_ns, u16::from_ne_bytes([event[16], event[17]]), live.generation());
+    Ok(())
 }
 
 /// What the grab loop decided for a currently-held non-modifier key on its press,
@@ -395,6 +413,23 @@ struct UinputDevice {
 }
 
 impl UinputDevice {
+    fn output_identity(&self) -> std::io::Result<crate::witness::Device> {
+        // Linux UI_GET_SYSNAME(len), _IOC(_IOC_READ, 'U', 44, len): returns
+        // the inputN sysfs name belonging to this exact uinput descriptor.
+        let mut name = [0u8; 256];
+        let request = (2u64 << 30) | ((name.len() as u64) << 16) | (u64::from(b'U') << 8) | 44;
+        check(unsafe { libc::ioctl(self.file.as_raw_fd(), request as libc::c_ulong, name.as_mut_ptr()) })?;
+        let end = name.iter().position(|byte| *byte == 0).ok_or_else(|| std::io::Error::other("unterminated uinput sysname"))?;
+        let name = std::str::from_utf8(&name[..end]).map_err(std::io::Error::other)?;
+        if !name.strip_prefix("input").is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())) { return Err(std::io::Error::other("invalid owning uinput sysname")); }
+        let events: Vec<_> = std::fs::read_dir(std::path::Path::new("/sys/devices/virtual/input").join(name))?
+            .filter_map(Result::ok).filter(|entry| entry.file_name().to_str().is_some_and(|name| name.strip_prefix("event").is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())))).collect();
+        if events.len() != 1 { return Err(std::io::Error::other("one owning uinput event node required")); }
+        let path = std::path::Path::new("/dev/input").join(events[0].file_name());
+        let file = File::open(&path)?;
+        crate::witness::Device::from_file(&file, &path)
+    }
+
     fn keyboard() -> std::io::Result<Self> {
         Self::create(b"cosmix-inputd virtual keyboard", 1, 0..=KEY_MAX, &[])
     }

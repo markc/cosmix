@@ -11,6 +11,7 @@
 mod keymap_file;
 mod reader;
 mod service;
+mod witness;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -78,7 +79,7 @@ fn main() -> anyhow::Result<()> {
         .keymap
         .map(PathBuf::from)
         .or_else(keymap_file::default_path);
-    let (keymap, store) = match keymap_path {
+    let (keymap, store) = match keymap_path.clone() {
         Some(path) => {
             let opened = keymap_file::open(&path, &keymap_file::local_stamp());
             let keymap = InputKeymap {
@@ -104,6 +105,7 @@ fn main() -> anyhow::Result<()> {
     );
     let store = store.with_mesh_open(mesh_open);
     let resolver: Shared = Arc::new(Mutex::new(Resolver::new(keymap)));
+    let witness = witness::Witness::new(keymap_path)?;
 
     // Grab mode fires resolved verbs; the reader (blocking thread) sends them to
     // the tokio side (which owns the Bus client) over this channel. Keeping the
@@ -133,12 +135,13 @@ fn main() -> anyhow::Result<()> {
         let shared = Arc::clone(&resolver);
         let tx = fire_tx.clone();
         let timeout = args.grab_timeout.map(Duration::from_secs);
+        let reader_witness = Arc::clone(&witness);
         std::thread::spawn(move || {
             // run_grab only returns on a device/uinput error (otherwise it loops
             // until the watchdog exits the process). The grab is already released
             // by fd-close here; exit so the daemon does not linger grab-less, and
             // systemd (Restart=always) can re-establish it.
-            if let Err(error) = reader::run_grab(&device, shared, tx, timeout) {
+            if let Err(error) = reader::run_grab(&device, shared, tx, timeout, reader_witness) {
                 eprintln!("cosmix-inputd: grab reader stopped: {error}");
                 std::process::exit(1);
             }
@@ -158,7 +161,7 @@ fn main() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(serve(resolver, store, fire_rx))
+    runtime.block_on(serve(resolver, store, fire_rx, witness))
 }
 
 /// Reconnect loop: (re)register `inputd` with noded and serve `input.*` until the
@@ -167,6 +170,7 @@ async fn serve(
     resolver: Shared,
     store: service::Store,
     mut fire_rx: tokio::sync::mpsc::UnboundedReceiver<reader::FiredVerb>,
+    witness: Arc<witness::Witness>,
 ) -> anyhow::Result<()> {
     let bi = cosmix_buildinfo::build_info!();
     // Retained across broker reconnects, with or without an evdev reader.
@@ -187,7 +191,7 @@ async fn serve(
         .await
         {
             Ok(client) => {
-                let client = client.with_verbs(service::verb_manifest());
+                let client = Arc::new(client.with_verbs(service::verb_manifest()));
                 eprintln!("cosmix-inputd: registered as '{SERVICE}'; serving input.*");
                 serve_bus(
                     &client,
@@ -195,6 +199,7 @@ async fn serve(
                     &store,
                     &mut injector,
                     &mut fire_rx,
+                    &witness,
                 )
                 .await;
                 eprintln!("cosmix-inputd: broker disconnected; reconnecting");
@@ -210,20 +215,48 @@ async fn serve(
 /// Drain and answer inbound `input.*` commands, and fire verbs the grab reader
 /// resolves, until the connection closes.
 async fn serve_bus(
-    client: &cosmix_client::NodedClient,
+    client: &Arc<cosmix_client::NodedClient>,
     resolver: &Shared,
     store: &service::Store,
     injector: &mut reader::PointerInjector,
     fire_rx: &mut tokio::sync::mpsc::UnboundedReceiver<reader::FiredVerb>,
+    witness: &Arc<witness::Witness>,
 ) {
     let Some(mut rx) = client.incoming_async().await else {
         return;
     };
+    let mut waits = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             maybe_cmd = rx.recv() => {
                 let Some(cmd) = maybe_cmd else { break };
+                if cmd.command == witness::WAIT {
+                    if waits.len() >= 16 {
+                        let (rc, body) = witness::reply(Err("wait_capacity"));
+                        let _ = client.respond_parts(&cmd.from, &cmd.command, cmd.id.as_deref(), rc, &body).await;
+                        continue;
+                    }
+                    let request = serde_json::from_str::<witness::WaitRequest>(&cmd.body);
+                    let client = Arc::clone(client);
+                    let resolver = Arc::clone(resolver);
+                    let witness = Arc::clone(witness);
+                    waits.spawn(async move {
+                        let result = match request {
+                            Ok(request) => witness.wait(&resolver, request).await,
+                            Err(_) => Err("invalid_request"),
+                        };
+                        let (rc, body) = witness::reply(result);
+                        let _ = client.respond_parts(&cmd.from, &cmd.command, cmd.id.as_deref(), rc, &body).await;
+                    });
+                    continue;
+                }
+                if cmd.command == witness::SNAPSHOT {
+                    let (rc, body) = witness::reply(witness.snapshot(resolver));
+                    let _ = client.respond_parts(&cmd.from, &cmd.command, cmd.id.as_deref(), rc, &body).await;
+                    continue;
+                }
                 let (rc, body) = service::dispatch(resolver, store, injector, &cmd);
+                witness.notify_config();
                 let _ = client
                     .respond_parts(&cmd.from, &cmd.command, cmd.id.as_deref(), rc, &body)
                     .await;
@@ -234,8 +267,10 @@ async fn serve_bus(
                 let Some(fired) = maybe_fired else { break };
                 fire_verb(client, &fired).await;
             }
+            _ = waits.join_next(), if !waits.is_empty() => {}
         }
     }
+    // Drop aborts all outstanding waits on this broker connection.
 }
 
 /// The `(service, command)` a fired verb is sent as. A row with an explicit
