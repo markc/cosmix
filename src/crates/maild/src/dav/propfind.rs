@@ -112,7 +112,7 @@ async fn single_calendar(
         super::warn_if_capped(events.len(), "calendar PROPFIND listing");
         for ev in &events {
             let href = format!("/dav/calendars/{account}/{calendar_id}/{}.ics", ev.uid);
-            let etag = cosmix_lib_davproto::etag::for_event(
+            let etag = mixos_davproto::etag::for_event(
                 &ev.uid,
                 ev.title.as_deref(),
                 ev.start_dt.as_deref(),
@@ -170,7 +170,7 @@ async fn single_addressbook(
         super::warn_if_capped(contacts.len(), "addressbook PROPFIND listing");
         for c in &contacts {
             let href = format!("/dav/addressbooks/{account}/{book_id}/{}.vcf", c.uid);
-            let etag = cosmix_lib_davproto::etag::for_contact(
+            let etag = mixos_davproto::etag::for_contact(
                 &c.uid,
                 c.full_name.as_deref(),
                 c.email.as_deref(),

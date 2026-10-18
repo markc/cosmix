@@ -309,7 +309,8 @@ mod tests {
             Some(end),
             None,
             &data,
-        ).unwrap();
+        )
+        .unwrap();
         assert!(ics.contains("BEGIN:VCALENDAR"));
         assert!(ics.contains("BEGIN:VEVENT"));
         assert!(ics.contains("UID:evt-1"));

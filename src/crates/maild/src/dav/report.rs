@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use cosmix_lib_davproto::{etag, ical, vcard};
+use mixos_davproto::{etag, ical, vcard};
 
 use chrono::{DateTime, Utc};
 use quick_xml::events::Event;
@@ -423,7 +423,11 @@ pub async fn handle(
     };
     result.unwrap_or_else(|error| {
         tracing::warn!(target: "maild::dav", %error, "REPORT representation failed");
-        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            error.to_string(),
+        )
+            .into_response()
     })
 }
 

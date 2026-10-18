@@ -4,7 +4,7 @@
 //! JMAP AddressBook + Contact methods (JSContact, RFC 9553).
 
 use anyhow::Result;
-use cosmix_lib_davproto::vcard;
+use mixos_davproto::vcard;
 use uuid::Uuid;
 
 use super::types::*;
@@ -283,7 +283,7 @@ pub async fn contact_set(
 
     if let Some(create) = args.get("create").and_then(|v| v.as_object()) {
         for (client_id, obj) in create {
-            cosmix_lib_davproto::validate_raw_keys(obj)?;
+            mixos_davproto::validate_raw_keys(obj)?;
             let addressbook_id = obj
                 .get("addressBookId")
                 .and_then(|v| v.as_str())
@@ -362,7 +362,7 @@ pub async fn contact_set(
 
     if let Some(update) = args.get("update").and_then(|v| v.as_object()) {
         for (id_str, patch) in update {
-            cosmix_lib_davproto::validate_raw_keys(patch)?;
+            mixos_davproto::validate_raw_keys(patch)?;
             let Ok(id) = id_str.parse::<Uuid>() else {
                 continue;
             };
@@ -415,17 +415,10 @@ pub async fn contact_set(
             }
             // Patch only the changed lines of the verbatim vCard, keeping
             // its other lines, so DAV clients see the edit too.
-            if let Some(raw) = vcard::raw_vcard(&data)?
-            {
-                let patched = vcard::patch_vcf(
-                    raw,
-                    patch_full,
-                    patch_email,
-                    patch_company,
-                    patch_phone,
-                );
-                data[vcard::RAW_VCARD_KEY] =
-                    serde_json::Value::String(patched);
+            if let Some(raw) = vcard::raw_vcard(&data)? {
+                let patched =
+                    vcard::patch_vcf(raw, patch_full, patch_email, patch_company, patch_phone);
+                data[vcard::RAW_VCARD_KEY] = serde_json::Value::String(patched);
             }
             if db::contact::update_contact(
                 &db.conn, account_id, id, &data, full_name, email, company,

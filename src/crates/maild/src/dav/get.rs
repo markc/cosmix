@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use cosmix_lib_davproto::{etag, ical, vcard};
+use mixos_davproto::{etag, ical, vcard};
 
 use axum::body::Body;
 use axum::http::{StatusCode, header};
@@ -52,14 +52,8 @@ async fn calendar_object(
             let start = ev.start_dt.as_deref().and_then(parse_dt);
             let end = ev.end_dt.as_deref().and_then(parse_dt);
             let updated = ev.updated_at.as_deref().and_then(parse_dt);
-            let ics = ical::event_to_ics(
-                &ev.uid,
-                ev.title.as_deref(),
-                start,
-                end,
-                updated,
-                &ev.data,
-            )?;
+            let ics =
+                ical::event_to_ics(&ev.uid, ev.title.as_deref(), start, end, updated, &ev.data)?;
             let etag = etag::for_event(
                 &ev.uid,
                 ev.title.as_deref(),
@@ -68,7 +62,11 @@ async fn calendar_object(
                 ev.updated_at.as_deref(),
                 &ev.data,
             );
-            Ok(body_response(ics.into_bytes(), "text/calendar; charset=utf-8", &etag))
+            Ok(body_response(
+                ics.into_bytes(),
+                "text/calendar; charset=utf-8",
+                &etag,
+            ))
         }
         Ok(None) => Ok(super::not_found()),
         Err(e) => {
@@ -103,7 +101,11 @@ async fn addressbook_object(
                 c.company.as_deref(),
                 &c.data,
             );
-            Ok(body_response(vcf.into_bytes(), "text/vcard; charset=utf-8", &etag))
+            Ok(body_response(
+                vcf.into_bytes(),
+                "text/vcard; charset=utf-8",
+                &etag,
+            ))
         }
         Ok(None) => Ok(super::not_found()),
         Err(e) => {

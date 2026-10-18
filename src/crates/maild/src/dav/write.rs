@@ -87,7 +87,7 @@ async fn put_event(
     let Ok(body_str) = std::str::from_utf8(body) else {
         return unprocessable();
     };
-    let parsed = match cosmix_lib_davproto::ical::parse_ics(body_str) {
+    let parsed = match mixos_davproto::ical::parse_ics(body_str) {
         Ok(p) => p,
         Err(e) => {
             tracing::debug!(target: "maild::dav", error = %e, "PUT: invalid iCalendar");
@@ -144,7 +144,7 @@ async fn put_contact(
     let Ok(body_str) = std::str::from_utf8(body) else {
         return unprocessable();
     };
-    let parsed = match cosmix_lib_davproto::vcard::parse_vcf(body_str) {
+    let parsed = match mixos_davproto::vcard::parse_vcf(body_str) {
         Ok(p) => p,
         Err(e) => {
             tracing::debug!(target: "maild::dav", error = %e, "PUT: invalid vCard");
@@ -257,7 +257,7 @@ async fn map_delete(
 /// matches a subsequent GET). Empty string if the row vanished.
 async fn event_etag(state: &Arc<AppState>, account: i32, cal: Uuid, uid: &str) -> String {
     match db::calendar::get_event_by_uid(&state.db.conn, account, cal, uid).await {
-        Ok(Some(ev)) => cosmix_lib_davproto::etag::for_event(
+        Ok(Some(ev)) => mixos_davproto::etag::for_event(
             &ev.uid,
             ev.title.as_deref(),
             ev.start_dt.as_deref(),
@@ -271,7 +271,7 @@ async fn event_etag(state: &Arc<AppState>, account: i32, cal: Uuid, uid: &str) -
 
 async fn contact_etag(state: &Arc<AppState>, account: i32, book: Uuid, uid: &str) -> String {
     match db::contact::get_contact_by_uid(&state.db.conn, account, book, uid).await {
-        Ok(Some(c)) => cosmix_lib_davproto::etag::for_contact(
+        Ok(Some(c)) => mixos_davproto::etag::for_contact(
             &c.uid,
             c.full_name.as_deref(),
             c.email.as_deref(),

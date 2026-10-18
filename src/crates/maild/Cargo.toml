@@ -68,7 +68,7 @@ maild-rules = { path = "../maild-rules" }
 maild-bayesian = { path = "../maild-bayesian" }
 cosmix-mds = { path = "../cosmix-mds" }
 cosmix_props = { package = "cosmix-lib-props-store", path = "../cosmix-lib-props-store" }
-cosmix-lib-davproto = { path = "../cosmix-lib-davproto" }
+mixos_davproto = { package = "cosmix-lib-davproto", path = "../cosmix-lib-davproto" }
 quick-xml = "0.37"
 rpassword = "7"
 

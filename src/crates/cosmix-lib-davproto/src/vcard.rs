@@ -363,7 +363,8 @@ mod tests {
             Some("ada@example.com"),
             Some("Analytical Engines"),
             &data,
-        ).unwrap();
+        )
+        .unwrap();
         assert!(vcf.starts_with("BEGIN:VCARD\r\nVERSION:4.0\r\n"));
         assert!(vcf.contains("UID:c-1\r\n"));
         assert!(vcf.contains("FN:Ada Lovelace\r\n"));
@@ -458,11 +459,18 @@ mod tests {
             "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:T\r\nTEL;TYPE=cell:+61400000000\r\nEND:VCARD\r\n",
         )
         .unwrap();
-        assert_eq!(primary_phone(&p.data).unwrap().as_deref(), Some("+61400000000"));
+        assert_eq!(
+            primary_phone(&p.data).unwrap().as_deref(),
+            Some("+61400000000")
+        );
         assert_eq!(p.data["phones"]["default"]["number"], "+61400000000"); // also structured
         // emit builds a TEL from data.phones for a non-raw contact.
         let data = serde_json::json!({"phones":{"x":{"number":"123"}}});
-        assert!(contact_to_vcf("u", Some("N"), None, None, &data).unwrap().contains("TEL:123\r\n"));
+        assert!(
+            contact_to_vcf("u", Some("N"), None, None, &data)
+                .unwrap()
+                .contains("TEL:123\r\n")
+        );
         // patch updates the TEL value, keeping its params + other lines.
         let raw =
             "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:N\r\nTEL;TYPE=cell:111\r\nNOTE:keep\r\nEND:VCARD\r\n";
