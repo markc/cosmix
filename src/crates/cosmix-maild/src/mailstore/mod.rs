@@ -867,6 +867,17 @@ pub trait MailStore: Send + Sync {
         opts: ListOpts,
     ) -> Result<Vec<ItemId>>;
 
+    /// Paged `Email/query`: the `opts.offset`/`opts.limit` window plus the
+    /// total number of matches, all computed in storage. `query_emails` is
+    /// this with the total dropped.
+    fn query_emails_page(
+        &self,
+        account: AccountId,
+        filter: EmailQueryFilter,
+        sort: EmailSort,
+        opts: ListOpts,
+    ) -> Result<(Vec<ItemId>, u64)>;
+
     /// Read one email by item id, returning the JMAP `Email/get` row.
     ///
     /// Read-only; no `with_set_tx` scope. Reads the underlying
@@ -3255,16 +3266,133 @@ impl MailStore for SqliteMailStore {
         sort: EmailSort,
         opts: ListOpts,
     ) -> Result<Vec<ItemId>> {
+        self.query_emails_page(account, filter, sort, opts)
+            .map(|(ids, _)| ids)
+    }
+
+    fn query_emails_page(
+        &self,
+        account: AccountId,
+        filter: EmailQueryFilter,
+        sort: EmailSort,
+        opts: ListOpts,
+    ) -> Result<(Vec<ItemId>, u64)> {
+        use rusqlite::params_from_iter;
+        use rusqlite::types::Value;
+
+        // Build the WHERE clause (and its bound values) for `Email/query`.
+        // The page query and the total count share it, so both see the
+        // same predicates. Every filter is pushed into SQLite; nothing is
+        // walked or filtered in Rust.
+        fn email_query_where(filter: &EmailQueryFilter) -> Result<(String, Vec<Value>)> {
+            let mut preds: Vec<String> = Vec::new();
+            let mut params: Vec<Value> = Vec::new();
+
+            // Candidate items: at least one membership in a live container.
+            // An explicit `in_mailbox` is validated by the caller and used
+            // as-is; the unfiltered walk excludes the upload-staging container.
+            match filter.in_mailbox {
+                Some(mb) => {
+                    preds.push(
+                        "i.id IN (SELECT m.item_id FROM membership m WHERE m.container_id = ?)"
+                            .into(),
+                    );
+                    params.push(Value::Text(mb.0.to_string()));
+                }
+                None => {
+                    preds.push(
+                        "i.id IN (SELECT m.item_id FROM membership m \
+                         JOIN container c ON c.id = m.container_id WHERE c.name <> ?)"
+                            .into(),
+                    );
+                    params.push(Value::Text(UPLOAD_STAGING_NAME.to_string()));
+                }
+            }
+            if let Some(b) = filter.before {
+                preds.push("i.received_at < ?".into());
+                params.push(Value::Integer(b));
+            }
+            if let Some(a) = filter.after {
+                preds.push("i.received_at >= ?".into());
+                params.push(Value::Integer(a));
+            }
+            if let Some(min) = filter.min_size {
+                preds.push("i.size_bytes >= ?".into());
+                params.push(Value::Integer(min as i64));
+            }
+            if let Some(max) = filter.max_size {
+                preds.push("i.size_bytes <= ?".into());
+                params.push(Value::Integer(max as i64));
+            }
+            // RFC 8621 §4.4.1: at least one membership outside the list.
+            // An empty list makes `NOT IN ()` true for any membership.
+            if let Some(others) = &filter.in_mailbox_other_than {
+                let marks = vec!["?"; others.len()].join(",");
+                preds.push(format!(
+                    "EXISTS (SELECT 1 FROM membership m2 \
+                     WHERE m2.item_id = i.id AND m2.container_id NOT IN ({marks}))"
+                ));
+                params.extend(others.iter().map(|c| Value::Text(c.0.to_string())));
+            }
+            // Keyword predicates use the union of flags across memberships:
+            // `has` needs some membership to carry a bit; `not` needs none.
+            if let Some(hk) = filter.has_keyword {
+                preds.push(
+                    "EXISTS (SELECT 1 FROM membership m2 \
+                     WHERE m2.item_id = i.id AND (m2.flags & ?) <> 0)"
+                        .into(),
+                );
+                params.push(Value::Integer(i64::from(hk.0)));
+            }
+            if let Some(nk) = filter.not_keyword {
+                preds.push(
+                    "NOT EXISTS (SELECT 1 FROM membership m2 \
+                     WHERE m2.item_id = i.id AND (m2.flags & ?) <> 0)"
+                        .into(),
+                );
+                params.push(Value::Integer(i64::from(nk.0)));
+            }
+            // User keywords live in `membership.tags` as a JSON string array.
+            if let Some(ht) = &filter.has_tag {
+                preds.push(
+                    "EXISTS (SELECT 1 FROM membership m2, json_each(m2.tags) t \
+                     WHERE m2.item_id = i.id AND t.value = ?)"
+                        .into(),
+                );
+                params.push(Value::Text(ht.clone()));
+            }
+            if let Some(nt) = &filter.not_tag {
+                preds.push(
+                    "NOT EXISTS (SELECT 1 FROM membership m2, json_each(m2.tags) t \
+                     WHERE m2.item_id = i.id AND t.value = ?)"
+                        .into(),
+                );
+                params.push(Value::Text(nt.clone()));
+            }
+            // Full text: a needle with no searchable token matches nothing.
+            if let Some(needle) = &filter.text {
+                let expr = cosmix_mds::container::fts_match_expr(needle);
+                if expr.is_empty() {
+                    preds.push("0".into());
+                } else {
+                    preds.push(
+                        "i.id IN (SELECT item_id FROM mail_search WHERE mail_search MATCH ?)"
+                            .into(),
+                    );
+                    params.push(Value::Text(expr));
+                }
+            }
+            Ok((preds.join(" AND "), params))
+        }
+
         let set = account_id_to_setid(account);
 
-        // Step 1: candidate containers. `in_mailbox: Some(X)` validates
-        // X exists (so `Email/query inMailbox: <unknown>` surfaces a
-        // distinct error). `in_mailbox: None` walks every container in
-        // the account's set, excluding `__upload_staging__` per the
-        // same rule `list_mailboxes` enforces.
-        let candidate_containers: Vec<ContainerId> = if let Some(mb) = filter.in_mailbox {
+        // Step 1: validate the mailbox filter. An explicit `in_mailbox` that
+        // does not exist is a distinct JMAP error. With no mailbox filter an
+        // unprovisioned account is simply empty (JMAP `[]`, not an error).
+        if let Some(mb) = filter.in_mailbox {
             match self.mds.container_status(&set, &mb) {
-                Ok(_) => vec![mb],
+                Ok(_) => {}
                 Err(cosmix_mds::Error::SetNotFound(_))
                 | Err(cosmix_mds::Error::ContainerNotFound(_)) => {
                     return Err(anyhow!("mailbox not found: {id}", id = mb.0));
@@ -3273,277 +3401,108 @@ impl MailStore for SqliteMailStore {
             }
         } else {
             match self.mds.list_containers(&set) {
-                Ok(cs) => cs
-                    .into_iter()
-                    .filter(|c| c.name != UPLOAD_STAGING_NAME)
-                    .map(|c| c.id)
-                    .collect(),
-                // Unprovisioned account + no `in_mailbox` filter is the
-                // moral equivalent of "no mailboxes at all" — return
-                // empty rather than error. JMAP `Email/query` over a
-                // brand-new account should give `[]`, not blow up.
-                Err(cosmix_mds::Error::SetNotFound(_)) => return Ok(Vec::new()),
+                Ok(_) => {}
+                Err(cosmix_mds::Error::SetNotFound(_)) => return Ok((Vec::new(), 0)),
                 Err(e) => return Err(anyhow!(e)),
             }
-        };
-
-        // Caller asked for zero rows. The mailbox-existence pre-check
-        // above has already run for the `in_mailbox: Some(_)` case.
-        if opts.limit == 0 {
-            return Ok(Vec::new());
         }
 
-        // Step 2: gather candidate item ids with received_at +
-        // size_bytes from `list_items`. Dedupe by ItemId — an email
-        // with N memberships shows up N times across container walks
-        // but its item-level metadata is invariant across them.
-        use std::collections::{HashMap, HashSet};
-        let mut candidates: HashMap<ItemId, (i64, u64)> = HashMap::new();
-        for cid in &candidate_containers {
-            let rows = match self.mds.list_items(&set, cid, SeqRange::All) {
-                Ok(v) => v,
-                // Walk-all branch: a container destroyed mid-iteration
-                // simply contributes nothing. `in_mailbox: Some(_)` was
-                // already validated above, so this can only fire on
-                // the unfiltered path.
-                Err(cosmix_mds::Error::ContainerNotFound(_)) => continue,
-                Err(e) => return Err(anyhow!(e)),
+        let (where_sql, where_params) = email_query_where(&filter)?;
+
+        // Sort keys mirror the in-memory order this replaces: the newest-first
+        // tiebreak within an equal key, then ItemId, with the whole ordering
+        // reversed for descending.
+        let order_sql = match sort {
+            EmailSort::ReceivedAtDesc => "i.received_at DESC, i.id DESC",
+            EmailSort::ReceivedAtAsc => "i.received_at ASC, i.id ASC",
+            EmailSort::SubjectAsc => {
+                "COALESCE(e.normalized_subject, '') ASC, i.received_at DESC, i.id ASC"
+            }
+            EmailSort::SubjectDesc => {
+                "COALESCE(e.normalized_subject, '') DESC, i.received_at ASC, i.id DESC"
+            }
+            EmailSort::FromAsc => {
+                "lower(COALESCE(e.from_addr, '')) ASC, i.received_at DESC, i.id ASC"
+            }
+            EmailSort::FromDesc => {
+                "lower(COALESCE(e.from_addr, '')) DESC, i.received_at ASC, i.id DESC"
+            }
+        };
+        let want_subject = matches!(sort, EmailSort::SubjectAsc | EmailSort::SubjectDesc);
+
+        let page_sql = format!(
+            "SELECT i.id FROM item i LEFT JOIN mail_envelopes e ON e.item_id = i.id \
+             WHERE {where_sql} ORDER BY {order_sql} LIMIT ? OFFSET ?"
+        );
+        let count_sql = format!("SELECT COUNT(*) FROM item i WHERE {where_sql}");
+
+        // Rows written before migration v1.7 carry an empty `normalized_subject`.
+        // Fill those in first so a subject sort does not misplace them. Rows
+        // whose normalised form is genuinely empty are re-probed each time.
+        fn backfill_normalized_subjects(conn: &rusqlite::Connection) -> cosmix_mds::Result<()> {
+            let pending: Vec<(String, String)> = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT item_id, subject FROM mail_envelopes \
+                         WHERE normalized_subject = ''",
+                    )
+                    .map_err(|e| cosmix_mds::Error::Other(format!("prepare backfill: {e}")))?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                    .map_err(|e| cosmix_mds::Error::Other(format!("query backfill: {e}")))?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(|e| cosmix_mds::Error::Other(format!("row backfill: {e}")))?
             };
-            for r in rows {
-                candidates
-                    .entry(r.id)
-                    .or_insert((r.meta.received_at, r.meta.size_bytes));
-            }
-        }
-
-        // Step 3: filter. Time + size predicates use only per-row
-        // metadata; membership predicates need a follow-up
-        // `item_memberships` read (one per surviving candidate after
-        // the cheap filters).
-        let other_set: HashSet<ContainerId> = filter
-            .in_mailbox_other_than
-            .as_ref()
-            .map(|v| v.iter().copied().collect())
-            .unwrap_or_default();
-        let need_memberships = filter.in_mailbox_other_than.is_some()
-            || filter.has_keyword.is_some()
-            || filter.not_keyword.is_some()
-            || filter.has_tag.is_some()
-            || filter.not_tag.is_some();
-
-        // `text` full-text predicate: resolve the set-wide FTS match set ONCE
-        // (a single `mail_search` MATCH), then intersect it per-candidate below
-        // — so `text` ANDs with `in_mailbox` and the keyword predicates. A blank
-        // / punctuation-only needle yields an empty set → no rows survive.
-        let text_matches: Option<HashSet<ItemId>> = match filter.text.as_deref() {
-            Some(needle) => Some(self.mds.search_items(&set, needle)?.into_iter().collect()),
-            None => None,
-        };
-
-        let mut survivors: Vec<(ItemId, i64)> = Vec::with_capacity(candidates.len());
-        for (id, (received_at, size_bytes)) in candidates {
-            if let Some(b) = filter.before
-                && received_at >= b
-            {
-                continue;
-            }
-            if let Some(a) = filter.after
-                && received_at < a
-            {
-                continue;
-            }
-            if let Some(min) = filter.min_size
-                && size_bytes < min
-            {
-                continue;
-            }
-            if let Some(max) = filter.max_size
-                && size_bytes > max
-            {
-                continue;
-            }
-            // `text` predicate: drop any candidate not in the FTS match set.
-            if let Some(tm) = &text_matches
-                && !tm.contains(&id)
-            {
-                continue;
-            }
-
-            if need_memberships {
-                let memberships = match self.mds.item_memberships(&set, &id) {
-                    Ok(v) => v,
-                    // Item destroyed between the candidate gather and
-                    // here — drop silently. `ItemNotFound` is not
-                    // emitted by `item_memberships` (it returns an
-                    // empty Vec for unknown ids per the trait doc),
-                    // so this branch handles the SetNotFound shape and
-                    // any future tightening of the contract.
-                    Err(cosmix_mds::Error::SetNotFound(_))
-                    | Err(cosmix_mds::Error::ItemNotFound(_)) => continue,
-                    Err(e) => return Err(anyhow!(e)),
-                };
-
-                // An item with zero memberships is either destroyed
-                // mid-walk (returns an empty Vec per the trait doc) or
-                // unmoored. Either way it cannot satisfy a membership-
-                // sensitive filter — in particular `not_keyword` would
-                // otherwise leak ghost rows since `0 & mask != 0` is
-                // always false.
-                if memberships.is_empty() {
+            for (item_id, subject) in pending {
+                let norm = subject::normalize_subject(&subject);
+                if norm.is_empty() {
                     continue;
                 }
-
-                if filter.in_mailbox_other_than.is_some() {
-                    // RFC 8621 §4.4.1: "the email has at least one
-                    // mailbox not in the list". An item with all
-                    // memberships inside `other_set` fails the filter.
-                    // An item with zero memberships also fails (it is
-                    // not "in" any mailbox other than the listed ones
-                    // because it is not in any mailbox at all).
-                    let has_other = memberships.iter().any(|(c, _, _)| !other_set.contains(c));
-                    if !has_other {
-                        continue;
-                    }
-                }
-
-                if filter.has_keyword.is_some() || filter.not_keyword.is_some() {
-                    let union: u32 = memberships
-                        .iter()
-                        .map(|(_, f, _)| f.0)
-                        .fold(0u32, |a, b| a | b);
-                    if let Some(hk) = filter.has_keyword
-                        && union & hk.0 == 0
-                    {
-                        continue;
-                    }
-                    if let Some(nk) = filter.not_keyword
-                        && union & nk.0 != 0
-                    {
-                        continue;
-                    }
-                }
-
-                if filter.has_tag.is_some() || filter.not_tag.is_some() {
-                    // User-keyword predicate: post-filter against the
-                    // union of per-membership `Tags` (no mds pushdown
-                    // for tags — the membership rows are already in
-                    // hand). Mirrors the `has_keyword`/`not_keyword`
-                    // union semantics above. An item with zero
-                    // memberships was already dropped, so a `not_tag`
-                    // here cannot leak a ghost row.
-                    let tag_match =
-                        |needle: &str| memberships.iter().any(|(_, _, t)| t.contains(needle));
-                    if let Some(ht) = filter.has_tag.as_deref()
-                        && !tag_match(ht)
-                    {
-                        continue;
-                    }
-                    if let Some(nt) = filter.not_tag.as_deref()
-                        && tag_match(nt)
-                    {
-                        continue;
-                    }
-                }
+                conn.execute(
+                    "UPDATE mail_envelopes SET normalized_subject = ?1 WHERE item_id = ?2",
+                    rusqlite::params![norm, item_id],
+                )
+                .map_err(|e| cosmix_mds::Error::Other(format!("update backfill: {e}")))?;
             }
-
-            survivors.push((id, received_at));
+            Ok(())
         }
 
-        // Step 4: sort + paginate. Tie-break on ItemId so paginated
-        // cursor positions are stable when multiple items share a
-        // received_at (e.g. SMTP burst delivery in the same second).
-        // The tiebreak mirrors the primary direction so that a client
-        // flipping `EmailSort` sees a fully reversed list within a
-        // tied group, not a partially-reversed one.
-        match sort {
-            EmailSort::ReceivedAtDesc => {
-                survivors.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.0.cmp(&a.0.0)));
-            }
-            EmailSort::ReceivedAtAsc => {
-                survivors.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.0.cmp(&b.0.0)));
-            }
-            EmailSort::SubjectAsc
-            | EmailSort::SubjectDesc
-            | EmailSort::FromAsc
-            | EmailSort::FromDesc => {
-                // Envelope-keyed sort (Phase B): pull the per-item sort key
-                // (RFC base subject, or the lowercased From address) from the
-                // `mail_envelopes` sidecar for the WHOLE filtered set — JMAP
-                // sorts before paginating. One prepared statement, reused per
-                // survivor. A missing envelope row (an item mid-delete) keys to
-                // the empty string rather than failing the whole query.
-                //
-                // Cost: O(survivors) indexed lookups on `mail_envelopes`
-                // (item_id is the row key), only when the client actually sorts
-                // by subject/from (the default receivedAt path stays key-free).
-                // This scales with the RESULT set, deliberately preferred over a
-                // single `SELECT … FROM mail_envelopes` that would load the whole
-                // account's envelopes (O(total), worse when survivors << total)
-                // or an `IN (…)` batch that would need chunking around SQLite's
-                // bound-parameter cap. If a pathological large-result subject/
-                // from sort ever becomes hot, batch the lookups then.
-                let want_subject = matches!(sort, EmailSort::SubjectAsc | EmailSort::SubjectDesc);
-                let mut keys: HashMap<ItemId, String> = HashMap::with_capacity(survivors.len());
-                self.mds
-                    .with_set_tx(&set, |tx| {
-                        let mut stmt = tx
-                            .tx()
-                            .prepare(
-                                "SELECT subject, from_addr \
-                                 FROM mail_envelopes WHERE item_id = ?1",
-                            )
-                            .map_err(|e| {
-                                cosmix_mds::Error::Other(format!("prepare envelope sort: {e}"))
-                            })?;
-                        for (id, _) in &survivors {
-                            let row = stmt
-                                .query_row(params![id.0.to_string()], |r| {
-                                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-                                })
-                                .optional()
-                                .map_err(|e| {
-                                    cosmix_mds::Error::Other(format!("envelope sort read: {e}"))
-                                })?;
-                            let key = match row {
-                                Some((subj, from_addr)) => {
-                                    if want_subject {
-                                        subject::normalize_subject(&subj)
-                                    } else {
-                                        from_addr.to_lowercase()
-                                    }
-                                }
-                                None => String::new(),
-                            };
-                            keys.insert(*id, key);
-                        }
-                        Ok(())
+        let (ids, total) = self
+            .mds
+            .with_set_tx(&set, |tx| {
+                let conn = tx.tx();
+                if want_subject {
+                    backfill_normalized_subjects(conn)?;
+                }
+                let total: i64 = conn
+                    .query_row(&count_sql, params_from_iter(where_params.iter()), |r| {
+                        r.get(0)
                     })
-                    .map_err(|e| anyhow!(e))?;
-                let blank = String::new();
-                let ascending = matches!(sort, EmailSort::SubjectAsc | EmailSort::FromAsc);
-                survivors.sort_by(|a, b| {
-                    let ka = keys.get(&a.0).unwrap_or(&blank);
-                    let kb = keys.get(&b.0).unwrap_or(&blank);
-                    // Tiebreak within an equal key: newest received first,
-                    // then ItemId. Reverse the whole ordering for descending
-                    // so a direction flip fully reverses the list.
-                    let ord = ka
-                        .cmp(kb)
-                        .then_with(|| b.1.cmp(&a.1))
-                        .then_with(|| a.0.0.cmp(&b.0.0));
-                    if ascending { ord } else { ord.reverse() }
-                });
-            }
-        }
+                    .map_err(|e| cosmix_mds::Error::Other(format!("count emails: {e}")))?;
 
-        let start = opts.offset as usize;
-        if start >= survivors.len() {
-            return Ok(Vec::new());
-        }
-        let end = start
-            .saturating_add(opts.limit as usize)
-            .min(survivors.len());
-        Ok(survivors[start..end].iter().map(|(id, _)| *id).collect())
+                let mut page_params = where_params.clone();
+                page_params.push(Value::Integer(i64::from(opts.limit)));
+                page_params.push(Value::Integer(i64::from(opts.offset)));
+                let mut stmt = conn
+                    .prepare(&page_sql)
+                    .map_err(|e| cosmix_mds::Error::Other(format!("prepare email page: {e}")))?;
+                let rows = stmt
+                    .query_map(params_from_iter(page_params.iter()), |r| {
+                        r.get::<_, String>(0)
+                    })
+                    .map_err(|e| cosmix_mds::Error::Other(format!("query email page: {e}")))?;
+                let mut ids = Vec::new();
+                for row in rows {
+                    let s =
+                        row.map_err(|e| cosmix_mds::Error::Other(format!("row email page: {e}")))?;
+                    let uuid = uuid::Uuid::parse_str(&s)
+                        .map_err(|e| cosmix_mds::Error::Other(format!("item id {s:?}: {e}")))?;
+                    ids.push(ItemId(uuid));
+                }
+                Ok((ids, total as u64))
+            })
+            .map_err(|e| anyhow!(e))?;
+        Ok((ids, total))
     }
 
     fn get_email(&self, account: AccountId, id: ItemId) -> Result<EmailRecord> {

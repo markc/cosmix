@@ -774,23 +774,18 @@ pub async fn query(
         }
     };
 
-    // `MailStore::query_emails` only returns `Vec<ItemId>` — the JMAP
-    // `total` field requires the count of all matching rows, not just
-    // the page. Pull the full sorted survivor list and slice locally;
-    // the storage layer already gathers all candidates in memory before
-    // pagination (`mailstore/mod.rs:1559+`), so passing
-    // `limit = u32::MAX` adds zero work beyond the slice that we'd
-    // otherwise do at the storage edge. A future revision can extend
-    // the trait to return `(Vec<ItemId>, u64)` and push the slice down.
+    // The storage layer applies the filter, sort and window in SQLite and
+    // returns the page plus the total match count, so only the requested
+    // rows and one COUNT come back for each call.
     let opts = ListOpts {
-        limit: u32::MAX,
-        offset: 0,
+        limit: u32::try_from(limit).unwrap_or(u32::MAX),
+        offset: u32::try_from(position).unwrap_or(u32::MAX),
         ..Default::default()
     };
 
     let ms = mailstore.clone();
-    let all_ids =
-        match tokio::task::spawn_blocking(move || ms.query_emails(account_id, filter, sort, opts))
+    let (page_ids, total) =
+        match tokio::task::spawn_blocking(move || ms.query_emails_page(account_id, filter, sort, opts))
             .await?
         {
             Ok(v) => v,
@@ -819,19 +814,10 @@ pub async fn query(
             }
         };
 
-    // `limit` is parsed as `u64` to keep the wire surface honest, but
-    // pagination indices into the in-memory `all_ids` Vec are `usize`.
-    // On a 32-bit target a client-supplied limit > u32::MAX would
-    // silently truncate the cast and return an empty page despite the
-    // client asking for "everything"; clamping to `usize::MAX` here
-    // keeps the slice math exact on every supported target. Cosmix's
-    // mesh nodes are 64-bit, but the clamp is free insurance against
-    // future cross-compiles or sandbox runs.
-    let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
-    let total = all_ids.len();
-    let start = (position as usize).min(all_ids.len());
-    let end = start.saturating_add(limit_usize).min(all_ids.len());
-    let page = &all_ids[start..end];
+    // A position past the end yields an empty page; report the clamped
+    // position so the client sees where the list actually ends.
+    let total_usize = usize::try_from(total).unwrap_or(usize::MAX);
+    let start = usize::try_from(position).unwrap_or(usize::MAX).min(total_usize);
 
     let resp = QueryResponse {
         account_id: acct,

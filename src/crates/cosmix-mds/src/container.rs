@@ -1177,6 +1177,13 @@ pub fn item_memberships(
 /// would yield an empty phrase for pure punctuation, which is unsafe to
 /// embed. If every token drops (or the needle is blank) the result is the
 /// empty string — [`search_items`] treats that as "match nothing".
+/// The FTS5 MATCH expression for a raw user needle, or `""` when the needle
+/// has no searchable token. Exposed so callers can push `text` predicates
+/// into their own SQL against `mail_search`.
+pub fn fts_match_expr(needle: &str) -> String {
+    build_fts_query(needle)
+}
+
 fn build_fts_query(needle: &str) -> String {
     let mut parts: Vec<String> = Vec::new();
     for tok in needle.split_whitespace() {
