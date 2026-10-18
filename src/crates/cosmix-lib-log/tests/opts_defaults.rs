@@ -26,7 +26,7 @@ fn log_opts_all_flags_parse() {
         "--log-level",
         "debug",
         "--log-filter",
-        "cosmix_maild=debug,cosmix_bus=warn",
+        "maild=debug,cosmix_bus=warn",
         "--log-format",
         "json",
         "--log-stderr",
@@ -43,7 +43,7 @@ fn log_opts_all_flags_parse() {
     assert_eq!(cmd.log.log_level, Some(LogLevel::Debug));
     assert_eq!(
         cmd.log.log_filter.as_deref(),
-        Some("cosmix_maild=debug,cosmix_bus=warn")
+        Some("maild=debug,cosmix_bus=warn")
     );
     assert_eq!(cmd.log.log_format, Some(LogFormat::Json));
     assert_eq!(cmd.log.log_stderr, Some(TriState::Never));
@@ -88,9 +88,9 @@ fn log_level_trace_is_first_class_clap_value() {
 
 #[test]
 fn defaults_daemon_shape() {
-    let d = LogDefaults::daemon("cosmix-maild");
-    assert_eq!(d.identity, "cosmix-maild");
-    assert_eq!(d.default_target, "cosmix_maild"); // hyphens → underscores
+    let d = LogDefaults::daemon("maild");
+    assert_eq!(d.identity, "maild");
+    assert_eq!(d.default_target, "maild"); // hyphens → underscores
     assert_eq!(d.bus_service, None);
     assert_eq!(d.level, LogLevel::Info);
     assert_eq!(d.format, LogFormat::Json);
@@ -242,14 +242,14 @@ fn with_log_file_retargets_default_stats_file() {
     // with_log_file must carry the default stats_file along — otherwise
     // the documented convention silently breaks. (daemon() no longer
     // pre-sets a file sink, so the precondition is built explicitly.)
-    let d = LogDefaults::daemon("cosmix-maild")
+    let d = LogDefaults::daemon("maild")
         .with_log_file("/old/log")
-        .with_stats_file("/old/log/cosmix-maild.stats.jsonl")
+        .with_stats_file("/old/log/maild.stats.jsonl")
         .with_log_file("/var/log/cosmix");
     let stats = d.stats_file.as_ref().expect("stats_file is retargeted");
     assert_eq!(
         stats,
-        std::path::Path::new("/var/log/cosmix/cosmix-maild.stats.jsonl")
+        std::path::Path::new("/var/log/cosmix/maild.stats.jsonl")
     );
     assert_eq!(
         d.log_file.as_deref(),
@@ -262,7 +262,7 @@ fn with_log_file_preserves_explicit_stats_file() {
     // Explicit `with_stats_file` overrides (non-default filename) must
     // NOT be clobbered by a subsequent `with_log_file` call, regardless
     // of order.
-    let d1 = LogDefaults::daemon("cosmix-maild")
+    let d1 = LogDefaults::daemon("maild")
         .with_stats_file("/srv/metrics/maild.jsonl")
         .with_log_file("/var/log/cosmix");
     assert_eq!(
@@ -270,7 +270,7 @@ fn with_log_file_preserves_explicit_stats_file() {
         Some(std::path::Path::new("/srv/metrics/maild.jsonl"))
     );
 
-    let d2 = LogDefaults::daemon("cosmix-maild")
+    let d2 = LogDefaults::daemon("maild")
         .with_log_file("/var/log/cosmix")
         .with_stats_file("/srv/metrics/maild.jsonl");
     assert_eq!(
@@ -287,7 +287,7 @@ fn with_log_file_preserves_same_dir_explicit_override() {
     // filename ≠ <identity>.stats.jsonl signals an explicit override.
     let old_dir = std::path::PathBuf::from("/old/log");
     let explicit = old_dir.join("custom-metrics.jsonl");
-    let d = LogDefaults::daemon("cosmix-maild")
+    let d = LogDefaults::daemon("maild")
         .with_log_file(&old_dir)
         .with_stats_file(&explicit)
         .with_log_file("/var/log/cosmix");

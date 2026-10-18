@@ -46,7 +46,7 @@ struct Cli {
 
 fn main() -> anyhow::Result<()> {
     let cli = <Cli as clap::Parser>::parse();
-    let _log = init(&cli.log, &cli.stats, LogDefaults::daemon("cosmix-maild"))?;
+    let _log = init(&cli.log, &cli.stats, LogDefaults::daemon("maild"))?;
     tracing::info!("hello");
     Ok(())
 }
@@ -77,7 +77,7 @@ retunes the filter at runtime:
 
 ```rust
 if let Some(rh) = log.reload_handle() {
-    rh.reload_filter("cosmix_maild=debug,cosmix_bus=warn".parse()?)?;
+    rh.reload_filter("maild=debug,cosmix_bus=warn".parse()?)?;
 }
 ```
 

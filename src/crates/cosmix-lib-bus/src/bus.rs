@@ -143,7 +143,7 @@ impl BusMessage {
     ///
     /// Without the body fallback, every daemon that reports its error via
     /// the body — the common case (`json_error()` in cosmix-indexd,
-    /// cosmix-maild, …) — surfaces to Bus callers as the opaque string
+    /// maild, …) — surfaces to Bus callers as the opaque string
     /// `"unknown error"`, discarding the real cause. That opacity is what
     /// turned an `invalid type: floating point 2.0, expected usize`
     /// deserialize error into an undiagnosable `rc=10 unknown error`.

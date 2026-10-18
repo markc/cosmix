@@ -198,9 +198,9 @@ print("SWAP_OK")
     $host .. " swap failed: " .. trim($swap["stdout"]) .. " " .. trim($swap["stderr"]))
 
   $restart = ssh_mix($host, '
-print(run("/usr/bin/systemctl restart cosmix-maild"))
+print(run("/usr/bin/systemctl restart maild"))
 sleep(2)
-print(run("/usr/bin/systemctl is-active cosmix-maild"))
+print(run("/usr/bin/systemctl is-active maild"))
 ', {timeout: 60})
   if not $restart["ok"] or trim($restart["stdout"]) != "active" then
     print("  RESTART FAILED with native config — restoring backup")
@@ -212,16 +212,16 @@ catch $restore_error
   exit(1)
 end
 try
-  print(run("/usr/bin/systemctl restart cosmix-maild"))
+  print(run("/usr/bin/systemctl restart maild"))
 catch $restart_error
   eprint("restart failed: " .. $restart_error)
   exit(1)
 end
 sleep(2)
-print(trim(run("/usr/bin/systemctl is-active cosmix-maild")))
+print(trim(run("/usr/bin/systemctl is-active maild")))
 ', {bindings: {bak: $RBAK, cfg: $RCFG}, timeout: 90})
     $journal = ssh_mix($host,
-      'print(run("/usr/bin/journalctl -u cosmix-maild -n 30 --no-pager"))')
+      'print(run("/usr/bin/journalctl -u maild -n 30 --no-pager"))')
     print($journal["stdout"])
     if $rollback["ok"] and trim($rollback["stdout"]) == "active" then
       $d.die_if(true,

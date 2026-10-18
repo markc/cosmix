@@ -41,10 +41,10 @@ sqlite = ["dep:rusqlite"]
 tokio-sleep = []
 # `dkim_keygen()` builtin — RSA-2048 / Ed25519 keypair + DNS TXT
 # record snippet. Depends on `mail-auth` directly rather than going
-# through `cosmix-maild-auth` to avoid a cargo cycle (cosmix-maild-auth
+# through `maild-auth` to avoid a cargo cycle (maild-auth
 # pulls cosmix-lib-client → cosmix-lib-config → cosmix-lib-mix even
 # under `default-features = false`, because cargo's cycle check is
-# feature-blind across optional-dep edges). `cosmix-maild-auth::keygen`
+# feature-blind across optional-dep edges). `maild-auth::keygen`
 # keeps the in-process Rust API for daemons that already link it;
 # this builtin re-walks the same ~30-line mail-auth flow on its own.
 dkim = ["dep:mail-auth"]
@@ -173,7 +173,7 @@ flate2 = { version = "1.1", default-features = true, optional = true }
 url = { version = "2", optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
 # `dkim` feature only — keygen path. Pinned to the same 0.7 line as
-# cosmix-maild-auth so the workspace builds one mail-auth version.
+# maild-auth so the workspace builds one mail-auth version.
 mail-auth = { version = "0.7", optional = true, default-features = false, features = ["ring", "generate"] }
 quick-xml = { version = "0.41.0", optional = true }
 

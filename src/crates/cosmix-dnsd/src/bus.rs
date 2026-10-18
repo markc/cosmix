@@ -46,7 +46,7 @@ use crate::stats::DnsStats;
 /// rc=10 is the caller-error sentinel: `NodedClient::call` only surfaces
 /// `rc >= 10` as an error, so a smaller rc would let a typo'd / a
 /// write-shaped action return `Ok(...)` and mask the failure at the
-/// caller. Same value + rationale as `cosmix-maild`'s Bus module so the
+/// caller. Same value + rationale as `maild`'s Bus module so the
 /// mesh-wide wire contract stays uniform.
 const RC_CALLER_ERROR: u8 = 10;
 

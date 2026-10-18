@@ -1,4 +1,4 @@
-# cosmix-maild Bus surface
+# maild Bus surface
 
 ## Service
 

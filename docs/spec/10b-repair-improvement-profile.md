@@ -584,7 +584,7 @@ Sources: `crates/cosmix-mds/README.md`, the operator runbook at
 
 | Action (§2) | MDS primitive | Notes |
 |---|---|---|
-| restart | systemd restart of the host daemon (e.g. `cosmix-maild`) | MDS itself is library code; restart is mediated by the consuming daemon. WAL recovery on `SqliteCasMds::open` is the post-restart half — proven safe under SIGKILL by `tests/recovery.rs`. |
+| restart | systemd restart of the host daemon (e.g. `maild`) | MDS itself is library code; restart is mediated by the consuming daemon. WAL recovery on `SqliteCasMds::open` is the post-restart half — proven safe under SIGKILL by `tests/recovery.rs`. |
 | reset-state | `cosmix-mds rebuild-index` (operator CLI) | Rebuilds box-wide `blobs.sqlite` from per-set `data.sqlite` walks. Idempotent; safe to re-run. **Caveat:** orphan CAS blobs (CAS file present, no `blob` row) are *reported* but not deleted — `put_blob` writes the CAS file *before* `add_item` writes the `blob` row, so a SIGKILL between them legitimately leaves an unindexed file. GC sweeps the `blob` table, not the filesystem. Cleanup of unindexed CAS files is operator-driven in v1. |
 | fail-over | not yet — single-node | Per-set data lives at `containers/<uuid>/data.sqlite`; cross-mesh fail-over would replicate sets via `export_set` / `import_set`. Tracked under §9.1. |
 | escalate | host daemon emits `repair.escalate` when `cosmix-mds verify --full` reports `mismatches > 0` after a recover attempt | Per the operator guide §Recover, manual surgery on individual CAS files is unsafe; the safe remediation is `import_set` from a recent backup, which is operator-mediated. |
@@ -621,7 +621,7 @@ the only surviving copy.
 
 The two LKG layers are orthogonal:
 
-- **Binary LKG (§6)** — code rollback. `/opt/cosmix/bin/cosmix-maild.lkg`.
+- **Binary LKG (§6)** — code rollback. `/opt/cosmix/bin/maild.lkg`.
 - **Set LKG (this section)** — data rollback. `mds-<UUID>-<date>.tar`.
 
 A bad deploy needs binary LKG; corruption from a hardware event needs

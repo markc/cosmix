@@ -14,7 +14,7 @@
 //! `target_root` is the **first `::`-separated segment** of the
 //! event's `target`, which for Rust code is the crate name (the
 //! plan's wording "first underscore-separated segment" is
-//! informal — the examples `cosmix_maild`, `cosmix_dnsd`, `mix`
+//! informal — the examples `maild`, `cosmix_dnsd`, `mix`
 //! are the crate names, not pre-underscore-split fragments).
 //! Bounded by workspace crate count (~25), independent of
 //! submodule depth.
@@ -155,7 +155,7 @@ fn level_str(level: &tracing::Level) -> &'static str {
 }
 
 /// First `::`-separated segment of a tracing target. For Rust
-/// code the segment is the crate name (`cosmix_maild`, `mix`,
+/// code the segment is the crate name (`maild`, `mix`,
 /// etc.) — Rust crate names are underscored, but the separator
 /// between crate and module path is `::`. Empty target degrades
 /// to `"unknown"` rather than `""` so cardinality stays bounded
@@ -190,7 +190,7 @@ mod tests {
 
     #[test]
     fn root_of_extracts_crate_segment() {
-        assert_eq!(root_of("cosmix_maild::scoring::run"), "cosmix_maild");
+        assert_eq!(root_of("maild::scoring::run"), "maild");
         assert_eq!(root_of("cosmix_dnsd"), "cosmix_dnsd");
         assert_eq!(root_of("mix"), "mix");
         // Empty degrades to "unknown" rather than "".
@@ -247,8 +247,8 @@ mod tests {
 
         metrics::with_local_recorder(&*recorder, || {
             tracing::subscriber::with_default(registry, || {
-                tracing::error!(target: "cosmix_maild::scoring", "boom");
-                tracing::error!(target: "cosmix_maild::imap", "boom2");
+                tracing::error!(target: "maild::scoring", "boom");
+                tracing::error!(target: "maild::imap", "boom2");
                 tracing::info!(target: "mix", "tick");
                 tracing::info!(target: "mix", "tick2");
             });
@@ -289,7 +289,7 @@ mod tests {
             .collect();
         assert_eq!(
             by_labels
-                .get(&("error".into(), "cosmix_maild".into()))
+                .get(&("error".into(), "maild".into()))
                 .copied(),
             Some(2)
         );

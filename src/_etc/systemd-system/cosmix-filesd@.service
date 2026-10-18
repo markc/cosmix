@@ -44,7 +44,7 @@ SyslogIdentifier=cosmix-filesd@%i
 LogRateLimitIntervalSec=30s
 LogRateLimitBurst=10000
 # Pin the broker config: under the sandbox the XDG resolver would miss the
-# canonical /etc/cosmix/node.conf.mix. Mirrors cosmix-indexd / cosmix-maild.
+# canonical /etc/cosmix/node.conf.mix. Mirrors cosmix-indexd / maild.
 Environment=COSMIX_NODE_CONFIG=%E/cosmix/node.conf.mix
 # HOME redirect at StateDirectory (mirrors maild). With ProtectHome=yes the
 # cosmix-filesd user's /home is inaccessible; without a valid HOME the BUS

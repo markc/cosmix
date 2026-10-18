@@ -3188,7 +3188,7 @@ async fn dispatch_notifications(_state: &AppState, notices: &[Notification]) {
 ///   header is **removed entirely** rather than rewritten to the
 ///   synthesised `anon-*` id. Two reasons:
 ///   1. The receiving service's `PeerIdentity::service_name` is set
-///      from `IncomingCommand.from` (e.g. `cosmix-maild::bus::mod`'s
+///      from `IncomingCommand.from` (e.g. `maild::bus::mod`'s
 ///      `dispatch_props`); leaving an `anon-*` string there would
 ///      look like a registered service to `service_name`-keyed auth
 ///      policies and to the C10c granter's `target_peer` derivation.

@@ -17,7 +17,7 @@ parser, then call:
 let mut log = cosmix_log::init(
     &cli.log,
     &cli.stats,
-    cosmix_log::LogDefaults::daemon("cosmix-maild"),
+    cosmix_log::LogDefaults::daemon("maild"),
 )?;
 ```
 

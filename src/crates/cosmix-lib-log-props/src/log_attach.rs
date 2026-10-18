@@ -194,8 +194,8 @@ mod tests {
     #[test]
     fn compose_directive_level_and_filter() {
         assert_eq!(
-            compose_directive("info", "cosmix_maild=debug"),
-            "info,cosmix_maild=debug"
+            compose_directive("info", "maild=debug"),
+            "info,maild=debug"
         );
         assert_eq!(
             compose_directive("none", "cosmix_log=info"),

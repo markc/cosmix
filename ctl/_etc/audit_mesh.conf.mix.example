@@ -14,7 +14,7 @@
     daemons: [
       "cosmix-noded",
       "cosmix-dnsd",
-      "cosmix-maild"
+      "maild"
     ]
   }
 }

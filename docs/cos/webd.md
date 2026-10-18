@@ -107,7 +107,7 @@ Bus verbs (service `webd`):
 Depends on `cosmix-lib-daemon` (the `tls` feature: rustls + ACME + SNI),
 `cosmix-lib-props-store` (SPEC-12 state), `cosmix-lib-config`, and the Bus
 client libraries from [bus](https://github.com/markc/cosmix). It reaches a local
-or remote `cosmix-maild` over JMAP for mail, the files daemon for the file
+or remote `maild` over JMAP for mail, the files daemon for the file
 manager, and evaluates per-vhost handlers through the embedded
 [mix](https://github.com/markc/cosmix) engine. Every node needs a
 [cosmix-noded](noded.md) broker for the Bus surface.

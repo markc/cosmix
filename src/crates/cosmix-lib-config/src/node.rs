@@ -370,7 +370,7 @@ pub struct MaildConfig {
     /// empty, the daemon uses it as the canonical identity list and
     /// ignores `tls_cert` / `tls_key`. When empty, the legacy pair
     /// (if set) is collapsed into a single-identity fallback by
-    /// `cosmix-maild` so existing deployments continue working
+    /// `maild` so existing deployments continue working
     /// unchanged. See `_doc/planned/maild-sni-internal-ca.md`.
     pub tls: TlsConfig,
     pub spam_enabled: bool,
@@ -400,7 +400,7 @@ impl Default for MaildConfig {
 /// Multi-identity TLS configuration.
 ///
 /// One `TlsIdentityConfig` per SNI value to be served. The
-/// resolver implementation lives in `cosmix-maild` (Phase 1
+/// resolver implementation lives in `maild` (Phase 1
 /// scope); this struct is the on-disk parse target only.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -972,7 +972,7 @@ const ENV_VAR: &str = "COSMIX_NODE_CONFIG";
 ///
 /// In user mode (uid != 0) `cosmix_path(Etc)` resolves to
 /// `~/.config/cosmix/`, which means a system daemon user (e.g.
-/// `cosmix-maild`) running an unprivileged CLI would never find a
+/// `maild`) running an unprivileged CLI would never find a
 /// node config placed at `/etc/cosmix/`. The doc comment at the top of
 /// this file already promised user-XDG-then-system-etc; this honours
 /// that promise by appending the system directory as a secondary

@@ -2,7 +2,7 @@
 //! maild/webd trust-split ADR (`_decisions/2026-06-04-maild-webd-trust-split.md`).
 //!
 //! Generalises maild's proven inbound-filter embed
-//! (`cosmix-maild/src/smtp/inbound.rs`) from SMTP to HTTP: an
+//! (`maild/src/smtp/inbound.rs`) from SMTP to HTTP: an
 //! operator-authored `.mix` script under a vhost's `www_dir` serves a
 //! request, dispatched by the declarative `webd.handlers` SPEC-12
 //! namespace ([`crate::handlers_namespace`]).

@@ -81,7 +81,7 @@ Environment=HOME=%S/cosmix/indexd
 # resolver looks at %S/cosmix/indexd/.config/cosmix/node.conf.mix and misses
 # the canonical /etc/cosmix/node.conf.mix. Pin COSMIX_NODE_CONFIG so BUS
 # registration uses the local broker URL declared in node.conf.mix. Mirrors
-# cosmix-maild.service / cosmix-noded.service for the same root cause.
+# maild.service / cosmix-noded.service for the same root cause.
 Environment=COSMIX_NODE_CONFIG=%E/cosmix/node.conf.mix
 
 # §5.1 required (Level 1)

@@ -110,7 +110,7 @@ It does not apply to:
 | **tarball** | The on-the-wire artifact (`cosmix-<package>-<version>-<arch>.tar.zst`) shipped to a host, plus its detached integrity envelope (§3.4). |
 | **installer** | The Mix script `ns4-install.mix` (§6) that drives §5's procedure on the host. |
 | **sysadm** | The administrative human user, UID 1000, NS 3.0 convention, configured by the operator before NS 4.0 runs. |
-| **base package** | `cosmix-base` — `cosmix-noded` + `cosmix-maild` + `cosmix-webd` + Mix runtime + canonical fragments (§2.1). |
+| **base package** | `cosmix-base` — `cosmix-noded` + `maild` + `cosmix-webd` + Mix runtime + canonical fragments (§2.1). |
 | **knowledge add-on** | `cosmix-indexd` — optional vector / knowledge index daemon, separate package (§2.2). |
 | **roles** | The set of cosmix-* daemons enabled on a node. NS 4.0 v1.0.0 defines two role packs: `mesh-citizen` (base) and `knowledge` (base + indexd). |
 | **operator** | The human (or agent) running the installer, addressing the host as sysadm. |
@@ -147,7 +147,7 @@ The base mesh-citizen package. Every NS 4.0 mesh node SHALL install
 | Component | Path on disk | Source / SPEC reference |
 |-----------|--------------|--------------------------|
 | `cosmix-noded` binary | `/opt/cosmix/bin/cosmix-noded` | SPEC 10 UID 500, ABP service `noded` |
-| `cosmix-maild` binary | `/opt/cosmix/bin/cosmix-maild` | SPEC 10 UID 501 |
+| `maild` binary | `/opt/cosmix/bin/maild` | SPEC 10 UID 501 |
 | `cosmix-webd` binary | `/opt/cosmix/bin/cosmix-webd` | SPEC 10 UID 502 |
 | `mix` binary | `/opt/cosmix/bin/mix` | Mix runtime — required by the installer and by every cosmix-* daemon's lifecycle hooks |
 | sysusers fragment | `/usr/lib/sysusers.d/cosmix.conf` | SPEC 10 §4, Appendix A — generated from canonical Markdown |
@@ -167,7 +167,7 @@ separate add-ons.
 
 **Pending materialisation.** As of v1.0.0-rc.1, the source tree
 contains canonical units only for `cosmix-noded.service` and
-`cosmix-maild.service` (`deployment-config/systemd/`); the `cosmix-webd`
+`maild.service` (`deployment-config/systemd/`); the `cosmix-webd`
 binary and `cosmix-webd.service` unit are normatively in scope for
 this SPEC but not yet committed. A `cosmix-base` v1.0.0 build
 artifact SHALL NOT be cut until the webd unit and binary land in
@@ -269,7 +269,7 @@ cosmix-base-1.0.0-amd64/
 │   ├── local/
 │   │   └── bin/
 │   │       ├── cosmix-noded
-│   │       ├── cosmix-maild
+│   │       ├── maild
 │   │       ├── cosmix-webd
 │   │       └── mix
 │   ├── lib/
@@ -280,7 +280,7 @@ cosmix-base-1.0.0-amd64/
 │   │   └── systemd/
 │   │       └── system/
 │   │           ├── cosmix-noded.service
-│   │           ├── cosmix-maild.service
+│   │           ├── maild.service
 │   │           └── cosmix-webd.service
 │   └── share/
 │       └── cosmix/
@@ -327,7 +327,7 @@ build_host_id: <opaque>
 ---
 # files: <relative path> <mode> <sha256>
 usr/local/bin/cosmix-noded 0755 <hex>
-usr/local/bin/cosmix-maild 0755 <hex>
+usr/local/bin/maild 0755 <hex>
 usr/local/bin/cosmix-webd  0755 <hex>
 usr/local/bin/mix          0755 <hex>
 usr/lib/sysusers.d/cosmix.conf 0644 <hex>
@@ -1263,7 +1263,7 @@ unchanged units or vice versa:
    tombstone removal SHALL fail-closed (per SPEC 10 §2.4).
 3. **Stop services** in reverse-dependency order, **before** any
    file is promoted out of staging:
-   `cosmix-indexd` → `cosmix-webd` → `cosmix-maild` →
+   `cosmix-indexd` → `cosmix-webd` → `maild` →
    `cosmix-noded`.
 4. Promote new sysusers / tmpfiles fragments (§5.4–§5.6),
    re-running the SPEC 10 §6.2 post-sysusers verification (this
@@ -1812,13 +1812,13 @@ hard-gate present entries.
 # tarball-path                                        mode    source-status
 MANIFEST                                              (frontmatter + one line per packaged file below)
 usr/local/bin/cosmix-noded                            0755    [present, $COSMIX/src/crates/cosmix-noded]
-usr/local/bin/cosmix-maild                            0755    [present, $COSMIX/src/crates/cosmix-maild]
+usr/local/bin/maild                            0755    [present, $COSMIX/src/crates/maild]
 usr/local/bin/cosmix-webd                             0755    [present in tree, $COSMIX/src/crates/cosmix-webd]
 usr/local/bin/mix                                     0755    [present, $COSMIX/src/crates/cosmix-mix]
 usr/lib/sysusers.d/cosmix.conf                        0644    [present, deployment-config/sysusers/cosmix.conf]
 usr/lib/tmpfiles.d/cosmix.conf                        0644    [pending, deployment-config/tmpfiles/cosmix.conf]
 usr/lib/systemd/system/cosmix-noded.service           0644    [present, deployment-config/systemd/cosmix-noded.service]
-usr/lib/systemd/system/cosmix-maild.service           0644    [present, deployment-config/systemd/cosmix-maild.service]
+usr/lib/systemd/system/maild.service           0644    [present, deployment-config/systemd/maild.service]
 usr/lib/systemd/system/cosmix-webd.service            0644    [pending, deployment-config/systemd/cosmix-webd.service]
 usr/share/cosmix/LICENSE                              0644    [present, ./LICENSE]
 usr/share/cosmix/README.md                            0644    [present, ./README.md]
@@ -1897,7 +1897,7 @@ existing NS 3.0 host being brought to NS 4.0 substrate plane.
 ### C.2 What changes
 
 - Substrate daemons (any pre-NS-4.0 hand-installed
-  `cosmix-noded`, `cosmix-maild`, `cosmix-jmap` from the
+  `cosmix-noded`, `maild`, `cosmix-jmap` from the
   pre-SPEC-10 era) SHALL be migrated to the SPEC 10 identity
   registry. The example-node first-deployment journal documents the
   worked example.

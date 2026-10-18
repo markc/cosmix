@@ -24,7 +24,7 @@ Encoded re-parses inherit the current combined depth plus one. The existing
 three-encoded-layer limit stays in place. Multipart child IDs are flat indices,
 not recursive Message ownership. Public APIs and ordinary messages are unchanged.
 
-Direct integration tests in `crates/cosmix-maild/tests/parser_nesting.rs` bypass
+Direct integration tests in `crates/maild/tests/parser_nesting.rs` bypass
 all maild preflight and parse/drop on an explicitly sized 2 MiB stack: 100,000
 plain levels, base64 wrapping 100,000 plain levels (also beneath 60 outer plain
 levels), and an unchanged ten-level message. The cluster must run these tests;

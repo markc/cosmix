@@ -1,14 +1,14 @@
-# cosmix-maild-auth
+# maild-auth
 
-`cosmix-maild-auth` provides the mail-authentication library used by `cosmix-maild`: inbound SPF, DKIM, DMARC, ARC, and iprev verification; outbound DKIM signing; DKIM key generation; DNS resolver construction; and structured authentication results. It lives in the `cos` repository at the downstream end of the `bus <- mix <- cos` dependency chain. The default build does not depend on `mix` or `bus`; the optional `cosmix` feature adds direct dependencies on two `bus` crates.
+`maild-auth` provides the mail-authentication library used by `maild`: inbound SPF, DKIM, DMARC, ARC, and iprev verification; outbound DKIM signing; DKIM key generation; DNS resolver construction; and structured authentication results. It lives in the `cos` repository at the downstream end of the `bus <- mix <- cos` dependency chain. The default build does not depend on `mix` or `bus`; the optional `cosmix` feature adds direct dependencies on two `bus` crates.
 
 ## Synopsis
 
-The Cargo package is named `cosmix-maild-auth`. Rust code imports it as `cosmix_maild_auth`.
+The Cargo package is named `maild-auth`. Rust code imports it as `maild_auth`.
 
 ```rust
-use cosmix_maild_auth::keygen::generate;
-use cosmix_maild_auth::KeySpec;
+use maild_auth::keygen::generate;
+use maild_auth::KeySpec;
 
 let material = generate(KeySpec::Ed25519)?;
 ```

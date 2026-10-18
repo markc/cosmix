@@ -6621,7 +6621,7 @@ impl QueryRowOptional for Result<Post, rusqlite::Error> {
 // ---------------------------------------------------------------------------
 
 /// Run a CLI `vhost` subcommand as a transient Bus client.
-/// Mirrors `cosmix-maild`'s `run_domain_cli` (commit `6dc28ab`):
+/// Mirrors `maild`'s `run_domain_cli` (commit `6dc28ab`):
 /// connects via the broker, calls the `webd.props.*` surface for the
 /// `vhosts` namespace, and renders structured-error bodies into
 /// operator-readable messages.

@@ -98,11 +98,11 @@ end
 fn rollback_config($host)
   $rb = ssh_mix($host, '
 copy($backup_path, $cfg_path)
-$active = run("/usr/bin/systemctl restart cosmix-maild && /usr/bin/sleep 2 && /usr/bin/systemctl is-active cosmix-maild")
+$active = run("/usr/bin/systemctl restart maild && /usr/bin/sleep 2 && /usr/bin/systemctl is-active maild")
 print($active)
 ', {bindings: {backup_path: $REMOTE_CONFIG_BACKUP, cfg_path: $REMOTE_CONFIG}})
   $journal = ssh_mix($host,
-    'print(run("/usr/bin/journalctl -u cosmix-maild -n 30 --no-pager"))')
+    'print(run("/usr/bin/journalctl -u maild -n 30 --no-pager"))')
   print($journal["stdout"])
   print($journal["stderr"])
   if $rb["ok"] and trim($rb["stdout"]) == "active" then
@@ -158,7 +158,7 @@ print("FILTER_OK")
   -- that did nothing, truncated the file, or installed invalid source fails.
   $smoke = ssh_mix($host, '
 write_file($smoke_path, $prefix .. read_file($filter_path))
-$out = run("/opt/cosmix/bin/mix /tmp/cosmix-maild-filter-smoke.mix")
+$out = run("/opt/cosmix/bin/mix /tmp/maild-filter-smoke.mix")
 remove($smoke_path)
 print("FILTER_SMOKE_OK " .. $out)
 ', {bindings: {
@@ -187,13 +187,13 @@ print("FILTER_SMOKE_OK " .. $out)
 
   print("  config: inbound_filter inserted — restarting maild")
   $restart = ssh_mix($host,
-    'print(run("/usr/bin/systemctl restart cosmix-maild && /usr/bin/sleep 2 && /usr/bin/systemctl is-active cosmix-maild"))')
+    'print(run("/usr/bin/systemctl restart maild && /usr/bin/sleep 2 && /usr/bin/systemctl is-active maild"))')
   if not $restart["ok"] or trim($restart["stdout"]) != "active" then
     print("  RESTART FAILED with new config — restoring pre-edit config")
     rollback_config($host)
   end
   print("  active: " .. trim($restart["stdout"]))
-  verify_logging($host, "cosmix-maild")
+  verify_logging($host, "maild")
   print("  [" .. $host .. "] OK (restarted)")
 end
 
@@ -278,7 +278,7 @@ $REMOTE_FILTER_DIR = "/etc/cosmix/maild"
 $REMOTE_FILTER = $REMOTE_FILTER_DIR .. "/inbound-filter.mix"
 $REMOTE_CONFIG = $REMOTE_FILTER_DIR .. "/config.conf.mix"
 $REMOTE_CONFIG_BACKUP = $REMOTE_CONFIG .. ".bak-filter"
-$REMOTE_SMOKE = "/tmp/cosmix-maild-filter-smoke.mix"
+$REMOTE_SMOKE = "/tmp/maild-filter-smoke.mix"
 $d.die_if(not is_file($FILTER), "local filter missing: " .. $FILTER)
 $FILTER_SOURCE = read_file($FILTER)
 

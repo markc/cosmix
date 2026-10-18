@@ -660,7 +660,7 @@ mod tests {
         assert_eq!(col.3, "TEXT", "normalized_subject must be TEXT");
 
         // Composite index landed and covers BOTH the WHERE filter
-        // and the ORDER BY chain used by the cosmix-maild subject-
+        // and the ORDER BY chain used by the maild subject-
         // fallback lookup. Asserting the exact column order pins
         // the index-covering property; if a future maintainer drops
         // a column or reorders the keys the threading-fallback query

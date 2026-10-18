@@ -1,7 +1,7 @@
 //! Per-listener TLS material with hot-swap.
 //!
 //! Generalises the `TlsSlot` + `ServerConfigCache` primitive that
-//! `cosmix-maild/src/tls.rs` introduced for its dual-bind listeners.
+//! `maild/src/tls.rs` introduced for its dual-bind listeners.
 //! webd is the second citizen (per-interface scoped SNI), so the
 //! core-and-citizen pattern says to extract it here; maild migrates
 //! onto this in a later phase.

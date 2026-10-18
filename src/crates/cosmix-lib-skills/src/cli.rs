@@ -227,7 +227,7 @@ enum Command {
         /// Workspace root (must be a git repo). Default: current directory.
         #[arg(long, default_value = ".")]
         path: String,
-        /// Only index files matching this substring (e.g. "cosmix-maild" for incremental).
+        /// Only index files matching this substring (e.g. "maild" for incremental).
         #[arg(long)]
         filter: Option<String>,
     },
@@ -2725,7 +2725,7 @@ fn extract_doc_blocks(source: &str) -> Vec<DocBlock> {
 }
 
 /// Derive a crate name from a file path relative to workspace root.
-/// e.g. "src/crates/cosmix-maild/src/smtp/mod.rs" → "cosmix-maild"
+/// e.g. "src/crates/maild/src/smtp/mod.rs" → "maild"
 fn crate_name_from_path(rel_path: &str) -> Option<String> {
     // Pattern: src/crates/<crate-name>/...
     let parts: Vec<&str> = rel_path.split('/').collect();

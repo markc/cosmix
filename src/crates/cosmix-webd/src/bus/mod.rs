@@ -49,7 +49,7 @@ use crate::NodeState;
 /// `rc=10` is the caller-error sentinel: `NodedClient::call` only
 /// surfaces `rc >= 10` as an error, so a smaller rc would let a
 /// typo'd / write-shaped action return `Ok(...)` and mask the failure
-/// at the caller. Same value + rationale as `cosmix-maild` and
+/// at the caller. Same value + rationale as `maild` and
 /// `cosmix-dnsd` so the mesh-wide wire contract stays uniform.
 const RC_CALLER_ERROR: u8 = 10;
 

@@ -1,9 +1,9 @@
-# cosmix-maild command line
+# maild command line
 
 ## Synopsis
 
 ```text
-cosmix-maild [--config PATH] <command>
+maild [--config PATH] <command>
 ```
 
 `--version` prints the crate version, source revision, and build time.
@@ -45,10 +45,10 @@ If no password argument is supplied, `account add` prompts without echo and asks
 Example:
 
 ```text
-cosmix-maild account add admin@example.com --name "Example Administrator"
-cosmix-maild account passwd admin@example.com
-cosmix-maild account lock admin@example.com
-cosmix-maild account unlock admin@example.com
+maild account add admin@example.com --name "Example Administrator"
+maild account passwd admin@example.com
+maild account lock admin@example.com
+maild account unlock admin@example.com
 ```
 
 ### Per-account rule overrides
@@ -83,10 +83,10 @@ Without `--merge`, omitted fields return to schema defaults. With `--merge`, uns
 `VALUE` is parsed as JSON first and falls back to a plain string. This permits booleans, `null`, arrays, and unquoted string arguments.
 
 ```text
-cosmix-maild domain add example.com
-cosmix-maild domain set example.com enabled true
-cosmix-maild domain set example.com mx_targets '["mx.example.com"]'
-cosmix-maild domain show example.com
+maild domain add example.com
+maild domain set example.com enabled true
+maild domain set example.com mx_targets '["mx.example.com"]'
+maild domain show example.com
 ```
 
 ### Aliases
@@ -100,7 +100,7 @@ cosmix-maild domain show example.com
 The target must be a real local account and cannot itself be an alias. Account and alias addresses are canonicalised before the Bus call.
 
 ```text
-cosmix-maild alias add info@example.com admin@example.com
+maild alias add info@example.com admin@example.com
 ```
 
 ### TLS and DKIM

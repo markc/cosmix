@@ -14,7 +14,7 @@
 //! version, nseq, lifecycle, and SoftDelete tombstone — in
 //! `__props_records`. Value bytes live wherever the
 //! [`SqliteTableMapping`] puts them: the daemon-supplied implementation
-//! (e.g. cosmix-maild's `accounts` table) round-trips between
+//! (e.g. maild's `accounts` table) round-trips between
 //! domain-shaped columns and the property [`PropValue`]; the
 //! library-provided [`JsonValuesMapping`] stores the value as JSON in
 //! a substrate-managed `__props_values` table for namespaces that have

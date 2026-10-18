@@ -65,7 +65,7 @@ tracing-subscriber = { workspace = true }
 # cosmix-ecosystem deps — OPTIONAL, pulled only by the `cosmix` feature
 # (the P1/P2 seam). `--no-default-features` excludes all three, keeping
 # the standalone P1 server dependency-identical. Dep-table keys + alias
-# style mirror `cosmix-maild`'s Cargo.toml (cosmix_config/_bus/_client).
+# style mirror `maild`'s Cargo.toml (cosmix_config/_bus/_client).
 cosmix_config = { package = "cosmix-lib-config", path = "../cosmix-lib-config", features = ["client-helpers"], optional = true }
 cosmix_bus = { package = "cosmix-lib-bus", path = "../cosmix-lib-bus", optional = true }
 cosmix_client = { package = "cosmix-lib-client", path = "../cosmix-lib-client", features = ["native"], optional = true }

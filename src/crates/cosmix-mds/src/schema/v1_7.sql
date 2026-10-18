@@ -4,7 +4,7 @@
 --
 -- Adds an RFC 5256 §2.1 "base subject" column to mail_envelopes plus
 -- an index keyed on it. New emails populate normalized_subject at
--- envelope-INSERT time (cosmix-maild MailStore); the threading
+-- envelope-INSERT time (maild MailStore); the threading
 -- resolver consults the index after In-Reply-To / References miss so
 -- "Re: Hello" can be clustered with an earlier "Hello" even when the
 -- reply omits References headers (a common Outlook / mobile-MUA
@@ -20,7 +20,7 @@
 -- could backfill historical rows if needed; that is out of scope for
 -- gate 4.
 --
--- Normalization rules (cosmix-maild::mailstore::subject) match RFC
+-- Normalization rules (maild::mailstore::subject) match RFC
 -- 5256 §2.1 verbatim — collapse whitespace, recursively strip
 -- subj-leader (blob* refwd ws*), strip subj-trailer (WSP / "(fwd)"),
 -- strip [fwd: ... ] wrapper, lowercase. The schema does NOT pin the
@@ -35,7 +35,7 @@ ALTER TABLE mail_envelopes ADD COLUMN normalized_subject TEXT NOT NULL DEFAULT '
 -- Composite index covers BOTH the WHERE filter
 -- (normalized_subject = ?) AND the
 -- `ORDER BY date_ts DESC, message_id DESC, item_id DESC LIMIT 1`
--- tail used by the cosmix-maild threading fallback (Phase 8e gate 4 /
+-- tail used by the maild threading fallback (Phase 8e gate 4 /
 -- JMAP §4.1.5). With this composite, SQLite can serve the lookup as
 -- a reverse-range walk of the index and skip the TEMP B-TREE sort
 -- it would otherwise need to resort matching rows before LIMIT 1.
@@ -44,7 +44,7 @@ ALTER TABLE mail_envelopes ADD COLUMN normalized_subject TEXT NOT NULL DEFAULT '
 -- per-set PRIMARY KEY of `mail_envelopes`, so it is always present
 -- and unique.
 --
--- Planner-guarantee scope: the cosmix-maild MailStore provisions
+-- Planner-guarantee scope: the maild MailStore provisions
 -- one MDS set per account (see `mailstore::setid`), so in this
 -- workspace the JOIN's `mt.account_id = ?1` filter is semantically
 -- satisfied by every row in `mail_threads` for the open set. SQLite

@@ -349,7 +349,7 @@ mod publisher {
     /// Spawn the long-lived publisher task. Drains the
     /// [`MdsEvent`] broadcast channel and forwards each event as a
     /// `topic.publish` RPC against the broker. The wire shape mirrors
-    /// `cosmix-maild::bus::verdict`:
+    /// `maild::bus::verdict`:
     ///
     /// - inner [`BusMessage`] carries `command = <topic>` so
     ///   subscribers can route with `on <topic> do …`.

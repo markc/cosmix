@@ -19,7 +19,7 @@ push_certs_sync: {
         {source: "plain", dest_dir: "/etc/ssl/example.net", key_group: "cosmix-tls", key_mode: "0640"}
       ],
       reload: [
-        {unit: "cosmix-maild", action: "restart"},
+        {unit: "maild", action: "restart"},
         {unit: "cosmix-webd", action: "restart"},
         {unit: "nginx", action: "reload"}
       ]

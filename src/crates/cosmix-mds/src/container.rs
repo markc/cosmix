@@ -15,7 +15,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::path::Path;
 
 /// Reserved name for the per-account upload-staging container in
-/// cosmix-maild (Phase 8d). MDS itself does not interpret this name —
+/// maild (Phase 8d). MDS itself does not interpret this name —
 /// reservation is documented here so a future caller cannot
 /// accidentally collide it via normal mailbox creation. The leading +
 /// trailing underscores are deliberately not legal in IMAP/JMAP
@@ -1292,7 +1292,7 @@ pub fn changes_since_set(
 /// Return every item id in the set whose `blob_hash` equals `target`.
 ///
 /// Used by the JMAP `Email/import` idempotency check (RFC 8621 §4.6
-/// SHOULD; the cosmix-maild migration plan §3.5b promotes it to MUST):
+/// SHOULD; the maild migration plan §3.5b promotes it to MUST):
 /// re-importing the same blob into the same mailbox MUST return the
 /// existing email id, not allocate a new one. The caller is
 /// responsible for filtering by membership-set match — this primitive

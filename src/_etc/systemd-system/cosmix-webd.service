@@ -69,7 +69,7 @@ Environment=HOME=%S/cosmix/webd
 # %S/cosmix/webd/.config/cosmix/node.conf.mix and misses the canonical
 # /etc/cosmix/node.conf.mix. Pin COSMIX_NODE_CONFIG so listen / TLS paths /
 # JMAP upstream / noded URL all derive from the right per-host config.
-# Mirrors the cosmix-noded.service and cosmix-maild.service fix for
+# Mirrors the cosmix-noded.service and maild.service fix for
 # the same root cause (different helper name, same hardcoded-fallback
 # class).
 Environment=COSMIX_NODE_CONFIG=%E/cosmix/node.conf.mix

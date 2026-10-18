@@ -3,7 +3,7 @@
 //! webd serves the **MX target** of the requested domain as the
 //! IMAPS/SMTPS `<hostname>` (the NS 3.0 model — see
 //! `_doc/planned/maild-autoconfig.md` §Decision). Two deliberate
-//! divergences from `cosmix-maild`'s delivery resolver
+//! divergences from `maild`'s delivery resolver
 //! (`smtp/delivery.rs::resolve_mx`), driven by the autoconfig
 //! §Security bar:
 //!
@@ -32,7 +32,7 @@
 //! the handshake) — exactly the operator-policy assertion. A
 //! mis-published inbound-only MX therefore fails the probe and is
 //! served as `503`, never as a config that would silently fail in the
-//! client. Unlike `cosmix-maild`'s delivery resolver, the probe **never
+//! client. Unlike `maild`'s delivery resolver, the probe **never
 //! falls back to a placeholder `ServerName`**: for a verification probe
 //! an unparseable name must fail closed, not validate some other host.
 //!
@@ -128,7 +128,7 @@ pub struct MxResolver {
 
 impl MxResolver {
     /// Build a system-config (`/etc/resolv.conf`) backed resolver.
-    /// Mirrors `cosmix-maild` delivery worker construction so both
+    /// Mirrors `maild` delivery worker construction so both
     /// crates use the identical hickory builder path.
     pub fn new() -> anyhow::Result<Self> {
         let resolver = Resolver::builder_tokio()
@@ -290,7 +290,7 @@ impl MxResolver {
 }
 
 /// Build the shared rustls client config: webpki trust roots, no client
-/// auth. Mirrors `cosmix-maild`'s delivery TLS builder path verbatim so
+/// auth. Mirrors `maild`'s delivery TLS builder path verbatim so
 /// the workspace keeps a single rustls/webpki-roots configuration.
 fn build_client_config() -> Arc<rustls::ClientConfig> {
     let mut root_store = rustls::RootCertStore::empty();

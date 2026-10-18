@@ -1,6 +1,6 @@
 #!/usr/bin/env mix
 -- deploy_spamlite.mix — build and install the external spamlite engine on
--- hub-configured mail nodes, then carry engine changes into cosmix-maild.
+-- hub-configured mail nodes, then carry engine changes into maild.
 --
 --   mix _bin/deploy_spamlite.mix deploy [--allow-downgrade]
 --        [--accept-parity SHA] [--skip-maild] [node...]
@@ -288,7 +288,7 @@ fn carry_maild($lag)
 
   $dirty = git_must($COSMIX, [
     "status", "--porcelain", "--",
-    "src/crates/cosmix-maild-bayesian", "src/crates/cosmix-maild", "src/Cargo.lock"
+    "src/crates/maild-bayesian", "src/crates/maild", "src/Cargo.lock"
   ], "monorepo status")
   $d.die_if($dirty != "",
     "maild crates are not clean — commit or stash first:\n" .. $dirty)
@@ -299,13 +299,13 @@ fn carry_maild($lag)
   set_toml_version($BAYES_TOML, $bayes_version)
   set_toml_version($MAILD_TOML, $maild_version)
   print("[maild] pin -> " .. substr($head, 0, 12) ..
-    "  cosmix-maild-bayesian " .. $bayes_version .. "  cosmix-maild " .. $maild_version)
+    "  maild-bayesian " .. $bayes_version .. "  maild " .. $maild_version)
 
   cargo_must(["fetch"], $COSMIX_SRC,
     "cargo fetch — pin and version bumps remain uncommitted")
-  print("[maild] cargo test -p cosmix-maild-bayesian -p cosmix-maild")
+  print("[maild] cargo test -p maild-bayesian -p maild")
   $tests = run_argv([
-    "cargo", "test", "-p", "cosmix-maild-bayesian", "-p", "cosmix-maild"
+    "cargo", "test", "-p", "maild-bayesian", "-p", "maild"
   ], {cwd: $COSMIX_SRC, timeout: 1800, max_output: 4000000})
   if $tests["exit_code"] != 0 then
     print("  RED: maild tests failed on the new engine (exit " .. $tests["exit_code"] .. ").")
@@ -316,7 +316,7 @@ fn carry_maild($lag)
     exit(1)
   end
   cargo_must([
-    "clippy", "-p", "cosmix-maild-bayesian", "-p", "cosmix-maild",
+    "clippy", "-p", "maild-bayesian", "-p", "maild",
     "--all-targets", "--", "-D", "warnings"
   ], $COSMIX_SRC, "clippy on the new engine — changes remain uncommitted")
 
@@ -331,13 +331,13 @@ fn carry_maild($lag)
   $body = $body .. "\nGoldens byte-identical; cargo test and clippy passed on the new engine."
   git_must($COSMIX, [
     "add", "--", "src/Cargo.lock",
-    "src/crates/cosmix-maild-bayesian/Cargo.toml",
-    "src/crates/cosmix-maild/Cargo.toml"
+    "src/crates/maild-bayesian/Cargo.toml",
+    "src/crates/maild/Cargo.toml"
   ], "add maild carry")
   git_must($COSMIX, ["commit", "-q", "-m", $subject, "-m", $body], "commit maild carry")
   print("[maild] committed: " .. $subject)
-  print("[maild] cargo build --release -p cosmix-maild")
-  cargo_must(["build", "--release", "-p", "cosmix-maild"], $COSMIX_SRC,
+  print("[maild] cargo build --release -p maild")
+  cargo_must(["build", "--release", "-p", "maild"], $COSMIX_SRC,
     "maild release build — commit remains local and unpushed")
   git_must($COSMIX, ["push", "-q", "origin", "HEAD:main"], "push maild carry")
   print("[maild] pushed")
@@ -391,8 +391,8 @@ $COSMIX = $d.cosmix_root()
 $COSMIX_SRC = $COSMIX .. "/src"
 $PARITY = $d.hub_root() .. "/_bin/mail/spamlite-parity.mix"
 $MAILD_DEPLOY = $d.hub_root() .. "/_bin/deploy_maild.mix"
-$BAYES_TOML = $COSMIX_SRC .. "/crates/cosmix-maild-bayesian/Cargo.toml"
-$MAILD_TOML = $COSMIX_SRC .. "/crates/cosmix-maild/Cargo.toml"
+$BAYES_TOML = $COSMIX_SRC .. "/crates/maild-bayesian/Cargo.toml"
+$MAILD_TOML = $COSMIX_SRC .. "/crates/maild/Cargo.toml"
 $REMOTE_BIN = "/usr/local/bin/spamlite"
 $REMOTE_RECONCILE = "/usr/local/bin/spamlite-reconcile.mix"
 $ENGINE_PATHS = ["src/lib.rs", "src/tokenizer.rs", "src/scoring.rs", "src/storage.rs"]

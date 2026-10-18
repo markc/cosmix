@@ -118,7 +118,7 @@ pub const SNAPSHOT_MAX_RESPONSE_BYTES: usize = 1_048_576;
 const RC_OK: u8 = 0;
 /// rc=10 caller-error sentinel; matches `NodedClient::call`'s
 /// `rc >= 10 → Err` convention used by every other `maild.*` dispatch
-/// helper in the tree (see `cosmix-maild/src/bus/mod.rs:64`).
+/// helper in the tree (see `maild/src/bus/mod.rs:64`).
 const RC_ERR: u8 = 10;
 
 /// Capabilities the caller holds for `<svc>.stats.snapshot`.

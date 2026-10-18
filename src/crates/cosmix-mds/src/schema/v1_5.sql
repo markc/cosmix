@@ -6,7 +6,7 @@
 -- entries from container_change_set / set_change; clients whose
 -- since-state is below the floor get a `cannotCalculateChanges`-style
 -- rejection from the mailstore read path (see
--- cosmix-maild::mailstore::mailbox_changes).
+-- maild::mailstore::mailbox_changes).
 --
 -- DEFAULT 0 is the "never pruned" state: floor=0 means no row has
 -- been deleted, so any non-negative since-state is still answerable.

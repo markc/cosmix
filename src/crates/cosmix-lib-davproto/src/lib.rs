@@ -1,4 +1,4 @@
-//! CalDAV/CardDAV protocol codecs — shared by the cosmix-maild DAV server
+//! CalDAV/CardDAV protocol codecs — shared by the maild DAV server
 //! and the future DAV client (`_plan/2026-06-09-maild-dav-server.md` §10.2).
 //!
 //! v1 scope:

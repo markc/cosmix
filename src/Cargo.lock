@@ -1691,127 +1691,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cosmix-maild"
-version = "0.10.1"
-dependencies = [
- "anyhow",
- "arc-swap",
- "async-stream",
- "async-trait",
- "axum",
- "base64 0.22.1",
- "bcrypt",
- "blake3",
- "chrono",
- "clap",
- "cosmix-lib-buildinfo",
- "cosmix-lib-bus",
- "cosmix-lib-client",
- "cosmix-lib-config",
- "cosmix-lib-daemon",
- "cosmix-lib-davproto",
- "cosmix-lib-log",
- "cosmix-lib-log-props",
- "cosmix-lib-mix",
- "cosmix-lib-props-store",
- "cosmix-maild-auth",
- "cosmix-maild-bayesian",
- "cosmix-maild-rules",
- "cosmix-mds",
- "directories",
- "hex",
- "hickory-resolver 0.25.2",
- "hmac",
- "hyper",
- "hyper-util",
- "libc",
- "mail-auth",
- "mail-builder",
- "mail-parser",
- "mail-send",
- "mimalloc",
- "quick-xml 0.37.5",
- "rand 0.8.7",
- "rcgen 0.13.2",
- "reqwest",
- "rpassword",
- "rusqlite",
- "rustls",
- "rustls-native-certs",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "smtp-proto",
- "tempfile",
- "tokio",
- "tokio-rustls",
- "tokio-stream",
- "tower-http",
- "tracing",
- "unicode-normalization",
- "uuid",
- "webpki-roots 0.26.11",
- "x509-parser",
-]
-
-[[package]]
-name = "cosmix-maild-auth"
-version = "0.2.0"
-dependencies = [
- "cosmix-lib-bus",
- "cosmix-lib-client",
- "mail-auth",
- "rustls-pki-types",
- "serde",
- "thiserror 2.0.20",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "cosmix-maild-bayesian"
-version = "0.7.1"
-dependencies = [
- "async-trait",
- "chrono",
- "cosmix-lib-buildinfo",
- "cosmix-lib-bus",
- "cosmix-lib-client",
- "cosmix-maild-rules",
- "rusqlite",
- "serde",
- "serde_json",
- "spamlite",
- "thiserror 2.0.20",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "cosmix-maild-rules"
-version = "0.3.1"
-dependencies = [
- "async-trait",
- "cosmix-lib-buildinfo",
- "cosmix-lib-bus",
- "cosmix-lib-client",
- "cosmix-lib-mix",
- "cosmix-maild-auth",
- "futures-util",
- "glob",
- "hickory-resolver 0.25.2",
- "linkify",
- "mail-parser",
- "regex",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "cosmix-mcp"
 version = "0.7.1"
 dependencies = [
@@ -4589,6 +4468,127 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "webpki-roots 1.0.9",
+]
+
+[[package]]
+name = "maild"
+version = "0.10.2"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "async-stream",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "bcrypt",
+ "blake3",
+ "chrono",
+ "clap",
+ "cosmix-lib-buildinfo",
+ "cosmix-lib-bus",
+ "cosmix-lib-client",
+ "cosmix-lib-config",
+ "cosmix-lib-daemon",
+ "cosmix-lib-davproto",
+ "cosmix-lib-log",
+ "cosmix-lib-log-props",
+ "cosmix-lib-mix",
+ "cosmix-lib-props-store",
+ "cosmix-mds",
+ "directories",
+ "hex",
+ "hickory-resolver 0.25.2",
+ "hmac",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "mail-auth",
+ "mail-builder",
+ "mail-parser",
+ "mail-send",
+ "maild-auth",
+ "maild-bayesian",
+ "maild-rules",
+ "mimalloc",
+ "quick-xml 0.37.5",
+ "rand 0.8.7",
+ "rcgen 0.13.2",
+ "reqwest",
+ "rpassword",
+ "rusqlite",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "smtp-proto",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tower-http",
+ "tracing",
+ "unicode-normalization",
+ "uuid",
+ "webpki-roots 0.26.11",
+ "x509-parser",
+]
+
+[[package]]
+name = "maild-auth"
+version = "0.2.1"
+dependencies = [
+ "cosmix-lib-bus",
+ "cosmix-lib-client",
+ "mail-auth",
+ "rustls-pki-types",
+ "serde",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "maild-bayesian"
+version = "0.7.2"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "cosmix-lib-buildinfo",
+ "cosmix-lib-bus",
+ "cosmix-lib-client",
+ "maild-rules",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "spamlite",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "maild-rules"
+version = "0.3.2"
+dependencies = [
+ "async-trait",
+ "cosmix-lib-buildinfo",
+ "cosmix-lib-bus",
+ "cosmix-lib-client",
+ "cosmix-lib-mix",
+ "futures-util",
+ "glob",
+ "hickory-resolver 0.25.2",
+ "linkify",
+ "mail-parser",
+ "maild-auth",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

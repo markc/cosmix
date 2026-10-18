@@ -588,7 +588,7 @@ impl SqliteCasMds {
     /// crate-internal mutations should still go through the existing
     /// `Mds` trait methods or the upcoming typed accessors; the raw
     /// handle exists for *cross-crate* sidecar writes
-    /// (e.g. `cosmix-maild`'s `MailStore` adapter) that need to
+    /// (e.g. `maild`'s `MailStore` adapter) that need to
     /// coordinate writes the `Mds` trait does not yet name.
     ///
     /// Lock discipline: acquires the per-set `Mutex` for the entire
@@ -645,7 +645,7 @@ impl SqliteCasMds {
 /// thing that proves cross-layer atomicity is reachable from outside
 /// the crate. Phase 8d.1 added typed methods (`ensure_container_by_name`,
 /// `add_staging_item`, `move_item`, `remove_membership`) for the
-/// load-bearing MDS operations cosmix-maild's `MailStore` needs;
+/// load-bearing MDS operations maild's `MailStore` needs;
 /// Phase 1 of the JMAP→MDS migration added `store_item_flags` for
 /// `MailStore::set_keywords`. Sidecar tables continue to use raw
 /// SQL through [`Self::tx`].

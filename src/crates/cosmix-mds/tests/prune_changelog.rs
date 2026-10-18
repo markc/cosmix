@@ -1,7 +1,7 @@
 //! MCS Phase 3 — `prune_changelog` + `changelog_floor` semantics.
 //!
 //! Pins the durable-retention contract relied on by
-//! `cosmix-maild::mailstore::mailbox_changes` stale-token rejection:
+//! `maild::mailstore::mailbox_changes` stale-token rejection:
 //!
 //! - Fresh DB: both floors are 0 (no prune has run).
 //! - keep_n >= row_count: no-op; floor unchanged.

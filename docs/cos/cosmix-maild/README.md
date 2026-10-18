@@ -1,10 +1,10 @@
-# cosmix-maild
+# maild
 
-`cosmix-maild` is the Cosmix mail, calendar, and contacts daemon. It serves JMAP, SMTP, IMAP, CalDAV, and CardDAV; owns account and mail-domain state; and exposes administration through a command-line interface and Bus. It belongs to the `cos` daemon layer in the `bus ← mix ← cos` dependency chain: it uses Bus client and wire libraries directly, and uses the Mix interpreter for strict-data configuration and inbound routing scripts.
+`maild` is the Cosmix mail, calendar, and contacts daemon. It serves JMAP, SMTP, IMAP, CalDAV, and CardDAV; owns account and mail-domain state; and exposes administration through a command-line interface and Bus. It belongs to the `cos` daemon layer in the `bus ← mix ← cos` dependency chain: it uses Bus client and wire libraries directly, and uses the Mix interpreter for strict-data configuration and inbound routing scripts.
 
 ## Package
 
-The Cargo package and binary are named `cosmix-maild`. The library import name is `cosmix_maild`.
+The Cargo package and binary are named `maild`. The library import name is `maild`.
 
 The crate has no crate-defined Cargo features.
 

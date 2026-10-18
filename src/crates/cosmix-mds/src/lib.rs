@@ -1,7 +1,7 @@
 //! `cosmix-mds` — metadata store.
 //!
 //! Per-container-set SQLite metadata + content-addressable blob CAS.
-//! Designed for `cosmix-maild` and any future consumer whose data
+//! Designed for `maild` and any future consumer whose data
 //! shape is *immutable content + multi-container mutable metadata +
 //! ordered access within a container + change log*.
 //!

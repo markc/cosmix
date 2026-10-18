@@ -28,7 +28,7 @@
 #     cosmix-noded form, not maild/webd's CAP_NET_BIND_SERVICE) —
 #     statecache binds no privileged port; it is a BUS client only.
 #   * After= ONLY against cosmix-noded.service — deliberately NO
-#     Requires=/BindsTo=/PartOf= (unlike cosmix-maild.service's
+#     Requires=/BindsTo=/PartOf= (unlike maild.service's
 #     Requires=). DO NOT "harmonize" this back to the maild shape: a
 #     stop/crash-without-restart of cosmix-noded under Requires= would
 #     deactivate statecache too, and the WS8 §3.3 assertion ("the

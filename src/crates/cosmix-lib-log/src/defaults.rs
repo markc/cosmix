@@ -28,11 +28,11 @@ pub enum RotationMode {
 #[derive(Debug, Clone)]
 pub struct LogDefaults {
     /// File-log prefix and journald `syslog_identifier`. Matches argv[0]
-    /// (e.g. `"cosmix-maild"`, `"cosmix-mcp"`).
+    /// (e.g. `"maild"`, `"cosmix-mcp"`).
     pub identity: String,
 
     /// Default EnvFilter target (the compiled crate name, with hyphens
-    /// replaced by underscores — e.g. `"cosmix_maild"`).
+    /// replaced by underscores — e.g. `"maild"`).
     pub default_target: String,
 
     /// The `<svc>` in `<svc>.props.*` for binaries that opt into the

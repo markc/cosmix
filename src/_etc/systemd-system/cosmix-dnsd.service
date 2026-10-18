@@ -58,7 +58,7 @@ EnvironmentFile=%E/cosmix/dnsd/service.env
 # RUST_LOG target is the COMPILED CRATE TARGET `cosmix_dnsd`
 # (underscore), NOT the `cosmix-dnsd` package name — an EnvFilter
 # directive keyed on the hyphenated package name silently matches
-# nothing. Mirrors cosmix-maild.service's `RUST_LOG=cosmix_maild=info`.
+# nothing. Mirrors maild.service's `RUST_LOG=maild=info`.
 Environment=RUST_LOG=cosmix_dnsd=info
 # Logging is journald-native (the cosmix_log core: journald-primary, with
 # structured PRIORITY + fields). Belt-and-suspenders: route any stray
@@ -95,7 +95,7 @@ RestartSec=5s
 # CAP_NET_BIND_SERVICE keeps the unit non-root while allowing the
 # privileged-port bind — the named-alternative form of §5.2's
 # CapabilityBoundingSet=/AmbientCapabilities= rule (same shape as
-# cosmix-maild's 25/465 and cosmix-webd's 443).
+# maild's 25/465 and cosmix-webd's 443).
 
 # §5.1 required (Level 1)
 NoNewPrivileges=yes

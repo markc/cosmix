@@ -1,5 +1,5 @@
 #!/usr/bin/env mix
--- maildir_import.mix — import one configured Maildir into cosmix-maild via
+-- maildir_import.mix — import one configured Maildir into maild via
 -- JMAP Email/import.
 --
 --   mix _bin/maildir_import.mix <job>

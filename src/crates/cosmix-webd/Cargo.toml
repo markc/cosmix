@@ -25,7 +25,7 @@ cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-bui
 cosmix_props = { package = "cosmix-lib-props-store", path = "../cosmix-lib-props-store" }
 # Embedded (trusted) Mix HTTP handlers — slice #3 of the maild/webd
 # trust-split ADR. Generalises maild's inbound-filter embed to HTTP.
-# Same path as cosmix-maild so the graph keeps a single cosmix-lib-mix
+# Same path as maild so the graph keeps a single cosmix-lib-mix
 # build (cargo unifies features across the workspace). `crypto`
 # (hash_sha256/blake3, uuid, random_password, base64) + `url`
 # (url_decode/encode) are needed by the CMS handlers
@@ -85,12 +85,12 @@ futures-util.workspace = true
 pulldown-cmark.workspace = true
 regex-lite = "0.1"
 # Mail-client autoconfig MX resolution. Same version/features as
-# cosmix-maild (the sibling crate that already does MX lookups) so the
+# maild (the sibling crate that already does MX lookups) so the
 # graph keeps a single hickory-resolver 0.25.x.
 hickory-resolver = { version = "0.25", features = ["tokio", "system-config"] }
 # Trust roots for the operator-policy implicit-TLS probe (verifies the
 # MX target terminates 993/465 with a valid cert). Same version as
-# cosmix-maild's delivery TLS path so the graph keeps one webpki-roots.
+# maild's delivery TLS path so the graph keeps one webpki-roots.
 webpki-roots = "0.26"
 # Timestamp arithmetic for the ACME provisioner's backoff scheduler
 # and `MetaV1` on-disk record. Same version as `cosmix-lib-daemon`

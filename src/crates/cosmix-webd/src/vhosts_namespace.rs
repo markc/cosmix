@@ -1305,7 +1305,7 @@ pub fn register_vhosts_namespace_with_listener_config(
 /// project the `PropsResponse` back to the `(rc, body)` shape the
 /// Bus loop needs.
 ///
-/// Mirrors `cosmix-maild/src/bus/mod.rs::dispatch_props` — `PeerIdentity`
+/// Mirrors `maild/src/bus/mod.rs::dispatch_props` — `PeerIdentity`
 /// carries the registered sender as `service_name`; Unix peer creds
 /// and WireGuard fields stay `None` (noded doesn't expose them today).
 pub async fn dispatch_props(

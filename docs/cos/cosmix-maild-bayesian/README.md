@@ -1,19 +1,19 @@
-# cosmix-maild-bayesian
+# maild-bayesian
 
-`cosmix-maild-bayesian` is the per-account Bayesian classification library used as the third stage of `cosmix-maild`'s inbound DATA filter pipeline, after `cosmix-maild-rules` returns `Continue`. It tokenises RFC 5322 messages, scores them with a Robinson-Fisher classifier, stores training state in SQLite, and returns a routing verdict. In the `bus <- mix <- cos` dependency chain it is a cos-layer crate: it has no direct Mix dependency, while its optional `cosmix` feature activates direct dependencies on Bus client libraries.
+`maild-bayesian` is the per-account Bayesian classification library used as the third stage of `maild`'s inbound DATA filter pipeline, after `maild-rules` returns `Continue`. It tokenises RFC 5322 messages, scores them with a Robinson-Fisher classifier, stores training state in SQLite, and returns a routing verdict. In the `bus <- mix <- cos` dependency chain it is a cos-layer crate: it has no direct Mix dependency, while its optional `cosmix` feature activates direct dependencies on Bus client libraries.
 
 ## Synopsis
 
-The Cargo package is `cosmix-maild-bayesian`. Rust code imports it as `cosmix_maild_bayesian`.
+The Cargo package is `maild-bayesian`. Rust code imports it as `maild_bayesian`.
 
 ```rust
 use std::sync::Arc;
 
-use cosmix_maild_bayesian::{
+use maild_bayesian::{
     Classifier, ClassifierConfig, ClassifyContext, DefaultClassifier,
     storage::SqliteBackend,
 };
-use cosmix_maild_rules::AccountId;
+use maild_rules::AccountId;
 
 let config = ClassifierConfig::default();
 let storage = Arc::new(SqliteBackend::new(
@@ -144,7 +144,7 @@ The current source has no `cfg(feature = ...)` sections. Enabling `cosmix` adds 
 
 | Dependency group | Crates |
 |---|---|
-| Mail pipeline | `cosmix-maild-rules` |
+| Mail pipeline | `maild-rules` |
 | Message parsing | `mail-parser`, `nanohtml2text` |
 | Storage and async | `rusqlite`, `tokio`, `async-trait` |
 | Data and errors | `serde`, `serde_json`, `thiserror`, `chrono` |
@@ -153,10 +153,10 @@ The current source has no `cfg(feature = ...)` sections. Enabling `cosmix` adds 
 
 ## Migration binary
 
-The package builds `cosmix-maild-bayesian-migrate`.
+The package builds `maild-bayesian-migrate`.
 
 ```text
-cosmix-maild-bayesian-migrate
+maild-bayesian-migrate
 ```
 
 The binary is currently a placeholder. It prints that the migration is not wired and exits with status `2`. It does not accept a usable migration command or modify a database.

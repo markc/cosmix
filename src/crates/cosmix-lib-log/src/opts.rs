@@ -64,7 +64,7 @@ pub struct LogOpts {
     #[arg(long, value_enum, global = true)]
     pub log_level: Option<LogLevel>,
 
-    /// EnvFilter directive string (e.g. `cosmix_maild=debug,cosmix_bus=warn`).
+    /// EnvFilter directive string (e.g. `maild=debug,cosmix_bus=warn`).
     /// Merged with `--log-level` at parse time per `_doc/planned/cosmix-lib-log.md` §2.
     #[arg(long, global = true)]
     pub log_filter: Option<String>,

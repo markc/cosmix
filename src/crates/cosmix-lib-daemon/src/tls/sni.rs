@@ -1,6 +1,6 @@
 //! SNI-routed TLS resolver shared across cosmix daemons.
 //!
-//! Originally landed in `cosmix-maild/src/tls.rs` for the maild
+//! Originally landed in `maild/src/tls.rs` for the maild
 //! dual-bind TLS plan (Phase 1, commits `aa67a61` / `2197c32`). Lifted
 //! to `cosmix-lib-daemon` in webd-vhosts Phase 1 commit 1 so webd and
 //! maild share one implementation rather than diverging copies — the

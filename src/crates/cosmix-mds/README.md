@@ -5,7 +5,7 @@ Per-container-set SQLite metadata + content-addressable blob store.
 The crate provides the `Mds` trait (the public surface), one
 production implementation `SqliteCasMds` (per-set `data.sqlite` +
 box-wide `blobs.sqlite` + flat CAS dir), and a feature-gated
-`MemMds` for tests. It is the storage substrate for `cosmix-maild`
+`MemMds` for tests. It is the storage substrate for `maild`
 and any future consumer with the same shape: immutable
 content + multi-container mutable metadata + ordered access
 within a container + change log.

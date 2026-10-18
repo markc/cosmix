@@ -184,7 +184,7 @@ Appendix A. As a summary:
 | UID/GID | POSIX name | ABP service | Role |
 |--------:|------------|-------------|------|
 | 500 | `cosmix-noded` | `noded` | Per-node ABP broker / mesh peer |
-| 501 | `cosmix-maild` | `maild` | Mail daemon |
+| 501 | `maild` | `maild` | Mail daemon |
 | 502 | `cosmix-webd` | `webd` | Web daemon |
 | 503 | `cosmix-indexd` | `indexd` | Knowledge / vector index daemon |
 | 504 | `cosmix-agentd` | `agentd` | Agent runtime |
@@ -611,7 +611,7 @@ ownership rules are:
   installer/boot ordering requirement, not a property of the
   tmpfiles fragment itself.
 - **TLS keypairs read by more than one daemon** (e.g. a host
-  certificate consumed by both `cosmix-maild` and `cosmix-webd`):
+  certificate consumed by both `maild` and `cosmix-webd`):
   `root:cosmix-tls 0640` for the private key. The `cosmix-tls`
   shared-credential group (§2.2) SHALL be the access mechanism;
   per-host POSIX ACLs (`setfacl u:cosmix-<d>:r …`) SHALL NOT be used
@@ -1346,7 +1346,7 @@ comment lines (§4.3) and SHALL NOT emit a `u` line.
 # --- Daemon-identity entries (POSIX user + same-numbered group) ---
 #Type Name              ID   GECOS                                Home           Shell
 u     cosmix-noded      500  "Cosmix node daemon (Bus broker)"    /nonexistent   /usr/sbin/nologin
-u     cosmix-maild      501  "Cosmix mail daemon"                 /nonexistent   /usr/sbin/nologin
+u     maild      501  "Cosmix mail daemon"                 /nonexistent   /usr/sbin/nologin
 u     cosmix-webd       502  "Cosmix web daemon"                  /nonexistent   /usr/sbin/nologin
 u     cosmix-indexd     503  "Cosmix knowledge daemon"            /nonexistent   /usr/sbin/nologin
 u     cosmix-agentd     504  "Cosmix agent runtime"               /nonexistent   /usr/sbin/nologin
@@ -1372,7 +1372,7 @@ u     cosmix-blobd      521  "Cosmix node blob store daemon"      /nonexistent  
 # consumers add their own `m cosmix-<d> cosmix-tls` line in this fragment
 # rather than via per-host setfacl.
 g     cosmix-tls     510
-m     cosmix-maild   cosmix-tls
+m     maild   cosmix-tls
 m     cosmix-webd    cosmix-tls
 # cosmix-mesh mediates read access to the signed mesh inventory (SPEC-13
 # INV-1) under /var/lib/cosmix/noded/, shared by mesh daemons, WITHOUT
@@ -1417,7 +1417,7 @@ Local installations MAY add directives, but SHALL NOT remove or
 weaken any directive shown here.
 
 ```ini
-# /usr/lib/systemd/system/cosmix-maild.service
+# /usr/lib/systemd/system/maild.service
 [Unit]
 Description=Cosmix mail daemon
 Documentation=https://cosmix.dev/spec/10
@@ -1427,8 +1427,8 @@ Requires=cosmix-noded.service
 
 [Service]
 Type=notify
-User=cosmix-maild
-Group=cosmix-maild
+User=maild
+Group=maild
 StateDirectory=cosmix/maild
 StateDirectoryMode=0750
 RuntimeDirectory=cosmix/maild
@@ -1441,9 +1441,9 @@ WorkingDirectory=%S/cosmix/maild
 # leaf defined in §3.1. The daemon reads from this path. This example
 # is the non-secret case (root:root 0755 dir, root:root 0644 file) —
 # see §3.3. For a secret-config variant the dir is created in advance
-# by the package or a tmpfiles fragment as root:cosmix-maild 0750, and
+# by the package or a tmpfiles fragment as root:maild 0750, and
 # ConfigurationDirectoryMode= is set to 0750 to match.
-ExecStart=/opt/cosmix/bin/cosmix-maild --config %E/cosmix/maild/config.toml
+ExecStart=/opt/cosmix/bin/maild --config %E/cosmix/maild/config.toml
 Restart=on-failure
 RestartSec=5s
 
@@ -1485,7 +1485,7 @@ Notes:
 - `User=` and `Group=` match the canonical registry entry for UID
   501 (Appendix A); CI lint L8 (§8.2) verifies this.
 - `StateDirectory=cosmix/maild` causes systemd to create
-  `/var/lib/cosmix/maild/` owned `cosmix-maild:cosmix-maild` mode
+  `/var/lib/cosmix/maild/` owned `maild:maild` mode
   `0750` before the daemon starts, satisfying §3.4.
 - `ConfigurationDirectory=cosmix/maild` materialises
   `/etc/cosmix/maild/` (§3.1) and exposes it as `%E/cosmix/maild`.
@@ -1496,7 +1496,7 @@ Notes:
   ordering invariant: the local ABP broker is up before any mesh
   citizen starts.
 - `CapabilityBoundingSet=` and `AmbientCapabilities=` are emptied;
-  bind-to-port-25 daemons (e.g. `cosmix-maild` SMTP inbound) SHOULD
+  bind-to-port-25 daemons (e.g. `maild` SMTP inbound) SHOULD
   prefer `AmbientCapabilities=CAP_NET_BIND_SERVICE` over running as
   root, and SHALL document the deviation in an in-line comment per
   §5.2.
@@ -1533,7 +1533,7 @@ semantics (§6.5) and emits diagnostics matching §6.3.
 # Appendix A; do not lift this array as a current verification list.
 
 DAEMON_IDENTITY = [
-  (500, "cosmix-noded"),      (501, "cosmix-maild"),    (502, "cosmix-webd"),
+  (500, "cosmix-noded"),      (501, "maild"),    (502, "cosmix-webd"),
   (503, "cosmix-indexd"),     (504, "cosmix-agentd"),   (505, "cosmix-mcp"),
   (506, "cosmix-dnsd"),       (507, "cosmix-cron"),     (508, "cosmix-prometheus"),
   (509, "cosmix-grafana"),    (511, "cosmix-loki"),     (512, "cosmix-alloy"),
@@ -1545,7 +1545,7 @@ DAEMON_IDENTITY = [
 
 SHARED_GROUPS = [
   # (gid, name, members)
-  (510, "cosmix-tls", ["cosmix-maild", "cosmix-webd"]),
+  (510, "cosmix-tls", ["maild", "cosmix-webd"]),
   (516, "cosmix-mesh", ["cosmix-wgd"]),
 ]
 
@@ -1714,7 +1714,7 @@ Notes on the ABP-emit branch:
 uid  name              bus     gecos                                  tier         tombstoned
 ---  ----------------  ------  -------------------------------------  -----------  ----------
 500  cosmix-noded      -       "Cosmix node daemon (Bus broker)"      substrate    -
-501  cosmix-maild      -       "Cosmix mail daemon"                   application  -
+501  maild      -       "Cosmix mail daemon"                   application  -
 502  cosmix-webd       -       "Cosmix web daemon"                    application  -
 503  cosmix-indexd     -       "Cosmix knowledge daemon"              substrate    -
 504  cosmix-agentd     -       "Cosmix agent runtime"                 substrate    -

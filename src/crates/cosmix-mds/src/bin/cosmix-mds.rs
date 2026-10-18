@@ -96,7 +96,7 @@ pub enum Command {
     /// advancing the durable retention floor. Clients whose
     /// `sinceState` references a pruned seq get the JMAP
     /// `cannotCalculateChanges` rejection from
-    /// `cosmix-maild::mailstore::mailbox_changes`.
+    /// `maild::mailstore::mailbox_changes`.
     ///
     /// MCS Phase 3 (2026-05-14). See
     /// `_doc/planned/mailbox-changes-substrate.md`.

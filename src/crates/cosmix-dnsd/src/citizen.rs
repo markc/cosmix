@@ -3,7 +3,7 @@
 //! ## What this module is (and is NOT)
 //!
 //! `cosmix-dnsd` takes a **SPEC-10 daemon identity** (UID/GID 506, Bus
-//! service `dnsd`) exactly like `cosmix-maild`/`-webd`/`-noded`. Per
+//! service `dnsd`) exactly like `maild`/`-webd`/`-noded`. Per
 //! that pattern, identity is *enforced* by three registry-generic
 //! mechanisms, none of which is bespoke Rust code in the daemon:
 //!
@@ -19,7 +19,7 @@
 //! This module adds ONLY a **legibility surface** on top of that: a
 //! structured startup log stating the registered identity, plus an
 //! **advisory** effective-uid/gid self-report. It deliberately does
-//! NOT refuse to start on mismatch — `cosmix-maild`/`-webd` have no
+//! NOT refuse to start on mismatch — `maild`/`-webd` have no
 //! in-process identity gate either; the systemd `User=` is the
 //! enforcement point, and adding a stricter refuse-to-start check here
 //! than the established daemons have would invent a new pattern the

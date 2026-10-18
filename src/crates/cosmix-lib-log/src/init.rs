@@ -432,7 +432,7 @@ fn install_stats_recorder(
 /// synthesised from `default_target=<level>,cosmix_bus=info`.
 /// `--log-filter` always layers on top via comma-append; EnvFilter
 /// applies later directives last, so a `--log-filter
-/// cosmix_maild::scoring=debug` over `cosmix_maild=info,cosmix_bus=info`
+/// maild::scoring=debug` over `maild=info,cosmix_bus=info`
 /// yields per-module debug without dropping the base.
 fn build_env_filter(
     opts: &LogOpts,

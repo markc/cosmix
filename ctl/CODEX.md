@@ -244,7 +244,7 @@ Core protocol and substrate libraries:
   into the `inventory.signed` trust root via the genesis Ed25519 key
   (operator secrets DB), sharing the canonicaliser with
   `cosmix-lib-mesh-trust` and `cosmix-noded`.
-- `cosmix-lib-davproto` — CalDAV/CardDAV codecs shared by the `cosmix-maild`
+- `cosmix-lib-davproto` — CalDAV/CardDAV codecs shared by the `maild`
   DAV server face and the future DAV client: JSCalendar↔iCalendar (RFC 8984/
   5545) + JSContact↔vCard 4.0 (RFC 9553/6350) emit + parse, strong
   content-hash ETags. Pure (no ABP/mesh/config). Plan retired 2026-07-23
@@ -274,9 +274,9 @@ Scripting and agent-facing libraries:
 Services:
 - `cosmix-noded` — consolidated node daemon: hub, config, monitor, and
   logger. Most local services communicate through it.
-- `cosmix-maild` — JMAP, SMTP, and CalDAV/CardDAV mail daemon (the DAV face
+- `maild` — JMAP, SMTP, and CalDAV/CardDAV mail daemon (the DAV face
   `src/dav/` rides the same axum server + auth, over `cosmix-lib-davproto`).
-- `cosmix-maild-auth`, `cosmix-maild-rules`, `cosmix-maild-bayesian` — inbound
+- `maild-auth`, `maild-rules`, `maild-bayesian` — inbound
   mail authentication, deterministic rules, and Bayesian filtering.
 - `cosmix-indexd` — semantic indexing and vector storage.
 - `cosmix-mds` — metadata store and content-addressable blob storage.

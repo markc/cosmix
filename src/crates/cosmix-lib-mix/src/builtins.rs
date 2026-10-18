@@ -26321,12 +26321,12 @@ use sqlite_builtins::{builtin_sqlclose, builtin_sqlexec, builtin_sqlopen};
 // map ready to write to disk + paste into a DNS TXT record:
 //   {algorithm, private_pem, public_b64, dns_txt_record}
 //
-// Uses `mail-auth` directly rather than `cosmix-maild-auth::keygen`
-// to avoid a cargo dep cycle (cosmix-maild-auth ↔ cosmix-lib-mix via
+// Uses `mail-auth` directly rather than `maild-auth::keygen`
+// to avoid a cargo dep cycle (maild-auth ↔ cosmix-lib-mix via
 // optional cosmix-lib-client → cosmix-lib-config → cosmix-lib-mix
 // edges; cargo's cycle check is feature-blind across optional deps).
 // The PEM envelope + DNS record shape is intentionally identical to
-// `cosmix-maild-auth::keygen` so files generated here load straight
+// `maild-auth::keygen` so files generated here load straight
 // into `MailAuthSigner` via `PrivateKeyDer::from_pem_slice`.
 
 #[cfg(feature = "dkim")]
@@ -26349,7 +26349,7 @@ fn builtin_dkim_keygen(args: Vec<Value>) -> MixResult<Option<Value>> {
         "rsa" => {
             // Default 2048; second arg overrides. Cap at 4096 to keep
             // a single keygen well under a second; refuse < 1024 to
-            // match cosmix-maild-auth::keygen's floor (anything weaker
+            // match maild-auth::keygen's floor (anything weaker
             // is rejected by modern receivers anyway).
             let bits = if args.len() >= 2 {
                 let n =
@@ -26435,7 +26435,7 @@ fn builtin_dkim_keygen(args: Vec<Value>) -> MixResult<Option<Value>> {
 /// Wrap DER bytes in a 64-char-wrapped PEM envelope matching OpenSSL's
 /// output. `label` is the `-----BEGIN <label>-----` content (e.g.
 /// `"RSA PRIVATE KEY"` for PKCS1, `"PRIVATE KEY"` for PKCS8). Must
-/// stay byte-identical to `cosmix-maild-auth::keygen::pem_encode` so
+/// stay byte-identical to `maild-auth::keygen::pem_encode` so
 /// files produced here re-load via the same PEM decoder path.
 #[cfg(feature = "dkim")]
 fn dkim_pem_encode(label: &str, der: &[u8]) -> String {

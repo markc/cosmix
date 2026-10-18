@@ -1,7 +1,7 @@
-# cosmix-maild-rules
+# maild-rules
 
-`cosmix-maild-rules` is the deterministic second stage of the inbound
-`cosmix-maild` DATA filtering pipeline. It consumes the authentication result,
+`maild-rules` is the deterministic second stage of the inbound
+`maild` DATA filtering pipeline. It consumes the authentication result,
 message, SMTP envelope, peer address, account identity, and account overrides,
 then returns a rule verdict for delivery or Bayesian classification. In the
 `bus <- mix <- cos` dependency chain it belongs to `cos`: it uses Mix to parse
@@ -13,15 +13,15 @@ when built for the wider Cosmix daemon family.
 The pipeline order is:
 
 ```text
-cosmix-maild-auth -> cosmix-maild-rules -> cosmix-maild-bayesian
+maild-auth -> maild-rules -> maild-bayesian
 ```
 
 Authentication establishes RFC-derived facts. This crate applies deterministic
 policy and content rules. Ambiguous messages continue to the Bayesian stage
 with their score and matched rule identifiers as contextual features.
 
-The library crate is named `cosmix_maild_rules`. The package also builds the
-`cosmix-maild-rules-smoke` diagnostic binary.
+The library crate is named `maild_rules`. The package also builds the
+`maild-rules-smoke` diagnostic binary.
 
 ## Verdicts
 
@@ -71,7 +71,7 @@ Configured negative rule weights contribute `0`.
 
 `RuleContext` borrows all classify-time data. It carries `peer_ip`,
 `envelope_from`, `envelope_to`, raw RFC 5322 message bytes, the
-`cosmix-maild-auth` `VerifyResult`, an `AccountId`, and `AccountOverrides`.
+`maild-auth` `VerifyResult`, an `AccountId`, and `AccountOverrides`.
 
 `AccountOverrides` supports disabled rule identifiers, a threshold override,
 and sender allowlist and blocklist globs. Literal addresses and `*` or `?`
@@ -155,12 +155,12 @@ The default feature set is `core`.
 
 ## Smoke program
 
-`cosmix-maild-rules-smoke` reads one RFC 5322 message from standard input,
+`maild-rules-smoke` reads one RFC 5322 message from standard input,
 loads the bundled default pack, uses a synthetic successful authentication
 result, and prints the debug verdict and explanation.
 
 ```text
-cosmix-maild-rules-smoke < message.eml
+maild-rules-smoke < message.eml
 ```
 
 If the default pack cannot be found beside the crate source, the program uses

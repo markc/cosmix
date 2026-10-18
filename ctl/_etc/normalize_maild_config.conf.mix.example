@@ -4,6 +4,6 @@
 {
   normalize_maild_config: {
     schema_version: 1,
-    default_input_path: "/home/user/cosmix-maild/config.conf.mix"
+    default_input_path: "/home/user/maild/config.conf.mix"
   }
 }

@@ -1,0 +1,11 @@
+//! Phase 0 placeholder for the migration tool. The full tool, which
+//! converts a spamlite v0.4.1 database into the maild-bayesian
+//! v2 schema (adding `model_version` + `seeded_from` columns), lands
+//! in Phase 5.
+
+fn main() {
+    // --version/-V: answer and exit 0 before any other side effect.
+    cosmix_buildinfo::exit_on_version!();
+    eprintln!("maild-bayesian-migrate is a Phase 0 stub; Phase 5 wires the real migration.");
+    std::process::exit(2);
+}

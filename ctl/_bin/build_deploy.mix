@@ -68,7 +68,7 @@ $COMPONENTS = [
     script: "deploy_mix.mix", stage: ""},
   {name: "noded", binary: "cosmix-noded", installed: "/opt/cosmix/bin/cosmix-noded",
     script: "deploy_noded.mix", stage: "all"},
-  {name: "maild", binary: "cosmix-maild", installed: "/opt/cosmix/bin/cosmix-maild",
+  {name: "maild", binary: "maild", installed: "/opt/cosmix/bin/maild",
     script: "deploy_maild.mix", stage: "deploy"},
   {name: "webd", binary: "cosmix-webd", installed: "/opt/cosmix/bin/cosmix-webd",
     script: "deploy_webd.mix", stage: ""},

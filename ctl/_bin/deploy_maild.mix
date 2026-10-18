@@ -1,5 +1,5 @@
 #!/usr/bin/env mix
--- deploy_maild.mix — install the freshly-built cosmix-maild binary and
+-- deploy_maild.mix — install the freshly-built maild binary and
 -- refreshed systemd unit on the hub-configured mail nodes.
 --
 --   mix _bin/deploy_maild.mix deploy
@@ -80,7 +80,7 @@ end
 
 fn deploy($host)
   print("")
-  print("[" .. $host .. "] deploy cosmix-maild")
+  print("[" .. $host .. "] deploy maild")
 
   $reach = ssh_mix($host, 'print("reach-ok")')
   $d.die_if(not $reach["ok"] or not contains($reach["stdout"], "reach-ok"),
@@ -89,10 +89,10 @@ fn deploy($host)
   -- Refuse a rollback before transferring anything. A present binary whose
   -- version cannot be read is also a failed pre-flight, not an absent install.
   $pre = ssh_mix($host, '
-if is_file("/opt/cosmix/bin/cosmix-maild") then
-  $v = trim(run("/opt/cosmix/bin/cosmix-maild --version"))
+if is_file("/opt/cosmix/bin/maild") then
+  $v = trim(run("/opt/cosmix/bin/maild --version"))
   if $v == "" then
-    eprint("installed cosmix-maild returned no version")
+    eprint("installed maild returned no version")
     exit(1)
   end
   print($v)
@@ -101,7 +101,7 @@ else
 end
 ')
   $d.die_if(not $pre["ok"],
-    $host .. " could not inspect installed cosmix-maild: " .. trim($pre["stderr"]))
+    $host .. " could not inspect installed maild: " .. trim($pre["stderr"]))
   if trim($pre["stdout"]) != "ABSENT" then
     $d.assert_not_downgrade($host, maild_semver($pre["stdout"]), $LOCAL_SEMVER, $ALLOW_DOWNGRADE)
   end
@@ -115,22 +115,22 @@ print("mkdir-ok")
   $d.die_if(not $mk["ok"] or not contains($mk["stdout"], "mkdir-ok"),
     $host .. " mkdir /opt/cosmix/bin failed: " .. trim($mk["stderr"]))
 
-  scp_to($host, $BIN, "/opt/cosmix/bin/cosmix-maild.new")
+  scp_to($host, $BIN, "/opt/cosmix/bin/maild.new")
   $inst = ssh_mix($host, '
-chown("/opt/cosmix/bin/cosmix-maild.new", 0, 0)
-chmod("/opt/cosmix/bin/cosmix-maild.new", 0o755)
-rename("/opt/cosmix/bin/cosmix-maild.new", "/opt/cosmix/bin/cosmix-maild")
-print(run("/opt/cosmix/bin/cosmix-maild --version"))
+chown("/opt/cosmix/bin/maild.new", 0, 0)
+chmod("/opt/cosmix/bin/maild.new", 0o755)
+rename("/opt/cosmix/bin/maild.new", "/opt/cosmix/bin/maild")
+print(run("/opt/cosmix/bin/maild --version"))
 ')
   $d.die_if(not $inst["ok"] or trim($inst["stdout"]) != $LOCAL_VERSION,
     $host .. " install/version mismatch (want " .. $LOCAL_VERSION .. "): " .. trim($inst["stdout"]) .. " " .. trim($inst["stderr"]))
   print("  bin: " .. trim($inst["stdout"]))
 
-  scp_to($host, $UNIT, "/usr/lib/systemd/system/cosmix-maild.service.new")
+  scp_to($host, $UNIT, "/usr/lib/systemd/system/maild.service.new")
   $unit_inst = ssh_mix($host, '
-chown("/usr/lib/systemd/system/cosmix-maild.service.new", 0, 0)
-chmod("/usr/lib/systemd/system/cosmix-maild.service.new", 0o644)
-rename("/usr/lib/systemd/system/cosmix-maild.service.new", "/usr/lib/systemd/system/cosmix-maild.service")
+chown("/usr/lib/systemd/system/maild.service.new", 0, 0)
+chmod("/usr/lib/systemd/system/maild.service.new", 0o644)
+rename("/usr/lib/systemd/system/maild.service.new", "/usr/lib/systemd/system/maild.service")
 print("UNIT_OK")
 ')
   $d.die_if(not $unit_inst["ok"] or not contains($unit_inst["stdout"], "UNIT_OK"),
@@ -138,18 +138,18 @@ print("UNIT_OK")
   print("  unit installed")
 
   $restart = ssh_mix($host,
-    'print(run("/usr/bin/systemctl daemon-reload && /usr/bin/systemctl restart cosmix-maild && /usr/bin/sleep 2 && /usr/bin/systemctl is-active cosmix-maild"))')
+    'print(run("/usr/bin/systemctl daemon-reload && /usr/bin/systemctl restart maild && /usr/bin/sleep 2 && /usr/bin/systemctl is-active maild"))')
   if not $restart["ok"] or trim($restart["stdout"]) != "active" then
     print("  ERROR restart failed; last 40 log lines:")
     $journal = ssh_mix($host,
-      'print(run("/usr/bin/journalctl -u cosmix-maild -n 40 --no-pager"))')
+      'print(run("/usr/bin/journalctl -u maild -n 40 --no-pager"))')
     print($journal["stdout"])
     print($journal["stderr"])
     exit(1)
   end
   print("  active: " .. trim($restart["stdout"]))
 
-  verify_logging($host, "cosmix-maild")
+  verify_logging($host, "maild")
 
   -- is-active cannot prove that the restarted daemon re-registered with its
   -- local broker. Query the broker registry for that separate liveness fact.
@@ -229,8 +229,8 @@ end
 $d.die_if(len($nodes) != len($requested),
   "maild target list contains a duplicate or a node absent from the fleet rollout order")
 
-$BIN = $d.cosmix_bin("cosmix-maild")
-$UNIT = $d.cosmix_root() .. "/src/_etc/systemd-system/cosmix-maild.service"
+$BIN = $d.cosmix_bin("maild")
+$UNIT = $d.cosmix_root() .. "/src/_etc/systemd-system/maild.service"
 $d.die_if(not is_file($BIN), "local binary missing (build it first): " .. $BIN)
 $d.die_if(not is_file($UNIT), "unit missing: " .. $UNIT)
 

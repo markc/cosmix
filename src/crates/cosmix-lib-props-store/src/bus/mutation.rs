@@ -1090,7 +1090,7 @@ fn project_record_summary(record: &Record, schema: &PropertySchema, with_secrets
 ///
 /// Per-namespace read-default is therefore the typed read helper's
 /// responsibility, not the substrate's. See
-/// `cosmix-maild/src/props/engine_config.rs::record_to_engine_config`
+/// `maild/src/props/engine_config.rs::record_to_engine_config`
 /// for the engine_config v0.2.0 amendment's reference implementation:
 /// the engine consumer fills `EngineConfig::default()` values for
 /// absent amendment fields, while the substrate's `props.get` returns

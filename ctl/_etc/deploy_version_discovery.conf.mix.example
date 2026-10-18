@@ -13,7 +13,7 @@
     -- `service` is the name each daemon registers with the local broker.
     client_daemons: [
       {binary: "cosmix-dnsd", unit: "cosmix-dnsd", service: "dnsd"},
-      {binary: "cosmix-maild", unit: "cosmix-maild", service: "maild"},
+      {binary: "maild", unit: "maild", service: "maild"},
       {binary: "cosmix-webd", unit: "cosmix-webd", service: "webd"}
     ]
   }

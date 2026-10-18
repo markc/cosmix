@@ -154,7 +154,7 @@ fn snapshot_bin($bin)
 end
 
 -- The FIRST dotted-numeric token of a --version line -> [major, minor, patch]:
--- "mix 0.61.1" and "cosmix-maild 0.8.1 (abc123, built 2026-08-30)" both work.
+-- "mix 0.61.1" and "maild 0.8.1 (abc123, built 2026-08-30)" both work.
 -- Daemons print build provenance after the version; the last token is not it.
 fn ver_tuple($s)
   $v = ""

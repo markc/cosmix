@@ -605,7 +605,7 @@ mod tests {
     fn validates_exact_cosmix_service_unit_grammar() {
         for valid in [
             "cosmix-noded.service",
-            "cosmix-maild@tenant.example.service",
+            "maild@tenant.example.service",
             "cosmix-web.d-1.service",
         ] {
             assert!(valid_unit_name(valid), "{valid}");

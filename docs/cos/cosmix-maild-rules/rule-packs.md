@@ -1,6 +1,6 @@
 # Rule packs
 
-`cosmix-maild-rules` loads deterministic rules from strict-data `.conf.mix`
+`maild-rules` loads deterministic rules from strict-data `.conf.mix`
 files. The bundled pack is available through `default_pack_str`; file-backed
 engines can atomically reload an operator-supplied pack.
 
@@ -176,7 +176,7 @@ The default engine thresholds are calibrated separately in `EngineConfig`.
 Callers can load the embedded text without locating a file:
 
 ```rust
-let pack = cosmix_maild_rules::default_pack_str();
+let pack = maild_rules::default_pack_str();
 ```
 
-Return to [cosmix-maild-rules](README.md).
+Return to [maild-rules](README.md).
