@@ -830,8 +830,8 @@ pub async fn query(
         // value would tell a paginating client "you are at offset N"
         // when it is actually at the end of the list.
         position: start as u64,
-        ids: page.iter().map(|id| id.0.to_string()).collect(),
-        total: total as u64,
+        ids: page_ids.iter().map(|id| id.0.to_string()).collect(),
+        total,
     };
     Ok(serde_json::to_value(resp)?)
 }
