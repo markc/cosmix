@@ -7601,6 +7601,186 @@ fn query_emails_paginates_with_offset_and_limit() {
     assert!(out.is_empty());
 }
 
+#[test]
+fn query_emails_page_total_is_independent_of_window() {
+    let (_d, mds, store) = open_mailstore();
+    let set = provision(&store);
+    let inbox = mk_container(&mds, &set, "Inbox", Some("\\Inbox"));
+    let mut ids = Vec::new();
+    for i in 0..5 {
+        let id = add_item_in(&mds, &set, inbox, format!("page-{i}").as_bytes());
+        set_received_at(&mds, &set, &id, 1_000 + i);
+        ids.push(id);
+    }
+    ids.reverse();
+    for (offset, limit, expected) in [(0, 2, &ids[..2]), (2, 2, &ids[2..4]), (4, 10, &ids[4..])] {
+        let (page, total) = store
+            .query_emails_page(
+                TEST_ACCOUNT,
+                EmailQueryFilter::default(),
+                EmailSort::ReceivedAtDesc,
+                ListOpts {
+                    offset,
+                    limit,
+                    ..ListOpts::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(page, expected, "offset {offset}, limit {limit}");
+        assert_eq!(total, 5, "offset {offset}, limit {limit}");
+    }
+}
+
+#[test]
+fn query_emails_page_offset_past_end_and_zero_limit() {
+    let (_d, mds, store) = open_mailstore();
+    let set = provision(&store);
+    let inbox = mk_container(&mds, &set, "Inbox", Some("\\Inbox"));
+    add_item_in(&mds, &set, inbox, b"first");
+    add_item_in(&mds, &set, inbox, b"second");
+    for (offset, limit) in [(99, 10), (0, 0)] {
+        let (page, total) = store
+            .query_emails_page(
+                TEST_ACCOUNT,
+                EmailQueryFilter::default(),
+                EmailSort::ReceivedAtDesc,
+                ListOpts {
+                    offset,
+                    limit,
+                    ..ListOpts::default()
+                },
+            )
+            .unwrap();
+        assert!(page.is_empty(), "offset {offset}, limit {limit}");
+        assert_eq!(total, 2, "offset {offset}, limit {limit}");
+    }
+}
+
+#[test]
+fn query_emails_page_filter_and_sort_window() {
+    let (_d, mds, store) = open_mailstore();
+    let set = provision(&store);
+    let inbox = mk_container(&mds, &set, "Inbox", Some("\\Inbox"));
+    let archive = mk_container(&mds, &set, "Archive", None);
+    let mut ids = Vec::new();
+    for (mailbox, subject, flags) in [
+        (inbox, "Apple", 1), (inbox, "Re: Banana", 1), (inbox, "Cherry", 1),
+        (inbox, "Blueberry", 0), (archive, "Apricot", 1),
+    ] {
+        let id = add_item_in(&mds, &set, mailbox, subject.as_bytes());
+        let mut env = sample_envelope();
+        env.subject = subject.into();
+        insert_envelope(&mds, &set, &id, &env);
+        store.set_keywords(TEST_ACCOUNT, id, Flags(flags), Tags::new()).unwrap();
+        ids.push(id);
+    }
+    for (sort, expected) in [
+        (EmailSort::SubjectAsc, vec![ids[1], ids[2]]),
+        (EmailSort::SubjectDesc, vec![ids[1], ids[0]]),
+    ] {
+        let result = store.query_emails_page(
+            TEST_ACCOUNT,
+            EmailQueryFilter {
+                in_mailbox: Some(inbox),
+                has_keyword: Some(Flags(1)),
+                ..EmailQueryFilter::default()
+            },
+            sort,
+            ListOpts { offset: 1, limit: 2, ..ListOpts::default() },
+        ).unwrap();
+        assert_eq!(result, (expected, 3), "sort {sort:?}");
+    }
+}
+
+#[test]
+fn query_emails_page_subject_legacy_row_sorts_empty() {
+    let (_d, mds, store) = open_mailstore();
+    let set = provision(&store);
+    let inbox = mk_container(&mds, &set, "Inbox", Some("\\Inbox"));
+    let legacy = add_item_in(&mds, &set, inbox, b"legacy");
+    let current = add_item_in(&mds, &set, inbox, b"current");
+    for (id, subject) in [(legacy, "Zebra"), (current, "Apple")] {
+        let mut env = sample_envelope();
+        env.subject = subject.into();
+        insert_envelope(&mds, &set, &id, &env);
+    }
+    mds.with_set_tx(&set, |tx| {
+        tx.tx().execute(
+            "UPDATE mail_envelopes SET normalized_subject = '' WHERE item_id = ?1",
+            params![legacy.0.to_string()],
+        ).unwrap();
+        Ok(())
+    }).unwrap();
+    let result = store.query_emails_page(
+        TEST_ACCOUNT,
+        EmailQueryFilter::default(),
+        EmailSort::SubjectAsc,
+        ListOpts::default(),
+    ).unwrap();
+    assert_eq!(result, (vec![legacy, current], 2));
+    let stored: String = mds.with_set_read(&set, |conn| {
+        conn.query_row(
+            "SELECT normalized_subject FROM mail_envelopes WHERE item_id = ?1",
+            params![legacy.0.to_string()],
+            |row| row.get(0),
+        ).map_err(|e| cosmix_mds::Error::Other(e.to_string()))
+    }).unwrap();
+    assert_eq!(stored, "", "queries must not backfill legacy subjects");
+}
+
+#[test]
+fn query_emails_page_punctuation_needle_matches_nothing() {
+    let (_d, mds, store) = open_mailstore();
+    let set = provision(&store);
+    let inbox = mk_container(&mds, &set, "Inbox", Some("\\Inbox"));
+    let (hash, _) = put_blob(&mds, b"searchable body");
+    let (id, _) = store.create_email(
+        TEST_ACCOUNT, inbox, hash, sample_envelope(), &[], Flags(0), Tags::new(), 1_000,
+    ).unwrap();
+    for (needle, expected) in [("lunch", (vec![id], 1)), ("- ^ ( )", (vec![], 0))] {
+        let result = store.query_emails_page(
+            TEST_ACCOUNT,
+            EmailQueryFilter {
+                text: Some(needle.into()),
+                ..EmailQueryFilter::default()
+            },
+            EmailSort::ReceivedAtDesc,
+            ListOpts::default(),
+        ).unwrap();
+        assert_eq!(result, expected, "needle {needle:?}");
+    }
+}
+
+#[test]
+fn query_emails_page_does_not_write() {
+    let (_d, mds, store) = open_mailstore();
+    let set = provision(&store);
+    let inbox = mk_container(&mds, &set, "Inbox", Some("\\Inbox"));
+    let id = add_item_in(&mds, &set, inbox, b"read-only");
+    insert_envelope(&mds, &set, &id, &sample_envelope());
+    mds.with_set_tx(&set, |tx| {
+        tx.tx().execute("UPDATE mail_envelopes SET normalized_subject = ''", []).unwrap();
+        Ok(())
+    }).unwrap();
+    // with_set_read and query_emails_page use the same cached per-set connection.
+    // total_changes also catches updates that write the same value or roll back.
+    let changes = || mds.with_set_read(&set, |conn| {
+        conn.query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0))
+            .map_err(|e| cosmix_mds::Error::Other(e.to_string()))
+    }).unwrap();
+    let before = changes();
+    for sort in [EmailSort::SubjectAsc, EmailSort::ReceivedAtDesc] {
+        let result = store.query_emails_page(
+            TEST_ACCOUNT,
+            EmailQueryFilter::default(),
+            sort,
+            ListOpts::default(),
+        ).unwrap();
+        assert_eq!(result, (vec![id], 1));
+        assert_eq!(changes(), before, "query with {sort:?} must not write");
+    }
+}
+
 /// `text` full-text filter: matches the `mail_search` FTS5 projection
 /// (subject + folded headers + normalized addrs + plain-text body), ANDs
 /// with `in_mailbox`, and yields nothing for a non-matching / blank needle.
