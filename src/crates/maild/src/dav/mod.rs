@@ -118,13 +118,11 @@ async fn dispatch(State(state): State<Arc<AppState>>, req: Request) -> Response 
         .unwrap_or("-")
         .to_owned();
     let resp = dispatch_inner(State(state), req).await;
+    // The journal shows only the message text, so the fields go in the string.
     tracing::info!(
         target: "maild::dav::access",
-        method = %method,
-        path = %path,
-        user_agent = %user_agent,
-        status = resp.status().as_u16(),
-        "DAV request",
+        "DAV {method} {path} status={} ua=\"{user_agent}\"",
+        resp.status().as_u16(),
     );
     resp
 }
