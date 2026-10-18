@@ -557,6 +557,16 @@ impl SqliteCasMds {
         self.root.join("blobs")
     }
 
+    /// Run `f` against the per-set connection for reads only. Takes no
+    /// write gate and opens no transaction, so a read never queues behind
+    /// deliveries or flag writes. `f` must not write.
+    pub fn with_set_read<R, F>(&self, set: &SetId, f: F) -> Result<R>
+    where
+        F: FnOnce(&Connection) -> Result<R>,
+    {
+        self.with_conn_ref(set, f)
+    }
+
     /// Run `f` inside a single per-set `BEGIN IMMEDIATE` transaction
     /// against the `data.sqlite` connection (with `blobs.sqlite`
     /// already ATTACH'd as `blobs_db`). On `Ok`, the transaction is

@@ -3318,11 +3318,12 @@ impl MailStore for SqliteMailStore {
             }
             if let Some(min) = filter.min_size {
                 preds.push("i.size_bytes >= ?".into());
-                params.push(Value::Integer(min as i64));
+                // Clamp so a bound above i64::MAX cannot wrap negative.
+                params.push(Value::Integer(i64::try_from(min).unwrap_or(i64::MAX)));
             }
             if let Some(max) = filter.max_size {
                 preds.push("i.size_bytes <= ?".into());
-                params.push(Value::Integer(max as i64));
+                params.push(Value::Integer(i64::try_from(max).unwrap_or(i64::MAX)));
             }
             // RFC 8621 §4.4.1: at least one membership outside the list.
             // An empty list makes `NOT IN ()` true for any membership.
@@ -3444,7 +3445,7 @@ impl MailStore for SqliteMailStore {
                 let mut stmt = conn
                     .prepare(
                         "SELECT item_id, subject FROM mail_envelopes \
-                         WHERE normalized_subject = ''",
+                         WHERE normalized_subject = '' AND subject <> ''",
                     )
                     .map_err(|e| cosmix_mds::Error::Other(format!("prepare backfill: {e}")))?;
                 let rows = stmt
@@ -3467,13 +3468,34 @@ impl MailStore for SqliteMailStore {
             Ok(())
         }
 
+        fn count_pending_subjects(conn: &rusqlite::Connection) -> cosmix_mds::Result<i64> {
+            conn.query_row(
+                "SELECT COUNT(*) FROM mail_envelopes \
+                 WHERE normalized_subject = '' AND subject <> ''",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| cosmix_mds::Error::Other(format!("count pending subjects: {e}")))
+        }
+
+        // Reads take no write gate, so a query never queues behind
+        // deliveries or flag writes. The backfill is the only write, and it
+        // runs only while rows still need it.
+        if want_subject {
+            let pending = self
+                .mds
+                .with_set_read(&set, |conn| count_pending_subjects(conn))
+                .map_err(|e| anyhow!(e))?;
+            if pending > 0 {
+                self.mds
+                    .with_set_tx(&set, |tx| backfill_normalized_subjects(tx.tx()))
+                    .map_err(|e| anyhow!(e))?;
+            }
+        }
+
         let (ids, total) = self
             .mds
-            .with_set_tx(&set, |tx| {
-                let conn = tx.tx();
-                if want_subject {
-                    backfill_normalized_subjects(conn)?;
-                }
+            .with_set_read(&set, |conn| {
                 let total: i64 = conn
                     .query_row(&count_sql, params_from_iter(where_params.iter()), |r| {
                         r.get(0)
