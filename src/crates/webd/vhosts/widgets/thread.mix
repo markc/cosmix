@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- thread.mix — SHARED threaded-reply substrate: forum discussion AND blog comments.
 -- ONE table (cms_threads, created in cms_init), ONE renderer (rd_thread), ONE composer
 -- (thread_reply_form), ONE insert (thread_add). A reply hangs off a ROOT cms_posts row:

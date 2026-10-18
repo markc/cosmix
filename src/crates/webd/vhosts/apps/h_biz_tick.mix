@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- biz_tick.mix — the billing engine tick (POST /biz/tick). Plan §3 P1.
 -- Runs daily from a systemd timer on the node (curl with X-Tick-Secret), or
 -- manually by a rank-3 admin session. Idempotent by construction:

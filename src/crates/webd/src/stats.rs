@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
 //! Per-vhost response-class counters — backs `webd.stats`.
 //!
 //! Shape: five `AtomicU64` buckets matching the HTTP status-class

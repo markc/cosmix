@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
 //! Embedded (trusted) Mix HTTP handlers for webd — slice #3 of the
 //! maild/webd trust-split ADR (`_decisions/2026-06-04-maild-webd-trust-split.md`).
 //!

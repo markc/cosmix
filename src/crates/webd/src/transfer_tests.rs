@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
 //! Local wire fixtures: real NodedClient discovery and real reqwest lane I/O.
 use axum::{
     body::{Body, Bytes},

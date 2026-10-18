@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- h_admin_vtokens.mix — OPAQUE vtoken management as a posts-standard datatable
 -- (GET/POST /admin/vtokens). Admin-only.
 --

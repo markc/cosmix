@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- tools_registry.mix — the DECLARATIVE tool registry: what may run, what params it
 -- takes, how they are validated, and the per-tool limits. Deployed to TWO trees from
 -- this ONE source (single source of truth):

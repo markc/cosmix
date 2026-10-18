@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
 //! Hot-swappable host-routing directory for webd.
 //!
 //! The directory is a single immutable snapshot containing every

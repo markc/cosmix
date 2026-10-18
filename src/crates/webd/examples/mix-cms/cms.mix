@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- cms.mix — a minimal, self-contained mix-scripted CMS handler for webd.
 --
 -- One `db`-capable handler bound to GET+POST on a path (register it with

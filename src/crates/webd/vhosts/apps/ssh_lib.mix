@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- ssh_lib.mix — shared logic for the /ssh admin panel (the admin vhost).
 --
 -- The filesystem (~/.ssh via the filesd `sshm` place) is the SOLE source of

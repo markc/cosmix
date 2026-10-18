@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- h_biz_customers.mix — billing customer CRUD + support-call detail (ANY /biz/customers).
 -- Admin-only. List = shared datatable + modal edit (mirrors h_admin_users); the DETAIL
 -- view (?view=<id>) is the phone-support screen: contact card (+ credit balance via

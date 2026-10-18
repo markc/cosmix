@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- h_shop_admin.mix — the shop PRODUCTS panel (/biz/products), a resource/1
 -- spec (Foundation P2) interpreted by resource_main. Orders need no panel of
 -- their own: an order IS an invoice, so /biz/invoices already lists and

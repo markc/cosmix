@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- h_ssh_hosts.mix — /ssh/hosts : full-CRUD SSH host inventory (P1).
 --
 -- admin-list/1 over the sshm.ssh_hosts mirror (FS-authoritative). CRUD is

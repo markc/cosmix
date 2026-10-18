@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- h_biz_invoices.mix — invoice admin (GET/POST /biz/invoices). Admin-only. THE MONEY
 -- SURFACE: every status flip goes through biz.mix (biz_apply_payment / biz_cancel_invoice /
 -- biz_issue_invoice / biz_recompute_draft) — this file never hand-rolls one. Money is

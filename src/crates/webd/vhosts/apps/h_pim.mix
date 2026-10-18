@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- h_pim.mix — GET /pim. The original client-side PIM SPA (pim.js + pim.css + the
 -- md.js webmail viewer) was RETIRED in favour of the server-rendered
 -- /pim/{contacts,calendar,mail} pages — there is now ONE PIM implementation (SSR).

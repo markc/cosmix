@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- reader.mix — rd_view($o): the shared READ/VIEW surface, the read-twin of fm_form (forms.mix).
 -- One header card (action bar + right-aligned back affordance) → title + status badges + meta
 -- rows → a clutter-free prose body (render_body output) → optional trailing footer. Schema-driven

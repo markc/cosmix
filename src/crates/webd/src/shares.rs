@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
 //! Public-share management and bounded password work. Bus callers are mesh-trusted;
 //! HTTP callers can create only paths beneath their session account's configured root.
 use crate::{NodeState, VhostState, blob_lane, blob_reference, file_share, session};

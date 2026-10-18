@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
 //! Ergonomic Bus verbs for the `webd.listeners` kill-switch namespace
 //! (P3): `webd.listener.{enable,disable,status} id=<id>`.
 //!

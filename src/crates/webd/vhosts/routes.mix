@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- routes.mix — shared route table for every webd CMS/PIM vhost. deploy_vhost.mix
 -- reads this ($ROUTES), generates one thin stub per unique handler `h`, and
 -- registers each route as "<prefix>_<id>" for the target vhost (prefix = the

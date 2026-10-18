@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
 //! Stateless AEAD-sealed session cookies for the SSR PIM (Phase 2).
 //!
 //! A `/auth/login` POST exchanges the user's password for a maild bearer

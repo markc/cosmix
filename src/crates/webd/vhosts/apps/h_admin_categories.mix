@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- admin_categories.mix — CATEGORY manager as a posts-standard DATATABLE (GET/POST /admin/categories).
 -- Admin-only. Categories are `terms` rows with taxonomy='category' + a nullable parent_id
 -- (Part C of _plan/2026-06-23-cms-reading-model-and-tree-nav.md). The MAIN PANE is now the

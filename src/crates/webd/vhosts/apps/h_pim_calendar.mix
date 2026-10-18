@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- h_pim_calendar.mix — SHARED SSR Calendar (event CRUD) for /pim/calendar.
 -- Defines pim_calendar_main(); the per-vhost stub includes site.conf.mix + lib.mix
 -- + this, then `return pim_calendar_main()`. Vhost-agnostic: identity is the maild

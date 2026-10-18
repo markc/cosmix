@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
 //! `webd.stats` — per-vhost response-class counters snapshot.
 //!
 //! Iterates `NodeState::vhosts.load().primaries` (a

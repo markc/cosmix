@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
 //! `webd.tls.{status,reload}` — TLS posture inspection + live
 //! manual-PEM cert reload.
 //!
@@ -57,7 +59,7 @@ use crate::tls_status::TlsStatusSnapshot;
 /// `listeners_namespace::auth_policy`, which `listener_verbs::require_cap`
 /// uses). Reusing the existing operator cap means no new policy grant to
 /// register and keeps "who may mutate listener/TLS state" a single tier.
-/// An anonymous caller (e.g. the bare `cosmix-webd tls reload` CLI on a
+/// An anonymous caller (e.g. the bare `webd tls reload` CLI on a
 /// node where `""` is not an operator) is denied — operate via an
 /// identity in the operators allowlist, as with the kill switch.
 const RELOAD_CAP: &str = "props.write:webd.listeners";

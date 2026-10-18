@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
 //! ACME provisioner — landed pieces: P2-C5a + P2-C5b + P2-C5d1 + P2-C5d2.
 //!
 //! This module accumulates the C5 subseries that lifts the Phase 2

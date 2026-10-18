@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- lib.mix — SHARED CMS library for every webd Mix-SSR vhost. Vhost-agnostic:
 -- per-vhost values (title/tagline/footer) come from $SITE, set by the per-vhost
 -- site.conf.mix the entry stub includes before this file. The shell template is
@@ -165,8 +167,8 @@ function cms_seed()
     if length($aid) > 0 then
       $author = $aid[0]["id"]
     end
-    $welcome = "Welcome to **" .. $SITE["title"] .. "**.\n\nEvery page is produced by an operator-authored `.mix` script running in-process inside `cosmix-webd`, reading and writing this vhost's own SQLite database through the `db_query`/`db_exec` builtins.\n\nThe visual shell is the **dcs.spa** dual-carousel design system, with the CMS content rendered into its main column. No React, no build step: just Mix, server-rendered HTML, and the dcs.spa CSS/JS. Edit a handler and reload; the change is live."
-    db_exec("INSERT INTO cms_posts (slug, title, excerpt, body, status, author_id) VALUES (?1, ?2, ?3, ?4, 'published', ?5)", ["hello", "Hello from " .. $SITE["title"], "This site is rendered entirely by Mix handlers inside cosmix-webd — server-side HTML over a per-vhost SQLite database — wrapped in the dcs.spa design-system shell.", $welcome, $author])
+    $welcome = "Welcome to **" .. $SITE["title"] .. "**.\n\nEvery page is produced by an operator-authored `.mix` script running in-process inside `webd`, reading and writing this vhost's own SQLite database through the `db_query`/`db_exec` builtins.\n\nThe visual shell is the **dcs.spa** dual-carousel design system, with the CMS content rendered into its main column. No React, no build step: just Mix, server-rendered HTML, and the dcs.spa CSS/JS. Edit a handler and reload; the change is live."
+    db_exec("INSERT INTO cms_posts (slug, title, excerpt, body, status, author_id) VALUES (?1, ?2, ?3, ?4, 'published', ?5)", ["hello", "Hello from " .. $SITE["title"], "This site is rendered entirely by Mix handlers inside webd — server-side HTML over a per-vhost SQLite database — wrapped in the dcs.spa design-system shell.", $welcome, $author])
   end
 end
 

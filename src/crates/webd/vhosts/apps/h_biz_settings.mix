@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- h_biz_settings.mix — billing settings (GET/POST /biz/settings). Admin-only.
 -- One full-page form (fm_open/fm_section/fm_actions — the admin_settings shape, NOT the
 -- CRUD md_form) that edits the biz_settings key/value table via biz_setting/biz_setting_set.

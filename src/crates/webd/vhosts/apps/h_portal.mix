@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- portal.mix — the CUSTOMER self-serve portal (the billing vhost). One handler,
 -- path-dispatched (biz_portal_main): /portal, /portal/services, /portal/invoices,
 -- /portal/profile. WHMCS-style reduced surface: a customer sees ONLY their own

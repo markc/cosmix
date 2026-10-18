@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
 //! Production [`SubscribeGranter`] for webd — bridges
 //! `<svc>.props.watch` / `<svc>.props.audit.watch` to noded's
 //! `noded.props.subscribe_grant` verb (SPEC 12 §15.5, C10b).

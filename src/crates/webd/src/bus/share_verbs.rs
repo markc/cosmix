@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
 //! Mesh-open catalogue verbs. JSON arguments only; no transport-header fallback.
 use crate::{NodeState, VhostState, shares};
 use cosmix_client::IncomingCommand;

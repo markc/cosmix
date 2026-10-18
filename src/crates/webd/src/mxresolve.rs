@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
 //! MX-derived hostname resolution for mail-client autoconfig.
 //!
 //! webd serves the **MX target** of the requested domain as the
@@ -21,7 +23,7 @@
 //!
 //! An MX record is *inbound-SMTP routing*, not a declaration that the
 //! target also terminates IMAPS/SMTPS. Reusing it as the served
-//! `<hostname>` is a Cosmix operator-policy requirement
+//! `<hostname>` is an operator-policy requirement
 //! (autoconfig.md §Decision); §Acceptance bullet 3 requires that policy
 //! be *verified*, not assumed. So after MX selection `resolve` probes
 //! the chosen host: a bounded, concurrent **implicit-TLS** handshake to

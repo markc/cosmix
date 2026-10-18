@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
 //! `WebdBusCallHandler` — the local Bus-named implementation of Mix's call-handler API.
 //! backing the `bus_call` builtin in an embedded Mix handler (vtoken C2).
 //!

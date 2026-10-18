@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- posts.mix (h_posts) — the stable blog index (GET /posts). The SAME card-list feed
 -- as the default home (/), but at a fixed URL so the blog survives when `/` is made a
 -- static page via the `home_page_slug` setting (P4). Unlike home it does NOT run

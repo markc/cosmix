@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
 //! `WebdDbHandler` — the [`cosmix_mix::DbHandler`] implementation that
 //! backs `db_query`/`db_exec` in an embedded Mix handler with the
 //! request's **per-vhost** SQLite connection.

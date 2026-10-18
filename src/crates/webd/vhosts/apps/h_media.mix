@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- media.mix — serve a stored image as real binary (GET /media/<id>).
 -- The media row holds base64 in `data`; decode to raw bytes and let
 -- webd stream them verbatim (Value::Bytes body, no UTF-8 mangling).

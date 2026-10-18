@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- h_fleet.mix — read-only fleet status board (GET /admin/fleet). Admin-gated.
 --
 -- Renders a status snapshot published by an agent-fleet controller. The page

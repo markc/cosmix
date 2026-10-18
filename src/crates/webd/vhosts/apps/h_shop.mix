@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- h_shop.mix — the PUBLIC digital-goods shop, one path-dispatched handler
 -- (shop_main): catalogue at /, /product/<slug>, /cart (view + mutate),
 -- POST /checkout, /order/<token> (the order page = gateway return target),

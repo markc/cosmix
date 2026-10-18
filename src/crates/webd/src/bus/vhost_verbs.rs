@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
 //! C5 — ergonomic Bus verbs for the `webd.vhosts` substrate.
 //!
 //! Five verbs sit on top of the SPEC-12 `webd.props.*` surface to give

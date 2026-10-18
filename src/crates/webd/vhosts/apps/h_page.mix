@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- page.mix — standalone CMS page view (GET /page/<slug>). Same data table as
 -- posts (cms_posts) but kind='page': no blog-feed listing, no author byline.
 --

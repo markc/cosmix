@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- sw.mix — Synergy Wholesale SOAP client for the billing panel.
 -- Wire reference: _doc/2026-07-08-synergy-wholesale-soap-reference.md.
 -- Plan §3 P3. Requires route capability "net". Uses xml_parse (webd 0.9.3+)

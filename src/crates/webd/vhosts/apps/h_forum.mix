@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- h_forum.mix — threaded forum. GET /forum (board index), GET /forum/<slug> (a topic's
 -- opening post + threaded replies + composer), POST /forum (new topic). Replies post to the
 -- shared /reply endpoint (h_reply.mix), the SAME path blog comments use — one substrate

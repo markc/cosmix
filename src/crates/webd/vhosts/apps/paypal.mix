@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- paypal.mix — PayPal Orders v2 client for the billing panel.
 -- Plan §3 P2: create (custom_id=invoice_id) → buyer approves → our return
 -- route captures server-side → PAYMENT.CAPTURE.COMPLETED webhook (verified

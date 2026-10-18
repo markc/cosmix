@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- admin_settings.mix — the ONE managed settings surface for both CMS and PIM
 -- (GET/POST /admin/settings). Two-tier model: site.conf.mix $SITE = Tier-1 versioned
 -- defaults; cms.db `settings` = Tier-2 admin overrides (db-wins, seeded from $SITE).

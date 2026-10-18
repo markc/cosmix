@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
 //! `WebdJmapHandler` — the [`cosmix_mix::JmapHandler`] implementation that
 //! backs the `jmap` builtin in an embedded Mix handler. It resolves JMAP
 //! method calls over webd's HTTP client to the vhost's configured maild

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
 //! P3 — `bootstrap_upsert_from_config` for the `webd.listeners`
 //! namespace: seed the L1 kill-switch/guard rows from the resolved
 //! `[[webd.listener]]` config at startup.

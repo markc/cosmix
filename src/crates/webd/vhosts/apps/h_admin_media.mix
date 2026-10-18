@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- admin_media.mix — image library (GET /admin/media: gallery + upload UI).
 --
 -- New uploads are stored as REAL FILES on disk: the client FileReader turns

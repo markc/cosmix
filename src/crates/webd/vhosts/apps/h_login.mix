@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- h_login.mix — the unified maild login UI, Mix-rendered (P1 of the login revamp).
 --
 -- webd still OWNS the auth logic: POST /auth/login (the form action) exchanges

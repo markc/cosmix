@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- h_biz_domains.mix — billing domain list/detail/edit (ANY /biz/domains). Admin-only.
 -- Built on biz.mix (schema, audit, money/date helpers) + the shared datatable/forms/
 -- modals pattern (mirrors h_admin_users). Money = INTEGER cents, dates = civil TEXT.

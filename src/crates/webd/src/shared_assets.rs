@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
 //! Opt-in, read-only publication of verified installed asset sets.
 //!
 //! A startup snapshot keeps request work bounded: each set is verified once,

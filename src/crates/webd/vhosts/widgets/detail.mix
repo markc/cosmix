@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- detail.mix — the webd DETAIL-PAGE FOUNDATION kit (dv_*).
 -- Contract: _doc/2026-07-12-webd-foundations.md (§ Detail pages) · probe: foundation_check
 -- §details (report-only inventory this round). Owns the NEUTRAL dv-* classes

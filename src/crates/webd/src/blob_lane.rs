@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
 //! Local blobd adapter. No reference origin is ever used as a routing target.
 //! Shared by public shares and recoverable media dual-write.
 

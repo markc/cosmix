@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- biz_provision.mix — DB-only CT provisioning handshake endpoints.
 -- D9 handshake: the standalone _bin/ct_provision_worker.mix performs PVE/gateway
 -- work and reports here; this handler owns all biz.db writes inside webd.

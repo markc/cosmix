@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
 //! `webd.autoconfig.served_domains` — the autoconfig admission allowlist.
 //!
 //! Returns the `NodeState::served_mail_domains` set, sorted for

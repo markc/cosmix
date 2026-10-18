@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- admin_resource.mix — the webd ADMIN PANEL FOUNDATION (executable canon).
 -- Contract + extension points: _doc/2026-07-12-webd-foundations.md (§ Admin panel).
 -- Registry: lib/foundation_registry.mix · probe: _bin/foundation_check.mix.

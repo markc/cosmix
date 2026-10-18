@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
 //! Per-vhost cache of rendered ANONYMOUS public responses.
 //!
 //! The authed-request win is [`crate::current_session_epoch`]'s epoch cache;

@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- archive.mix (h_archive) — ONE generic taxonomy archive for /tag/<slug> and
 -- /category/<slug> (P2). The taxonomy is inferred from the path prefix; the trailing
 -- segment is the term slug. Lists the published-public posts in that term as the SAME

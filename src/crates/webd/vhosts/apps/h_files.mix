@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- h_files.mix — Dolphin-style dual-pane FILE MANAGER (/files) over the delegated
 -- cosmix-filesd fs-mode bus_call seam (filesd-fs / fs.* verbs). S2 = read-only
 -- browse: two independent panes (each its own cwd/sort, l.* / r.* query state), a

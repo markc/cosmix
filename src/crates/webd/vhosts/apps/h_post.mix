@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- post.mix — single post view (GET /post/<slug>). Renders through the shared rd_view reader
 -- widget (reader.mix). Post-specific logic (the slug lookup, the draft/private gate) stays here;
 -- the read SPEC (badges, byline, Edit action, taxonomy footer, back) is built by the shared

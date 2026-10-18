@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
 //! Filesystem-backed image storage for the CMS `media` library.
 //!
 //! CMS handler `.mix` scripts run in a Pure+FsRead Mix sandbox

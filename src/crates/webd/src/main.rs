@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -76,9 +78,9 @@ const VERSION: &str = concat!(
 
 #[derive(Parser)]
 #[command(
-    name = "cosmix-webd",
+    name = "webd",
     version = VERSION,
-    about = "Lightweight web server for cosmix WASM apps + CMS API"
+    about = "Lightweight web server for WASM apps + CMS API"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -229,7 +231,7 @@ enum TlsAction {
     /// Re-reads + re-validates the configured cert files and atomically
     /// swaps each listener's resolver; a bad cert returns rc=10 and keeps
     /// the prior cert serving. Manual-PEM nodes only — ACME-managed nodes
-    /// use `cosmix-webd acme renew`. Operator-gated (the listeners
+    /// use `webd acme renew`. Operator-gated (the listeners
     /// operator tier): the caller must be in `[webd.listeners] operators`,
     /// so a bare anonymous CLI invocation is denied unless `""` is an
     /// operator — drive it from an identity in that allowlist.
@@ -6395,12 +6397,12 @@ async fn redirect_to_https(req: axum::extract::Request) -> Response {
 /// `kind` is a short label for the startup log line.
 async fn serve_plain(listen: &str, app: Router, kind: &str) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(listen).await?;
-    info!("cosmix-web listening on {listen} ({kind})");
+    info!("webd listening on {listen} ({kind})");
     axum::serve(listener, app).await?;
     Ok(())
 }
 
-/// DEV-MODE static server — `cosmix-webd serve --static-dir <dir>`.
+/// DEV-MODE static server — `webd serve --static-dir <dir>`.
 ///
 /// Serves `static_dir` as a plain static site on a **loopback-only**
 /// listener, behind a minimal synthesized `localhost` vhost. No database,
@@ -6525,7 +6527,7 @@ async fn run_static_dev_server(
     );
     // cosmix_log routes to journald (daemon mode), so a stdout banner the
     // interactive user can't miss — this is a foreground dev tool.
-    println!("cosmix-webd dev server");
+    println!("webd dev server");
     println!("  serving : {}", www_dir.display());
     println!("  url     : http://{listen}/");
     println!(
@@ -6617,7 +6619,7 @@ impl QueryRowOptional for Result<Post, rusqlite::Error> {
 }
 
 // ---------------------------------------------------------------------------
-// `cosmix-webd vhost` CLI subcommands
+// `webd vhost` CLI subcommands
 // ---------------------------------------------------------------------------
 
 /// Run a CLI `vhost` subcommand as a transient Bus client.
@@ -6642,8 +6644,8 @@ async fn run_vhost_cli(action: VhostAction) -> Result<()> {
         .map_err(|e| {
             anyhow!(
                 "webd daemon not reachable via broker ({e}). \
-                 `cosmix-webd vhost` requires the daemon to be \
-                 running — `systemctl start cosmix-webd` (or equivalent) first."
+                 `webd vhost` requires the daemon to be \
+                 running — `systemctl start webd` (or equivalent) first."
             )
         })?;
 
@@ -6943,8 +6945,8 @@ async fn run_acme_cli(action: AcmeAction) -> Result<()> {
         .map_err(|e| {
             anyhow!(
                 "webd daemon not reachable via broker ({e}). \
-                 `cosmix-webd acme` requires the daemon to be \
-                 running — `systemctl start cosmix-webd` (or equivalent) first."
+                 `webd acme` requires the daemon to be \
+                 running — `systemctl start webd` (or equivalent) first."
             )
         })?;
 
@@ -7003,7 +7005,7 @@ async fn run_readonly_verb_cli(verb: &'static str) -> Result<()> {
             anyhow!(
                 "webd daemon not reachable via broker ({e}). \
                  read-only inspection verbs require the daemon to be \
-                 running — `systemctl start cosmix-webd` (or equivalent) first."
+                 running — `systemctl start webd` (or equivalent) first."
             )
         })?;
 
@@ -7061,7 +7063,7 @@ async fn async_main() -> Result<()> {
     let log_handle = cosmix_log::init(
         &cosmix_log::LogOpts::default(),
         &cosmix_log::StatsOpts::default(),
-        cosmix_log::LogDefaults::daemon("cosmix-webd").with_stats(false),
+        cosmix_log::LogDefaults::daemon("webd").with_stats(false),
     )
     .expect("logging init failed");
 
@@ -7451,7 +7453,7 @@ async fn async_main() -> Result<()> {
                              — refusing to enter the ACME order phase without :80"
                             )
                         })?;
-                    info!("cosmix-web listening on {http_listen} (HTTP redirect (pre-ACME))");
+                    info!("webd listening on {http_listen} (HTTP redirect (pre-ACME))");
                     Some(tokio::spawn(async move {
                         axum::serve(listener, redirect).await?;
                         Ok(())
@@ -9944,7 +9946,7 @@ mod cli_parser_tests {
     #[test]
     fn vhost_add_parses_minimum_positionals() {
         let cli = parse(&[
-            "cosmix-webd",
+            "webd",
             "vhost",
             "add",
             "example.com",
@@ -9980,7 +9982,7 @@ mod cli_parser_tests {
 
     #[test]
     fn vhost_add_without_positionals_errors() {
-        let Err(err) = parse(&["cosmix-webd", "vhost", "add"]) else {
+        let Err(err) = parse(&["webd", "vhost", "add"]) else {
             panic!("vhost add requires <fqdn> and <www_dir>")
         };
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
@@ -9988,7 +9990,7 @@ mod cli_parser_tests {
 
     #[test]
     fn vhost_add_without_www_dir_errors() {
-        let Err(err) = parse(&["cosmix-webd", "vhost", "add", "example.com"]) else {
+        let Err(err) = parse(&["webd", "vhost", "add", "example.com"]) else {
             panic!("vhost add requires <www_dir>")
         };
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
@@ -9997,7 +9999,7 @@ mod cli_parser_tests {
     #[test]
     fn vhost_add_accepts_full_acme_trio() {
         let cli = parse(&[
-            "cosmix-webd",
+            "webd",
             "vhost",
             "add",
             "example.com",
@@ -10031,7 +10033,7 @@ mod cli_parser_tests {
     #[test]
     fn vhost_add_accepts_manual_tls_pair_and_disabled_flag() {
         let cli = parse(&[
-            "cosmix-webd",
+            "webd",
             "vhost",
             "add",
             "example.com",
@@ -10071,7 +10073,7 @@ mod cli_parser_tests {
 
     #[test]
     fn acme_renew_parses_with_fqdn() {
-        let cli = parse(&["cosmix-webd", "acme", "renew", "example.com"])
+        let cli = parse(&["webd", "acme", "renew", "example.com"])
             .expect("acme renew <fqdn> should parse");
         match cli.command {
             Command::Acme {
@@ -10085,7 +10087,7 @@ mod cli_parser_tests {
 
     #[test]
     fn acme_status_parses_with_fqdn() {
-        let cli = parse(&["cosmix-webd", "acme", "status", "example.com"])
+        let cli = parse(&["webd", "acme", "status", "example.com"])
             .expect("acme status <fqdn> should parse");
         match cli.command {
             Command::Acme {
@@ -10099,7 +10101,7 @@ mod cli_parser_tests {
 
     #[test]
     fn acme_renew_without_fqdn_errors() {
-        let Err(err) = parse(&["cosmix-webd", "acme", "renew"]) else {
+        let Err(err) = parse(&["webd", "acme", "renew"]) else {
             panic!("acme renew requires <fqdn>")
         };
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
@@ -10107,7 +10109,7 @@ mod cli_parser_tests {
 
     #[test]
     fn acme_status_without_fqdn_errors() {
-        let Err(err) = parse(&["cosmix-webd", "acme", "status"]) else {
+        let Err(err) = parse(&["webd", "acme", "status"]) else {
             panic!("acme status requires <fqdn>")
         };
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
@@ -10117,7 +10119,7 @@ mod cli_parser_tests {
 
     #[test]
     fn routes_list_parses() {
-        let cli = parse(&["cosmix-webd", "routes", "list"]).expect("routes list should parse");
+        let cli = parse(&["webd", "routes", "list"]).expect("routes list should parse");
         assert!(matches!(
             cli.command,
             Command::Routes {
@@ -10128,7 +10130,7 @@ mod cli_parser_tests {
 
     #[test]
     fn stats_parses_as_leaf_command() {
-        let cli = parse(&["cosmix-webd", "stats"]).expect("stats should parse as a leaf command");
+        let cli = parse(&["webd", "stats"]).expect("stats should parse as a leaf command");
         // `stats` is a leaf — no sub-action, no positional args. A
         // future drift that introduces a positional or sub-action
         // would break this binding.
@@ -10137,7 +10139,7 @@ mod cli_parser_tests {
 
     #[test]
     fn tls_status_parses() {
-        let cli = parse(&["cosmix-webd", "tls", "status"]).expect("tls status should parse");
+        let cli = parse(&["webd", "tls", "status"]).expect("tls status should parse");
         assert!(matches!(
             cli.command,
             Command::Tls {
@@ -10148,7 +10150,7 @@ mod cli_parser_tests {
 
     #[test]
     fn autoconfig_served_domains_parses() {
-        let cli = parse(&["cosmix-webd", "autoconfig", "served-domains"])
+        let cli = parse(&["webd", "autoconfig", "served-domains"])
             .expect("autoconfig served-domains should parse");
         assert!(matches!(
             cli.command,
@@ -10162,7 +10164,7 @@ mod cli_parser_tests {
     fn routes_without_action_errors() {
         // `routes` alone is invalid — `list` is the only action and
         // clap should refuse to fill it in implicitly.
-        let Err(err) = parse(&["cosmix-webd", "routes"]) else {
+        let Err(err) = parse(&["webd", "routes"]) else {
             panic!("`routes` requires a sub-action")
         };
         // Clap reports this as MissingSubcommand for a #[command(subcommand)]
@@ -10176,7 +10178,7 @@ mod cli_parser_tests {
 
     #[test]
     fn tls_without_action_errors() {
-        let Err(err) = parse(&["cosmix-webd", "tls"]) else {
+        let Err(err) = parse(&["webd", "tls"]) else {
             panic!("`tls` requires a sub-action")
         };
         assert!(matches!(
@@ -10188,7 +10190,7 @@ mod cli_parser_tests {
 
     #[test]
     fn autoconfig_without_action_errors() {
-        let Err(err) = parse(&["cosmix-webd", "autoconfig"]) else {
+        let Err(err) = parse(&["webd", "autoconfig"]) else {
             panic!("`autoconfig` requires a sub-action")
         };
         assert!(matches!(

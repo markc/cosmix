@@ -1,4 +1,6 @@
-//! Bus integration for cosmix-webd.
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+//! Bus integration for webd.
 //!
 //! Per [`_decisions/all-daemons-bus-citizens.md`] +
 //! [`_doc/planned/cosmix-webd-bus-citizenship.md`], webd is a full Bus
@@ -53,8 +55,7 @@ use crate::NodeState;
 /// `cosmix-dnsd` so the mesh-wide wire contract stays uniform.
 const RC_CALLER_ERROR: u8 = 10;
 
-/// Bus service name — SPEC-10 R6: the daemon name minus `cosmix-`
-/// (`cosmix-webd` → `webd`).
+/// Bus service name — SPEC-10 R6: the daemon name.
 const BUS_SERVICE: &str = "webd";
 
 struct BusyReplies {

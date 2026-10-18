@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- biz_pay.mix — PUBLIC payment surface (token-scoped) + gateway webhooks.
 -- Plan §3 P2, Codex-converged design. Routes (billing vhost):
 --   GET  /invoice/<token>            → public SSR invoice document

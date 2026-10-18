@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- h_biz_sw.mix — admin Synergy Wholesale ops (ANY /biz/sw, entry biz_sw_main).
 -- Layout: "Check balance" is a header-RHS action opening a small modal (result)
 -- with any error routed to a toast; the top-of-page wide widget is a domain

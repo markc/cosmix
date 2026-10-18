@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT OR Apache-2.0 */
+/* Copyright 2026 Mark Constable <mc@mixos.dev> */
 /* app.css — the merged CMS app layer (P3). cms + datatable + forms + modals,
  * concatenated IN CASCADE ORDER and ALL UNLAYERED so they beat the dcs.spa
  * @layers (base/site) exactly as the four separate sheets did. Load order in

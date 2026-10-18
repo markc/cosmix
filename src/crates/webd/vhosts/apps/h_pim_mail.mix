@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- h_pim_mail.mix — SHARED SSR webmail READ view for /pim/mail. Defines
 -- pim_mail_main(); the per-vhost stub includes site.conf.mix + lib.mix + this,
 -- then `return pim_mail_main()`. Vhost-agnostic: identity is the maild session,

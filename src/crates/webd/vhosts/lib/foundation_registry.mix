@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- foundation_registry.mix — the FOUNDATIONS REGISTRY (strict data).
 -- Read by _bin/foundation_check.mix (the conformance probe): every admin list
 -- page DECLARES itself under `resources:` — the registry, not filesystem grep,

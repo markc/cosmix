@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- biz.mix — billing core: schema bootstrap + money-path helpers.
 -- Spec: the 2026-07-08 billing implementation plan (cmctl _plan/; §2 schema,
 -- money-path invariants; Codex-reviewed to convergence 2026-07-08).

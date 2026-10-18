@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- admin_comments.mix — comment / forum-reply moderation (GET/POST /admin/comments). Admin-only.
 -- Posts-standard shared SSR datatable (widgets/datatable.mix) over the threaded-reply
 -- substrate (cms_threads — forum discussion AND blog comments), with per-row + bulk

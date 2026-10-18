@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- biz_provision_status.mix — admin JSON poll endpoint for CT provision jobs.
 -- GET /biz/provision-status?service=<id>. Session/admin gated like the other
 -- /biz pages; D9-safe because this is a read-only webd handler.

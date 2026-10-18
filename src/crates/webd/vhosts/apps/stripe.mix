@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- stripe.mix — Stripe API client + webhook signature verification for the
 -- the billing panel. Plan §3 P2. Included by h_biz_pay.mix and
 -- h_biz_tick.mix (auto-charge pass). Requires the route capability "net"

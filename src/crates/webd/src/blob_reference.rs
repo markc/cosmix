@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
 //! Validated local-lane reference shared by the share catalogue and media.
 
 use serde::{Deserialize, Serialize};

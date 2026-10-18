@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
 //! P3 — the runtime reaction loop that applies `webd.listeners` L1
 //! changes to the live [`ListenerSetControl`].
 //!

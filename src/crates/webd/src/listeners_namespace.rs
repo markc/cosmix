@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
 //! SPEC-12 property substrate for webd: the `listeners` namespace —
 //! the runtime kill-switch + guard surface for the per-interface
 //! listener set (P3).

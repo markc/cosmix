@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- datatable.mix — SHARED SSR DataTable widget for every webd Mix-SSR list page.
 -- ONE copy at /opt/cosmix/vhosts/shared/; `include`-d by a list handler
 -- (after lib.mix, so esc()/url_encode() resolve at call-time). Gives sortable

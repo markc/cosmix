@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
 //! Customer billing-portal authentication (Codex ruling A, 2026-07-08).
 //!
 //! Real WHMCS-style email+password login for billing customers, backed by the

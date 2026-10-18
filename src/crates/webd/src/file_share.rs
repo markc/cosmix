@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
 //! Token catalogue for public file shares, managed and served by shares.rs.
 //!
 //! Account identity is the exact canonical email in the unified session. Legacy

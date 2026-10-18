@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- admin_posts.mix — post CRUD (GET/POST /admin/posts).
 --   GET  /admin/posts            → list
 --   GET  /admin/posts?new=1      → blank editor

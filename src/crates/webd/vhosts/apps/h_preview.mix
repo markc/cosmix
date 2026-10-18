@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- preview.mix — live markdown preview endpoint (POST /admin/preview).
 -- Takes a `body` field, returns render_body() (the markdown() builtin — full CommonMark/GFM,
 -- escapes raw HTML + neutralises unsafe URL schemes, so the output is safe to innerHTML) as an

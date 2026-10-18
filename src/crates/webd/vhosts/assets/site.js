@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
 /**
  * DCS Site JavaScript
  * Marketing enhancements on top of base.js app shell

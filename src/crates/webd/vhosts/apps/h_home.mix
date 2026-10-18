@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- home.mix — public blog index (GET /, or wherever a per-vhost route override
 -- mounts it — e.g. a vhost can serve it at /blog so / can be a static landing
 -- page; links derive from $PATH so any mount works). Rendered as a stack of horizontal blog cards

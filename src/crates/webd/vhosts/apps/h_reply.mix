@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- h_reply.mix — uniform reply submit for the shared threaded-reply substrate (thread.mix).
 -- POST /reply with: root_kind ('forum'|'post'), root_id, parent_id, body, return. Used by
 -- BOTH forum topics AND blog comments — one submit path for the whole substrate. Login-to-post;

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
 //! TLS status snapshot — the value carried over the `tokio::sync::watch`
 //! channel that backs `webd.tls.status`.
 //!

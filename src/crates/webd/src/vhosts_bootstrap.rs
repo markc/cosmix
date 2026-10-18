@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
 //! C3c — `bootstrap_upsert_from_config`: materialise resolved
 //! `[[webd.vhost]]` rows from `node.conf.mix` into the `webd.vhosts`
 //! property substrate, idempotently, at daemon startup.

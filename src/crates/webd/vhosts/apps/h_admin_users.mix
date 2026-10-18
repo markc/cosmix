@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+-- Copyright 2026 Mark Constable <mc@mixos.dev>
 -- admin_users.mix — user CRUD (GET/POST /admin/users). Admin-only. A resource/1
 -- panel: users_resource() declares list/form/policy and resource_engine.mix
 -- interprets it (list, md-edit modal + canvas editor, save with derived
