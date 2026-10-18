@@ -2447,8 +2447,8 @@ fn insert_envelope(mds: &SqliteCasMds, set: &SetId, item: &ItemId, env: &EmailEn
             .execute(
                 "INSERT INTO mail_envelopes \
                  (item_id, from_addr, to_addrs, cc_addrs, bcc_addrs, \
-                  reply_to_addrs, subject, date_ts, message_id) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                  reply_to_addrs, subject, date_ts, message_id, normalized_subject) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     item.0.to_string(),
                     env.from,
@@ -2459,6 +2459,8 @@ fn insert_envelope(mds: &SqliteCasMds, set: &SetId, item: &ItemId, env: &EmailEn
                     env.subject,
                     env.date,
                     env.message_id,
+                    // Same key the production insert path writes (create_email).
+                    super::subject::normalize_subject(&env.subject),
                 ],
             )
             .unwrap();
