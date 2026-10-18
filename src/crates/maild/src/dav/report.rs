@@ -14,12 +14,14 @@
 
 use std::sync::Arc;
 
+use cosmix_lib_davproto::{etag, ical, vcard};
+
 use chrono::{DateTime, Utc};
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use uuid::Uuid;
 
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 
 use crate::db;
 use crate::db::calendar::CalendarEvent;
@@ -226,7 +228,8 @@ fn is_prop(line: &str, name: &str) -> bool {
         .is_some_and(|rest| rest.starts_with(':') || rest.starts_with(';'))
 }
 
-fn vevent_facts(data: &serde_json::Value) -> VeventFacts {
+fn vevent_facts(data: &serde_json::Value) -> anyhow::Result<VeventFacts> {
+    let raw = ical::raw_ical(data)?;
     let mut f = VeventFacts {
         recurring: data.get("recurrenceRules").is_some_and(|v| !v.is_null()),
         all_day: data
@@ -236,11 +239,8 @@ fn vevent_facts(data: &serde_json::Value) -> VeventFacts {
         has_duration: false,
         utc_certain: true,
     };
-    let Some(raw) = data
-        .get(cosmix_lib_davproto::ical::RAW_ICAL_KEY)
-        .and_then(|v| v.as_str())
-    else {
-        return f;
+    let Some(raw) = raw else {
+        return Ok(f);
     };
     // Unfold (RFC 5545 §3.1) so folded property lines classify correctly.
     let unfolded = raw
@@ -280,7 +280,7 @@ fn vevent_facts(data: &serde_json::Value) -> VeventFacts {
             f.utc_certain = false;
         }
     }
-    f
+    Ok(f)
 }
 
 /// Largest real UTC offset is UTC+14 (Kiribati); an instant indexed
@@ -309,14 +309,14 @@ const TZ_SLACK: chrono::Duration = chrono::Duration::hours(14);
 /// truncation), and the captured time-range is not validated against
 /// its comp-filter context (a VTODO-scoped range would filter VEVENTs;
 /// the store holds only VEVENTs in v1).
-fn event_in_range(ev: &CalendarEvent, range: &Option<TimeRange>) -> bool {
+fn event_in_range(ev: &CalendarEvent, range: &Option<TimeRange>) -> anyhow::Result<bool> {
+    let facts = vevent_facts(&ev.data)?;
     let Some((range_start, range_end)) = range else {
-        return true;
+        return Ok(true);
     };
     let Some(start) = ev.start_dt.as_deref().and_then(super::parse_stored_dt) else {
-        return true;
+        return Ok(true);
     };
-    let facts = vevent_facts(&ev.data);
     let slack = if facts.utc_certain {
         chrono::Duration::zero()
     } else {
@@ -329,7 +329,7 @@ fn event_in_range(ev: &CalendarEvent, range: &Option<TimeRange>) -> bool {
     };
     let starts_before_range_end = range_end.is_none_or(|re| start < plus(re, slack));
     if facts.recurring {
-        return starts_before_range_end;
+        return Ok(starts_before_range_end);
     }
     let stored_end = ev
         .end_dt
@@ -339,7 +339,7 @@ fn event_in_range(ev: &CalendarEvent, range: &Option<TimeRange>) -> bool {
     // No indexed end but a real DURATION: the true extent is unknown to
     // the index — conservative include (bounded only by the range end).
     if stored_end.is_none() && facts.has_duration {
-        return starts_before_range_end;
+        return Ok(starts_before_range_end);
     }
     let default_dur = if facts.all_day {
         chrono::Duration::days(1)
@@ -347,20 +347,20 @@ fn event_in_range(ev: &CalendarEvent, range: &Option<TimeRange>) -> bool {
         chrono::Duration::seconds(1)
     };
     let end = stored_end.unwrap_or_else(|| plus(start, default_dur));
-    starts_before_range_end && range_start.is_none_or(|rs| plus(end, slack) > rs)
+    Ok(starts_before_range_end && range_start.is_none_or(|rs| plus(end, slack) > rs))
 }
 
-fn event_ics_etag(ev: &CalendarEvent) -> (String, String) {
+fn event_ics_etag(ev: &CalendarEvent) -> anyhow::Result<(String, String)> {
     let parse_dt = super::parse_stored_dt;
-    let ics = cosmix_lib_davproto::ical::event_to_ics(
+    let ics = ical::event_to_ics(
         &ev.uid,
         ev.title.as_deref(),
         ev.start_dt.as_deref().and_then(parse_dt),
         ev.end_dt.as_deref().and_then(parse_dt),
         ev.updated_at.as_deref().and_then(parse_dt),
         &ev.data,
-    );
-    let etag = cosmix_lib_davproto::etag::for_event(
+    )?;
+    let etag = etag::for_event(
         &ev.uid,
         ev.title.as_deref(),
         ev.start_dt.as_deref(),
@@ -368,25 +368,25 @@ fn event_ics_etag(ev: &CalendarEvent) -> (String, String) {
         ev.updated_at.as_deref(),
         &ev.data,
     );
-    (ics, etag)
+    Ok((ics, etag))
 }
 
-fn contact_vcf_etag(c: &Contact) -> (String, String) {
-    let vcf = cosmix_lib_davproto::vcard::contact_to_vcf(
+fn contact_vcf_etag(c: &Contact) -> anyhow::Result<(String, String)> {
+    let vcf = vcard::contact_to_vcf(
+        &c.uid,
+        c.full_name.as_deref(),
+        c.email.as_deref(),
+        c.company.as_deref(),
+        &c.data,
+    )?;
+    let etag = etag::for_contact(
         &c.uid,
         c.full_name.as_deref(),
         c.email.as_deref(),
         c.company.as_deref(),
         &c.data,
     );
-    let etag = cosmix_lib_davproto::etag::for_contact(
-        &c.uid,
-        c.full_name.as_deref(),
-        c.email.as_deref(),
-        c.company.as_deref(),
-        &c.data,
-    );
-    (vcf, etag)
+    Ok((vcf, etag))
 }
 
 /// Max member changes returned in one sync-collection response. If a
@@ -405,7 +405,7 @@ pub async fn handle(
     if parsed.malformed {
         return super::bad_request();
     }
-    match (resource, &parsed.kind) {
+    let result = match (resource, &parsed.kind) {
         (Resource::Calendar { calendar_id, .. }, Kind::SyncCollection) => {
             calendar_sync(state, account, calendar_id, &parsed).await
         }
@@ -419,8 +419,12 @@ pub async fn handle(
             addressbook_report(state, account, book_id, parsed).await
         }
         // REPORT is only meaningful on a collection in v1.
-        _ => super::not_found(),
-    }
+        _ => Ok(super::not_found()),
+    };
+    result.unwrap_or_else(|error| {
+        tracing::warn!(target: "maild::dav", %error, "REPORT representation failed");
+        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+    })
 }
 
 /// Parse the destroyed/created/updated id lists (strings) into UUIDs,
@@ -434,33 +438,33 @@ async fn calendar_sync(
     account: i32,
     calendar_id: &str,
     parsed: &Parsed,
-) -> Response {
+) -> anyhow::Result<Response> {
     let Ok(cal_uuid) = calendar_id.parse::<Uuid>() else {
-        return super::not_found();
+        return Ok(super::not_found());
     };
     // The collection must exist for this account — don't return a 207 for
     // a phantom/foreign collection id.
     match db::calendar::get_by_ids(&state.db.conn, account, &[cal_uuid]).await {
         Ok(v) if !v.is_empty() => {}
-        Ok(_) => return super::not_found(),
+        Ok(_) => return Ok(super::not_found()),
         Err(e) => {
             tracing::warn!(target: "maild::dav", error = %e, "sync: collection lookup failed");
-            return super::server_error();
+            return Err(e);
         }
     }
     // Resolve the client's sync-token → changelog state.
     let Some(since) = super::parse_sync_token(parsed.sync_token.as_deref()) else {
-        return super::invalid_sync_token();
+        return Ok(super::invalid_sync_token());
     };
     // A non-initial token must be one we actually issued (RFC 6578 §3.7).
     match crate::db::changelog::is_valid_state(&state.db.conn, account, "CalendarEvent", since)
         .await
     {
         Ok(true) => {}
-        Ok(false) => return super::invalid_sync_token(),
+        Ok(false) => return Ok(super::invalid_sync_token()),
         Err(e) => {
             tracing::warn!(target: "maild::dav", error = %e, "sync: state validation failed");
-            return super::server_error();
+            return Err(e);
         }
     }
 
@@ -476,7 +480,7 @@ async fn calendar_sync(
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(target: "maild::dav", error = %e, "sync: changes_since failed");
-            return super::server_error();
+            return Err(e);
         }
     };
 
@@ -489,7 +493,7 @@ async fn calendar_sync(
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(target: "maild::dav", error = %e, "sync: fetch changed failed");
-            return super::server_error();
+            return Err(e);
         }
     };
 
@@ -500,7 +504,7 @@ async fn calendar_sync(
             continue;
         }
         let href = format!("/dav/calendars/{account}/{calendar_id}/{}.ics", ev.uid);
-        let (_, etag) = event_ics_etag(ev);
+        let (_, etag) = event_ics_etag(ev)?;
         out.push_str(&xml::object_listing(
             &href,
             &etag,
@@ -528,12 +532,12 @@ async fn calendar_sync(
         }
         Err(e) => {
             tracing::warn!(target: "maild::dav", error = %e, "sync: tombstone lookup failed");
-            return super::server_error();
+            return Err(e);
         }
     }
 
     let token = super::sync_token_string(&changes.new_state);
-    xml::sync_multistatus_response(&out, &token)
+    Ok(xml::sync_multistatus_response(&out, &token))
 }
 
 async fn addressbook_sync(
@@ -541,27 +545,27 @@ async fn addressbook_sync(
     account: i32,
     book_id: &str,
     parsed: &Parsed,
-) -> Response {
+) -> anyhow::Result<Response> {
     let Ok(book_uuid) = book_id.parse::<Uuid>() else {
-        return super::not_found();
+        return Ok(super::not_found());
     };
     match db::contact::get_books_by_ids(&state.db.conn, account, &[book_uuid]).await {
         Ok(v) if !v.is_empty() => {}
-        Ok(_) => return super::not_found(),
+        Ok(_) => return Ok(super::not_found()),
         Err(e) => {
             tracing::warn!(target: "maild::dav", error = %e, "sync: collection lookup failed");
-            return super::server_error();
+            return Err(e);
         }
     }
     let Some(since) = super::parse_sync_token(parsed.sync_token.as_deref()) else {
-        return super::invalid_sync_token();
+        return Ok(super::invalid_sync_token());
     };
     match crate::db::changelog::is_valid_state(&state.db.conn, account, "Contact", since).await {
         Ok(true) => {}
-        Ok(false) => return super::invalid_sync_token(),
+        Ok(false) => return Ok(super::invalid_sync_token()),
         Err(e) => {
             tracing::warn!(target: "maild::dav", error = %e, "sync: state validation failed");
-            return super::server_error();
+            return Err(e);
         }
     }
 
@@ -577,7 +581,7 @@ async fn addressbook_sync(
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(target: "maild::dav", error = %e, "sync: changes_since failed");
-            return super::server_error();
+            return Err(e);
         }
     };
 
@@ -587,7 +591,7 @@ async fn addressbook_sync(
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(target: "maild::dav", error = %e, "sync: fetch changed failed");
-            return super::server_error();
+            return Err(e);
         }
     };
 
@@ -598,7 +602,7 @@ async fn addressbook_sync(
             continue;
         }
         let href = format!("/dav/addressbooks/{account}/{book_id}/{}.vcf", c.uid);
-        let (_, etag) = contact_vcf_etag(c);
+        let (_, etag) = contact_vcf_etag(c)?;
         out.push_str(&xml::object_listing(
             &href,
             &etag,
@@ -622,12 +626,12 @@ async fn addressbook_sync(
         }
         Err(e) => {
             tracing::warn!(target: "maild::dav", error = %e, "sync: tombstone lookup failed");
-            return super::server_error();
+            return Err(e);
         }
     }
 
     let token = super::sync_token_string(&changes.new_state);
-    xml::sync_multistatus_response(&out, &token)
+    Ok(xml::sync_multistatus_response(&out, &token))
 }
 
 async fn calendar_report(
@@ -635,22 +639,22 @@ async fn calendar_report(
     account: i32,
     calendar_id: &str,
     parsed: Parsed,
-) -> Response {
+) -> anyhow::Result<Response> {
     // A parser error anywhere in the body → 400 (don't trust a partial
     // parse, even if the root element was recognised).
     if parsed.malformed {
-        return super::bad_request();
+        return Ok(super::bad_request());
     }
     // Reject a REPORT root that isn't a calendar report (a CardDAV report
     // mis-sent here, or an unknown root) rather than silently running an
     // expensive query-all.
     match parsed.kind {
         Kind::CalendarMultiget | Kind::CalendarQuery => {}
-        _ => return super::bad_request(),
+        _ => return Ok(super::bad_request()),
     }
 
     let Ok(cal_uuid) = calendar_id.parse::<Uuid>() else {
-        return super::not_found();
+        return Ok(super::not_found());
     };
 
     let mut out = String::new();
@@ -681,10 +685,11 @@ async fn calendar_report(
                         .await
                     {
                         Ok(Some(ev)) => {
-                            let (ics, etag) = event_ics_etag(&ev);
+                            let (ics, etag) = event_ics_etag(&ev)?;
                             out.push_str(&xml::object_with_data(h, &etag, CAL_DATA, &ics));
                         }
-                        _ => out.push_str(&xml::object_not_found(h)),
+                        Ok(None) => out.push_str(&xml::object_not_found(h)),
+                        Err(error) => return Err(error),
                     }
                 }
                 _ => out.push_str(&xml::object_not_found(h)),
@@ -705,23 +710,23 @@ async fn calendar_report(
         {
             Ok(events) => {
                 super::warn_if_capped(events.len(), "calendar-query REPORT");
-                for ev in events
-                    .iter()
-                    .filter(|ev| event_in_range(ev, &parsed.time_range))
-                {
+                for ev in &events {
+                    if !event_in_range(ev, &parsed.time_range)? {
+                        continue;
+                    }
                     let href = format!("/dav/calendars/{account}/{calendar_id}/{}.ics", ev.uid);
-                    let (ics, etag) = event_ics_etag(ev);
+                    let (ics, etag) = event_ics_etag(ev)?;
                     out.push_str(&xml::object_with_data(&href, &etag, CAL_DATA, &ics));
                 }
             }
             Err(e) => {
                 tracing::warn!(target: "maild::dav", error = %e, "calendar REPORT failed");
-                return super::server_error();
+                return Err(e);
             }
         }
     }
 
-    xml::multistatus_response(xml::wrap_multistatus(&out))
+    Ok(xml::multistatus_response(xml::wrap_multistatus(&out)))
 }
 
 async fn addressbook_report(
@@ -729,17 +734,17 @@ async fn addressbook_report(
     account: i32,
     book_id: &str,
     parsed: Parsed,
-) -> Response {
+) -> anyhow::Result<Response> {
     if parsed.malformed {
-        return super::bad_request();
+        return Ok(super::bad_request());
     }
     match parsed.kind {
         Kind::AddressbookMultiget | Kind::AddressbookQuery => {}
-        _ => return super::bad_request(),
+        _ => return Ok(super::bad_request()),
     }
 
     let Ok(book_uuid) = book_id.parse::<Uuid>() else {
-        return super::not_found();
+        return Ok(super::not_found());
     };
 
     let mut out = String::new();
@@ -764,10 +769,11 @@ async fn addressbook_report(
                         .await
                     {
                         Ok(Some(c)) => {
-                            let (vcf, etag) = contact_vcf_etag(&c);
+                            let (vcf, etag) = contact_vcf_etag(&c)?;
                             out.push_str(&xml::object_with_data(h, &etag, ADDR_DATA, &vcf));
                         }
-                        _ => out.push_str(&xml::object_not_found(h)),
+                        Ok(None) => out.push_str(&xml::object_not_found(h)),
+                        Err(error) => return Err(error),
                     }
                 }
                 _ => out.push_str(&xml::object_not_found(h)),
@@ -786,18 +792,18 @@ async fn addressbook_report(
                 super::warn_if_capped(contacts.len(), "addressbook-query REPORT");
                 for c in &contacts {
                     let href = format!("/dav/addressbooks/{account}/{book_id}/{}.vcf", c.uid);
-                    let (vcf, etag) = contact_vcf_etag(c);
+                    let (vcf, etag) = contact_vcf_etag(c)?;
                     out.push_str(&xml::object_with_data(&href, &etag, ADDR_DATA, &vcf));
                 }
             }
             Err(e) => {
                 tracing::warn!(target: "maild::dav", error = %e, "addressbook REPORT failed");
-                return super::server_error();
+                return Err(e);
             }
         }
     }
 
-    xml::multistatus_response(xml::wrap_multistatus(&out))
+    Ok(xml::multistatus_response(xml::wrap_multistatus(&out)))
 }
 
 #[cfg(test)]
@@ -885,7 +891,7 @@ mod tests {
             Some("2026-06-15 10:00:00"),
             serde_json::json!({}),
         );
-        assert!(event_in_range(&ev, &june_range()));
+        assert!(event_in_range(&ev, &june_range()).unwrap());
     }
 
     #[test]
@@ -895,7 +901,7 @@ mod tests {
             Some("2026-01-10 10:00:00"),
             serde_json::json!({}),
         );
-        assert!(!event_in_range(&ev, &june_range()));
+        assert!(!event_in_range(&ev, &june_range()).unwrap());
     }
 
     #[test]
@@ -905,20 +911,20 @@ mod tests {
             Some("2026-06-01 01:00:00"),
             serde_json::json!({}),
         );
-        assert!(event_in_range(&ev, &june_range()));
+        assert!(event_in_range(&ev, &june_range()).unwrap());
     }
 
     #[test]
     fn time_range_point_event_at_range_start_included() {
         let ev = mk_event(Some("2026-06-01 00:00:00"), None, serde_json::json!({}));
-        assert!(event_in_range(&ev, &june_range()));
+        assert!(event_in_range(&ev, &june_range()).unwrap());
     }
 
     #[test]
     fn time_range_recurring_old_start_conservatively_included() {
         // Weekly event started in January — instances may fall in June.
         let data = serde_json::json!({
-            "cosmix:rawICalendar":
+            "mixos:rawICalendar":
                 "BEGIN:VEVENT\r\nDTSTART:20260110T090000Z\r\nRRULE:FREQ=WEEKLY\r\nEND:VEVENT\r\n"
         });
         let ev = mk_event(
@@ -926,7 +932,7 @@ mod tests {
             Some("2026-01-10 10:00:00"),
             data,
         );
-        assert!(event_in_range(&ev, &june_range()));
+        assert!(event_in_range(&ev, &june_range()).unwrap());
     }
 
     #[test]
@@ -934,7 +940,7 @@ mod tests {
         // First instance is after the queried window — no instance can
         // precede DTSTART, so exclusion is safe even for recurrence.
         let data = serde_json::json!({
-            "cosmix:rawICalendar":
+            "mixos:rawICalendar":
                 "BEGIN:VEVENT\r\nDTSTART:20261001T090000Z\r\nRRULE:FREQ=WEEKLY\r\nEND:VEVENT\r\n"
         });
         let ev = mk_event(
@@ -942,13 +948,13 @@ mod tests {
             Some("2026-10-01 10:00:00"),
             data,
         );
-        assert!(!event_in_range(&ev, &june_range()));
+        assert!(!event_in_range(&ev, &june_range()).unwrap());
     }
 
     #[test]
     fn no_time_range_matches_everything() {
         let ev = mk_event(Some("1999-01-01 00:00:00"), None, serde_json::json!({}));
-        assert!(event_in_range(&ev, &None));
+        assert!(event_in_range(&ev, &None).unwrap());
     }
 
     #[test]
@@ -956,7 +962,7 @@ mod tests {
         // RFC 5545 §3.6.1: a DATE VEVENT without DTEND lasts one day. A
         // June 15 all-day event must match a range starting June 15 noon.
         let data = serde_json::json!({
-            "cosmix:rawICalendar":
+            "mixos:rawICalendar":
                 "BEGIN:VEVENT\r\nUID:a\r\nDTSTART;VALUE=DATE:20260615\r\nEND:VEVENT\r\n"
         });
         let ev = mk_event(Some("2026-06-15 00:00:00"), None, data);
@@ -964,7 +970,7 @@ mod tests {
             parse_caldav_utc("20260615T120000Z"),
             parse_caldav_utc("20260616T000000Z"),
         ));
-        assert!(event_in_range(&ev, &range));
+        assert!(event_in_range(&ev, &range).unwrap());
     }
 
     #[test]
@@ -975,7 +981,7 @@ mod tests {
         // Brisbane event indexed at "2026-05-31 18:00" (true UTC June 1
         // 04:00) must not vanish from a June query.
         let data = serde_json::json!({
-            "cosmix:rawICalendar":
+            "mixos:rawICalendar":
                 "BEGIN:VEVENT\r\nUID:b\r\nDTSTART;TZID=Australia/Brisbane:20260531T180000\r\nEND:VEVENT\r\n"
         });
         let ev = mk_event(
@@ -983,7 +989,7 @@ mod tests {
             Some("2026-05-31 19:00:00"),
             data,
         );
-        assert!(event_in_range(&ev, &june_range()));
+        assert!(event_in_range(&ev, &june_range()).unwrap());
     }
 
     #[test]
@@ -991,7 +997,7 @@ mod tests {
         // A UTC-stamped event just before the range must stay excluded —
         // slack applies only to non-UTC-certain instants.
         let data = serde_json::json!({
-            "cosmix:rawICalendar":
+            "mixos:rawICalendar":
                 "BEGIN:VEVENT\r\nUID:c\r\nDTSTART:20260531T180000Z\r\nDTEND:20260531T190000Z\r\nEND:VEVENT\r\n"
         });
         let ev = mk_event(
@@ -999,7 +1005,7 @@ mod tests {
             Some("2026-05-31 19:00:00"),
             data,
         );
-        assert!(!event_in_range(&ev, &june_range()));
+        assert!(!event_in_range(&ev, &june_range()).unwrap());
     }
 
     #[test]
@@ -1008,19 +1014,19 @@ mod tests {
         // (single) VEVENT as recurring — else an out-of-range one-off
         // with an old DTSTART would leak into every future query.
         let data = serde_json::json!({
-            "cosmix:rawICalendar":
+            "mixos:rawICalendar":
                 "BEGIN:VCALENDAR\r\nBEGIN:VTIMEZONE\r\nTZID:Europe/Berlin\r\n\
                  BEGIN:DAYLIGHT\r\nRRULE:FREQ=YEARLY;BYMONTH=3\r\nEND:DAYLIGHT\r\nEND:VTIMEZONE\r\n\
                  BEGIN:VEVENT\r\nUID:d\r\nDTSTART:20260110T090000Z\r\nDTEND:20260110T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
         });
-        let facts = vevent_facts(&data);
+        let facts = vevent_facts(&data).unwrap();
         assert!(!facts.recurring);
         let ev = mk_event(
             Some("2026-01-10 09:00:00"),
             Some("2026-01-10 10:00:00"),
             data,
         );
-        assert!(!event_in_range(&ev, &june_range()));
+        assert!(!event_in_range(&ev, &june_range()).unwrap());
     }
 
     #[test]
@@ -1029,7 +1035,7 @@ mod tests {
         // index has no end for these — a 09:00Z + PT8H event must match
         // a noon query.
         let data = serde_json::json!({
-            "cosmix:rawICalendar":
+            "mixos:rawICalendar":
                 "BEGIN:VEVENT\r\nUID:f\r\nDTSTART:20260615T090000Z\r\nDURATION:PT8H\r\nEND:VEVENT\r\n"
         });
         let ev = mk_event(Some("2026-06-15 09:00:00"), None, data);
@@ -1037,7 +1043,7 @@ mod tests {
             parse_caldav_utc("20260615T120000Z"),
             parse_caldav_utc("20260616T000000Z"),
         ));
-        assert!(event_in_range(&ev, &range));
+        assert!(event_in_range(&ev, &range).unwrap());
     }
 
     #[test]
@@ -1045,17 +1051,17 @@ mod tests {
         // UTC DTSTART + TZID DTEND: end certainty matters near the lower
         // range boundary — the event must get slack, not exact compare.
         let data = serde_json::json!({
-            "cosmix:rawICalendar":
+            "mixos:rawICalendar":
                 "BEGIN:VEVENT\r\nUID:g\r\nDTSTART:20260531T180000Z\r\n\
                  DTEND;TZID=Australia/Brisbane:20260601T050000\r\nEND:VEVENT\r\n"
         });
-        assert!(!vevent_facts(&data).utc_certain);
+        assert!(!vevent_facts(&data).unwrap().utc_certain);
         let ev = mk_event(
             Some("2026-05-31 18:00:00"),
             Some("2026-06-01 05:00:00"),
             data,
         );
-        assert!(event_in_range(&ev, &june_range()));
+        assert!(event_in_range(&ev, &june_range()).unwrap());
     }
 
     #[test]
@@ -1063,7 +1069,7 @@ mod tests {
         // Slack addition to a client-supplied range edge near the
         // representable maximum must clamp, not overflow.
         let data = serde_json::json!({
-            "cosmix:rawICalendar":
+            "mixos:rawICalendar":
                 "BEGIN:VEVENT\r\nUID:h\r\nDTSTART;TZID=X/Y:99991231T220000\r\nEND:VEVENT\r\n"
         });
         let ev = mk_event(Some("9999-12-31 22:00:00"), None, data);
@@ -1071,7 +1077,7 @@ mod tests {
             parse_caldav_utc("99990101T000000Z"),
             parse_caldav_utc("99991231T235959Z"),
         ));
-        assert!(event_in_range(&ev, &range));
+        assert!(event_in_range(&ev, &range).unwrap());
     }
 
     #[test]
@@ -1079,10 +1085,10 @@ mod tests {
         // RRULE folded across physical lines must still classify as
         // recurring after unfolding.
         let data = serde_json::json!({
-            "cosmix:rawICalendar":
+            "mixos:rawICalendar":
                 "BEGIN:VEVENT\r\nUID:e\r\nDTSTART:20260110T090000Z\r\nRRU\r\n LE:FREQ=WEEKLY\r\nEND:VEVENT\r\n"
         });
-        assert!(vevent_facts(&data).recurring);
+        assert!(vevent_facts(&data).unwrap().recurring);
     }
 
     #[test]

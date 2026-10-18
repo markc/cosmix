@@ -10,7 +10,16 @@
 /// Key under which a DAV PUT stashes the client's **verbatim** vCard in
 /// the stored JSContact `data`, for a lossless GET round-trip. JMAP-
 /// created contacts have no such key and emit from their fields.
-pub const RAW_VCARD_KEY: &str = "cosmix:rawVCard";
+pub const RAW_VCARD_KEY: &str = "mixos:rawVCard";
+
+/// Retired wire key, used only to reject data that needs migration.
+pub const RETIRED_VCARD_KEY: &str = "cosmix:rawVCard";
+
+/// Read the verbatim representation, rejecting retired keys before any fallback.
+pub fn raw_vcard(data: &serde_json::Value) -> anyhow::Result<Option<&str>> {
+    crate::validate_raw_keys(data)?;
+    Ok(data.get(RAW_VCARD_KEY).and_then(|v| v.as_str()))
+}
 
 /// Escape a vCard text value (RFC 6350 §3.4): backslash, comma, semicolon,
 /// and newline are escaped; bare CR is dropped.
@@ -38,9 +47,9 @@ pub fn contact_to_vcf(
     email: Option<&str>,
     company: Option<&str>,
     data: &serde_json::Value,
-) -> String {
-    if let Some(raw) = data.get(RAW_VCARD_KEY).and_then(|v| v.as_str()) {
-        return raw.to_string();
+) -> anyhow::Result<String> {
+    if let Some(raw) = raw_vcard(data)? {
+        return Ok(raw.to_string());
     }
     let mut lines = vec!["BEGIN:VCARD".to_string(), "VERSION:4.0".to_string()];
     lines.push(format!("UID:{}", esc(uid)));
@@ -56,13 +65,13 @@ pub fn contact_to_vcf(
     if let Some(c) = company {
         lines.push(format!("ORG:{}", esc(c)));
     }
-    if let Some(ph) = primary_phone(data) {
+    if let Some(ph) = primary_phone(data)? {
         lines.push(format!("TEL:{}", esc(&ph)));
     }
     lines.push("END:VCARD".to_string());
     let mut out = lines.join("\r\n");
     out.push_str("\r\n");
-    out
+    Ok(out)
 }
 
 /// The fields a DAV PUT extracts from an incoming vCard: the indexed
@@ -249,7 +258,8 @@ pub fn patch_vcf(
 /// `phones` entry's `number`, falling back to the first `TEL` line of a
 /// stashed vCard ([`RAW_VCARD_KEY`]) — so TB-imported contacts (whose
 /// phone lives only in the raw vCard) surface a number too.
-pub fn primary_phone(data: &serde_json::Value) -> Option<String> {
+pub fn primary_phone(data: &serde_json::Value) -> anyhow::Result<Option<String>> {
+    let raw = raw_vcard(data)?;
     if let Some(num) = data
         .get("phones")
         .and_then(|v| v.as_object())
@@ -258,9 +268,9 @@ pub fn primary_phone(data: &serde_json::Value) -> Option<String> {
         .and_then(|n| n.as_str())
         && !num.is_empty()
     {
-        return Some(num.to_string());
+        return Ok(Some(num.to_string()));
     }
-    if let Some(raw) = data.get(RAW_VCARD_KEY).and_then(|v| v.as_str()) {
+    if let Some(raw) = raw {
         for line in unfold(raw).lines() {
             let l = line.trim_end_matches('\r');
             let prop = l
@@ -273,18 +283,19 @@ pub fn primary_phone(data: &serde_json::Value) -> Option<String> {
             {
                 let v = unesc(l[i + 1..].trim());
                 if !v.is_empty() {
-                    return Some(v);
+                    return Ok(Some(v));
                 }
             }
         }
     }
-    None
+    Ok(None)
 }
 
 /// Set the primary phone `number` in a JSContact `data`, **preserving**
 /// any existing `phones` map (siblings + per-phone metadata): updates the
 /// first entry's `number`, or creates a `default` entry if none exist.
-pub fn set_primary_phone(data: &mut serde_json::Value, number: &str) {
+pub fn set_primary_phone(data: &mut serde_json::Value, number: &str) -> anyhow::Result<()> {
+    crate::validate_raw_keys(data)?;
     if let Some(map) = data.get_mut("phones").and_then(|v| v.as_object_mut()) {
         if let Some(k) = map.keys().next().cloned() {
             if let Some(obj) = map.get_mut(&k) {
@@ -296,6 +307,7 @@ pub fn set_primary_phone(data: &mut serde_json::Value, number: &str) {
     } else {
         data["phones"] = serde_json::json!({ "default": { "number": number } });
     }
+    Ok(())
 }
 
 /// JSContact `name.full` — the formatted full name, if present.
@@ -310,6 +322,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn retired_vcard_key_errors_before_raw_or_field_fallback() {
+        let expected = format!(
+            "retired wire key {RETIRED_VCARD_KEY:?} present: migrate the stored object to {RAW_VCARD_KEY:?}"
+        );
+        for retired_value in [serde_json::json!("old body"), serde_json::Value::Null] {
+            let mut data = serde_json::json!({
+                "name": { "full": "Field fallback" },
+                "phones": { "default": { "number": "123" } }
+            });
+            data[RETIRED_VCARD_KEY] = retired_value;
+            for current_value in [None, Some("current body")] {
+                if let Some(raw) = current_value {
+                    data[RAW_VCARD_KEY] = serde_json::json!(raw);
+                }
+                assert_eq!(raw_vcard(&data).unwrap_err().to_string(), expected);
+                assert_eq!(
+                    contact_to_vcf("u", Some("Field fallback"), None, None, &data)
+                        .unwrap_err()
+                        .to_string(),
+                    expected
+                );
+                assert_eq!(primary_phone(&data).unwrap_err().to_string(), expected);
+                let original = data.clone();
+                assert_eq!(
+                    set_primary_phone(&mut data, "456").unwrap_err().to_string(),
+                    expected
+                );
+                assert_eq!(data, original);
+            }
+        }
+    }
+
+    #[test]
     fn emits_valid_vcard() {
         let data = serde_json::json!({});
         let vcf = contact_to_vcf(
@@ -318,7 +363,7 @@ mod tests {
             Some("ada@example.com"),
             Some("Analytical Engines"),
             &data,
-        );
+        ).unwrap();
         assert!(vcf.starts_with("BEGIN:VCARD\r\nVERSION:4.0\r\n"));
         assert!(vcf.contains("UID:c-1\r\n"));
         assert!(vcf.contains("FN:Ada Lovelace\r\n"));
@@ -331,37 +376,37 @@ mod tests {
     fn set_primary_phone_preserves_siblings_and_metadata() {
         let mut d =
             serde_json::json!({"phones":{"home":{"number":"111","features":{"voice":true}}}});
-        set_primary_phone(&mut d, "999");
+        set_primary_phone(&mut d, "999").unwrap();
         assert_eq!(d["phones"]["home"]["number"], "999"); // first entry updated
         assert_eq!(d["phones"]["home"]["features"]["voice"], true); // metadata kept
         let mut e = serde_json::json!({"@type":"Card"});
-        set_primary_phone(&mut e, "555");
+        set_primary_phone(&mut e, "555").unwrap();
         assert_eq!(e["phones"]["default"]["number"], "555"); // created when absent
     }
 
     #[test]
     fn primary_phone_raw_fallback_exact_tel() {
         // A custom `TELX:` must not be mistaken for `TEL:`.
-        let d = serde_json::json!({"cosmix:rawVCard":
+        let d = serde_json::json!({"mixos:rawVCard":
             "BEGIN:VCARD\r\nFN:N\r\nTELX:nope\r\nTEL;TYPE=cell:real\r\nEND:VCARD\r\n"});
-        assert_eq!(primary_phone(&d).as_deref(), Some("real"));
+        assert_eq!(primary_phone(&d).unwrap().as_deref(), Some("real"));
     }
 
     #[test]
     fn fn_falls_back_to_jscontact_then_uid() {
         let data = serde_json::json!({ "name": { "full": "Grace Hopper" } });
-        let vcf = contact_to_vcf("c-2", None, None, None, &data);
+        let vcf = contact_to_vcf("c-2", None, None, None, &data).unwrap();
         assert!(vcf.contains("FN:Grace Hopper\r\n"));
 
         let empty = serde_json::json!({});
-        let vcf2 = contact_to_vcf("c-3", None, None, None, &empty);
+        let vcf2 = contact_to_vcf("c-3", None, None, None, &empty).unwrap();
         assert!(vcf2.contains("FN:c-3\r\n"));
     }
 
     #[test]
     fn escapes_special_chars() {
         let data = serde_json::json!({});
-        let vcf = contact_to_vcf("c-4", Some("Doe; John, Jr."), None, None, &data);
+        let vcf = contact_to_vcf("c-4", Some("Doe; John, Jr."), None, None, &data).unwrap();
         assert!(vcf.contains("FN:Doe\\; John\\, Jr.\r\n"));
     }
 
@@ -382,7 +427,7 @@ mod tests {
         let vcf = "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:u\r\nFN:N\r\n\
                    X-CUSTOM:keep-me\r\nEND:VCARD\r\n";
         let p = parse_vcf(vcf).unwrap();
-        let out = contact_to_vcf("u", Some("N"), None, None, &p.data);
+        let out = contact_to_vcf("u", Some("N"), None, None, &p.data).unwrap();
         assert_eq!(out, vcf);
         assert!(out.contains("X-CUSTOM:keep-me"));
     }
@@ -413,11 +458,11 @@ mod tests {
             "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:T\r\nTEL;TYPE=cell:+61400000000\r\nEND:VCARD\r\n",
         )
         .unwrap();
-        assert_eq!(primary_phone(&p.data).as_deref(), Some("+61400000000"));
+        assert_eq!(primary_phone(&p.data).unwrap().as_deref(), Some("+61400000000"));
         assert_eq!(p.data["phones"]["default"]["number"], "+61400000000"); // also structured
         // emit builds a TEL from data.phones for a non-raw contact.
         let data = serde_json::json!({"phones":{"x":{"number":"123"}}});
-        assert!(contact_to_vcf("u", Some("N"), None, None, &data).contains("TEL:123\r\n"));
+        assert!(contact_to_vcf("u", Some("N"), None, None, &data).unwrap().contains("TEL:123\r\n"));
         // patch updates the TEL value, keeping its params + other lines.
         let raw =
             "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:N\r\nTEL;TYPE=cell:111\r\nNOTE:keep\r\nEND:VCARD\r\n";

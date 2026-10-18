@@ -4,6 +4,7 @@
 //! JMAP Calendar + CalendarEvent methods (JSCalendar, RFC 8984).
 
 use anyhow::Result;
+use cosmix_lib_davproto::ical;
 use uuid::Uuid;
 
 use super::types::*;
@@ -268,6 +269,7 @@ pub async fn event_set(
 
     if let Some(create) = args.get("create").and_then(|v| v.as_object()) {
         for (client_id, obj) in create {
+            cosmix_lib_davproto::validate_raw_keys(obj)?;
             let calendar_id = obj
                 .get("calendarId")
                 .and_then(|v| v.as_str())
@@ -321,6 +323,7 @@ pub async fn event_set(
 
     if let Some(update) = args.get("update").and_then(|v| v.as_object()) {
         for (id_str, patch) in update {
+            cosmix_lib_davproto::validate_raw_keys(patch)?;
             let Ok(id) = id_str.parse::<Uuid>() else {
                 continue;
             };
@@ -354,13 +357,11 @@ pub async fn event_set(
             if let Some(t) = patch_title {
                 data["title"] = serde_json::Value::String(t.to_string());
             }
-            if let Some(raw) = data
-                .get(cosmix_lib_davproto::ical::RAW_ICAL_KEY)
-                .and_then(|v| v.as_str())
+            if let Some(raw) = ical::raw_ical(&data)?
             {
                 let patched =
-                    cosmix_lib_davproto::ical::patch_ics(raw, patch_title, patch_start, patch_end);
-                data[cosmix_lib_davproto::ical::RAW_ICAL_KEY] = serde_json::Value::String(patched);
+                    ical::patch_ics(raw, patch_title, patch_start, patch_end);
+                data[ical::RAW_ICAL_KEY] = serde_json::Value::String(patched);
             }
             if db::calendar::update_event(&db.conn, account_id, id, &data, title, start_dt, end_dt)
                 .await?

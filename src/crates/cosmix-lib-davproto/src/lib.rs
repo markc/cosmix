@@ -13,3 +13,19 @@
 pub mod etag;
 pub mod ical;
 pub mod vcard;
+
+/// Reject retired raw representation keys, even when their value is null or
+/// the replacement key is also present. Call before reading or changing data.
+pub fn validate_raw_keys(data: &serde_json::Value) -> anyhow::Result<()> {
+    for (retired, current) in [
+        (ical::RETIRED_ICAL_KEY, ical::RAW_ICAL_KEY),
+        (vcard::RETIRED_VCARD_KEY, vcard::RAW_VCARD_KEY),
+    ] {
+        if data.get(retired).is_some() {
+            anyhow::bail!(
+                "retired wire key {retired:?} present: migrate the stored object to {current:?}"
+            );
+        }
+    }
+    Ok(())
+}

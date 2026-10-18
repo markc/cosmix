@@ -70,6 +70,9 @@ fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<CalendarEvent> {
     let data_json: String = row.get(4)?;
     let data: serde_json::Value = serde_json::from_str(&data_json).unwrap_or(serde_json::json!({}));
 
+    cosmix_lib_davproto::validate_raw_keys(&data).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, error.into())
+    })?;
     Ok(CalendarEvent {
         id: row.get(0)?,
         calendar_id: row.get(1)?,
@@ -354,6 +357,7 @@ pub async fn conditional_upsert_event_by_uid(
     let conn = conn.clone();
     let cal = calendar_id.to_string();
     let uid = uid.to_string();
+    cosmix_lib_davproto::validate_raw_keys(data)?;
     let data_json = serde_json::to_string(data)?;
     let title = title.map(|s| s.to_string());
     let start = start_dt.map(|d| d.to_rfc3339());
@@ -505,6 +509,7 @@ fn read_event_etag_row(
             let (id, title, start, end, updated, data_json) = row?;
             let data: serde_json::Value =
                 serde_json::from_str(&data_json).unwrap_or(serde_json::json!({}));
+            cosmix_lib_davproto::validate_raw_keys(&data)?;
             let etag = cosmix_lib_davproto::etag::for_event(
                 uid,
                 title.as_deref(),
@@ -672,6 +677,7 @@ pub async fn create_event(
     let conn = conn.clone();
     let calendar_id_str = calendar_id.to_string();
     let uid = uid.to_string();
+    cosmix_lib_davproto::validate_raw_keys(data)?;
     let data_json = serde_json::to_string(data)?;
     let title = title.map(|s| s.to_string());
     let start_str = start_dt.map(|d| d.to_rfc3339());
@@ -713,6 +719,7 @@ pub async fn update_event(
 ) -> Result<bool> {
     let conn = conn.clone();
     let id_str = id.to_string();
+    cosmix_lib_davproto::validate_raw_keys(data)?;
     let data_json = serde_json::to_string(data)?;
     let title = title.map(|s| s.to_string());
     let start_str = start_dt.map(|d| d.to_rfc3339());

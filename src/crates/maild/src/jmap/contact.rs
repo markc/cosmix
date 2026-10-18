@@ -4,6 +4,7 @@
 //! JMAP AddressBook + Contact methods (JSContact, RFC 9553).
 
 use anyhow::Result;
+use cosmix_lib_davproto::vcard;
 use uuid::Uuid;
 
 use super::types::*;
@@ -282,6 +283,7 @@ pub async fn contact_set(
 
     if let Some(create) = args.get("create").and_then(|v| v.as_object()) {
         for (client_id, obj) in create {
+            cosmix_lib_davproto::validate_raw_keys(obj)?;
             let addressbook_id = obj
                 .get("addressBookId")
                 .and_then(|v| v.as_str())
@@ -329,7 +331,7 @@ pub async fn contact_set(
             // existing phones map).
             let mut data = obj.clone();
             if let Some(p) = phone {
-                cosmix_lib_davproto::vcard::set_primary_phone(&mut data, p);
+                vcard::set_primary_phone(&mut data, p)?;
             }
 
             match db::contact::create_contact(
@@ -360,6 +362,7 @@ pub async fn contact_set(
 
     if let Some(update) = args.get("update").and_then(|v| v.as_object()) {
         for (id_str, patch) in update {
+            cosmix_lib_davproto::validate_raw_keys(patch)?;
             let Ok(id) = id_str.parse::<Uuid>() else {
                 continue;
             };
@@ -408,22 +411,20 @@ pub async fn contact_set(
                 data["name"] = serde_json::json!({ "full": fname });
             }
             if let Some(p) = patch_phone {
-                cosmix_lib_davproto::vcard::set_primary_phone(&mut data, p);
+                vcard::set_primary_phone(&mut data, p)?;
             }
             // Patch only the changed lines of the verbatim vCard, keeping
             // its other lines, so DAV clients see the edit too.
-            if let Some(raw) = data
-                .get(cosmix_lib_davproto::vcard::RAW_VCARD_KEY)
-                .and_then(|v| v.as_str())
+            if let Some(raw) = vcard::raw_vcard(&data)?
             {
-                let patched = cosmix_lib_davproto::vcard::patch_vcf(
+                let patched = vcard::patch_vcf(
                     raw,
                     patch_full,
                     patch_email,
                     patch_company,
                     patch_phone,
                 );
-                data[cosmix_lib_davproto::vcard::RAW_VCARD_KEY] =
+                data[vcard::RAW_VCARD_KEY] =
                     serde_json::Value::String(patched);
             }
             if db::contact::update_contact(

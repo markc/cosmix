@@ -51,10 +51,17 @@ The emitted event always receives a deterministic `DTSTAMP`. The function uses
 `updated`, then `start`, then the Unix epoch. It does not use the current time,
 so repeated reads of unchanged inputs produce the same representation.
 
-`RAW_ICAL_KEY` is `cosmix:rawICalendar`. When the JSON data contains a string
+`RAW_ICAL_KEY` is `mixos:rawICalendar`. When the JSON data contains a string
 under this key, `event_to_ics` returns that string unchanged instead of
 rebuilding the event. This preserves fields that the structured mapper does not
 model.
+
+`event_to_ics` and `raw_ical` return `anyhow::Result`. Retired raw keys in
+JSON data cause an error before raw output or field fallback, including when
+the retired value is null or the replacement key is also present.
+The error names the retired key and its replacement. Stored objects must be
+migrated explicitly; no old-key fallback is provided. `validate_raw_keys`
+checks both formats at storage and incoming JSON boundaries.
 
 ### Parsing
 
@@ -106,8 +113,11 @@ The `vcard` module handles vCard 4.0 contact text.
 When `full_name` is absent, `FN` falls back to JSContact `name.full`, then to
 the UID. Output lines use CRLF termination.
 
-`RAW_VCARD_KEY` is `cosmix:rawVCard`. When the JSON data contains a string under
+`RAW_VCARD_KEY` is `mixos:rawVCard`. When the JSON data contains a string under
 this key, `contact_to_vcf` returns it unchanged.
+
+`contact_to_vcf` and `raw_vcard` return `anyhow::Result` and reject retired
+raw keys before either raw output or structured field fallback.
 
 ### Parsing
 
@@ -139,6 +149,9 @@ the corresponding property unchanged.
 `primary_phone` reads the first phone number from the JSContact `phones` map.
 If that map has no usable number, it reads the first `TEL` value from a stashed
 raw vCard.
+
+`primary_phone` and `set_primary_phone` also return `anyhow::Result` and
+reject retired raw keys before reading or changing the contact.
 
 `set_primary_phone` updates the first existing `phones` entry while preserving
 its sibling fields and other phone entries. If no entry exists, it creates
@@ -179,6 +192,6 @@ The crate declares no Cargo features.
 | --- | --- |
 | `serde_json` | Structured JSCalendar and JSContact values and deterministic ETag inputs. |
 | `chrono` | UTC calendar date-times. |
-| `anyhow` | Parse errors returned by the public parsing functions. |
+| `anyhow` | Parse errors and retired wire key errors from representation and phone helpers. |
 | `icalendar` | iCalendar parsing and event emission. |
 | `blake3` | Strong content hashing. |

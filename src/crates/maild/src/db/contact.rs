@@ -58,7 +58,9 @@ fn row_to_book(row: &rusqlite::Row<'_>) -> rusqlite::Result<AddressBook> {
 fn row_to_contact(row: &rusqlite::Row<'_>) -> rusqlite::Result<Contact> {
     let data_json: String = row.get(4)?;
     let data: serde_json::Value = serde_json::from_str(&data_json).unwrap_or(serde_json::json!({}));
-    let phone = cosmix_lib_davproto::vcard::primary_phone(&data);
+    let phone = cosmix_lib_davproto::vcard::primary_phone(&data).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, error.into())
+    })?;
 
     Ok(Contact {
         id: row.get(0)?,
@@ -455,6 +457,7 @@ pub async fn conditional_upsert_contact_by_uid(
     let conn = conn.clone();
     let ab = addressbook_id.to_string();
     let uid = uid.to_string();
+    cosmix_lib_davproto::validate_raw_keys(data)?;
     let data_json = serde_json::to_string(data)?;
     let full_name = full_name.map(|s| s.to_string());
     let email = email.map(|s| s.to_string());
@@ -595,6 +598,7 @@ fn read_contact_etag_row(
             let (id, full_name, email, company, data_json) = row?;
             let data: serde_json::Value =
                 serde_json::from_str(&data_json).unwrap_or(serde_json::json!({}));
+            cosmix_lib_davproto::validate_raw_keys(&data)?;
             let etag = cosmix_lib_davproto::etag::for_contact(
                 uid,
                 full_name.as_deref(),
@@ -631,6 +635,7 @@ pub async fn create_contact(
     let conn = conn.clone();
     let ab_id_str = addressbook_id.to_string();
     let uid = uid.to_string();
+    cosmix_lib_davproto::validate_raw_keys(data)?;
     let data_json = serde_json::to_string(data)?;
     let full_name = full_name.map(|s| s.to_string());
     let email = email.map(|s| s.to_string());
@@ -671,6 +676,7 @@ pub async fn update_contact(
 ) -> Result<bool> {
     let conn = conn.clone();
     let id_str = id.to_string();
+    cosmix_lib_davproto::validate_raw_keys(data)?;
     let data_json = serde_json::to_string(data)?;
     let full_name = full_name.map(|s| s.to_string());
     let email = email.map(|s| s.to_string());

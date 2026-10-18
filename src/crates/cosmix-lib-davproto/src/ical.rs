@@ -16,7 +16,16 @@ use icalendar::{
 /// lossless round-trip (alarms, RRULE, X-props the v1 mapper doesn't
 /// model survive); JSCalendar objects created via JMAP have no such key
 /// and are emitted from their fields.
-pub const RAW_ICAL_KEY: &str = "cosmix:rawICalendar";
+pub const RAW_ICAL_KEY: &str = "mixos:rawICalendar";
+
+/// Retired wire key, used only to reject data that needs migration.
+pub const RETIRED_ICAL_KEY: &str = "cosmix:rawICalendar";
+
+/// Read the verbatim representation, rejecting retired keys before any fallback.
+pub fn raw_ical(data: &serde_json::Value) -> anyhow::Result<Option<&str>> {
+    crate::validate_raw_keys(data)?;
+    Ok(data.get(RAW_ICAL_KEY).and_then(|v| v.as_str()))
+}
 
 /// Build a single-VEVENT `VCALENDAR` string from an event's indexed
 /// fields plus its JSCalendar `data` (for DESCRIPTION / LOCATION). If the
@@ -29,9 +38,9 @@ pub fn event_to_ics(
     end: Option<DateTime<Utc>>,
     updated: Option<DateTime<Utc>>,
     data: &serde_json::Value,
-) -> String {
-    if let Some(raw) = data.get(RAW_ICAL_KEY).and_then(|v| v.as_str()) {
-        return raw.to_string();
+) -> anyhow::Result<String> {
+    if let Some(raw) = raw_ical(data)? {
+        return Ok(raw.to_string());
     }
     let mut ev = Event::new();
     ev.uid(uid);
@@ -69,7 +78,7 @@ pub fn event_to_ics(
     let mut cal = Calendar::new();
     cal.push(event);
     cal.name("Cosmix");
-    cal.done().to_string()
+    Ok(cal.done().to_string())
 }
 
 /// The fields a DAV PUT extracts from an incoming iCalendar VEVENT: the
@@ -263,6 +272,29 @@ mod tests {
     use chrono::TimeZone;
 
     #[test]
+    fn retired_ical_key_errors_before_raw_or_field_fallback() {
+        let expected = format!(
+            "retired wire key {RETIRED_ICAL_KEY:?} present: migrate the stored object to {RAW_ICAL_KEY:?}"
+        );
+        for retired_value in [serde_json::json!("old body"), serde_json::Value::Null] {
+            let mut data = serde_json::json!({ "title": "Field fallback" });
+            data[RETIRED_ICAL_KEY] = retired_value;
+            for current_value in [None, Some("current body")] {
+                if let Some(raw) = current_value {
+                    data[RAW_ICAL_KEY] = serde_json::json!(raw);
+                }
+                assert_eq!(raw_ical(&data).unwrap_err().to_string(), expected);
+                assert_eq!(
+                    event_to_ics("u", Some("Field fallback"), None, None, None, &data)
+                        .unwrap_err()
+                        .to_string(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
     fn emits_valid_vevent() {
         let start = Utc.with_ymd_and_hms(2026, 6, 9, 10, 0, 0).unwrap();
         let end = Utc.with_ymd_and_hms(2026, 6, 9, 11, 0, 0).unwrap();
@@ -277,7 +309,7 @@ mod tests {
             Some(end),
             None,
             &data,
-        );
+        ).unwrap();
         assert!(ics.contains("BEGIN:VCALENDAR"));
         assert!(ics.contains("BEGIN:VEVENT"));
         assert!(ics.contains("UID:evt-1"));
@@ -309,7 +341,7 @@ mod tests {
         let p = parse_ics(ics).unwrap();
         // event_to_ics must return the verbatim body (incl. the RRULE the
         // v1 mapper doesn't model), not a re-emitted projection.
-        let out = event_to_ics("x", Some("S"), None, None, None, &p.data);
+        let out = event_to_ics("x", Some("S"), None, None, None, &p.data).unwrap();
         assert_eq!(out, ics);
         assert!(out.contains("RRULE:FREQ=WEEKLY"));
     }
