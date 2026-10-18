@@ -3415,7 +3415,9 @@ impl MailStore for SqliteMailStore {
 
         // Sort keys mirror the in-memory order this replaces: the newest-first
         // tiebreak within an equal key, then ItemId, with the whole ordering
-        // reversed for descending.
+        // reversed for descending. From sort lowercases with SQLite `lower()`,
+        // which folds ASCII only: non-ASCII addresses may order differently
+        // from the Rust `to_lowercase` order this replaced. Accepted.
         let order_sql = match sort {
             EmailSort::ReceivedAtDesc => "i.received_at DESC, i.id DESC",
             EmailSort::ReceivedAtAsc => "i.received_at ASC, i.id ASC",
@@ -3432,70 +3434,17 @@ impl MailStore for SqliteMailStore {
                 "lower(COALESCE(e.from_addr, '')) DESC, i.received_at ASC, i.id DESC"
             }
         };
-        let want_subject = matches!(sort, EmailSort::SubjectAsc | EmailSort::SubjectDesc);
-
         let page_sql = format!(
             "SELECT i.id FROM item i LEFT JOIN mail_envelopes e ON e.item_id = i.id \
              WHERE {where_sql} ORDER BY {order_sql} LIMIT ? OFFSET ?"
         );
         let count_sql = format!("SELECT COUNT(*) FROM item i WHERE {where_sql}");
 
-        // Rows written before migration v1.7 carry an empty `normalized_subject`.
-        // Fill those in first so a subject sort does not misplace them. Rows
-        // whose normalised form is genuinely empty are re-probed each time.
-        fn backfill_normalized_subjects(conn: &rusqlite::Connection) -> cosmix_mds::Result<()> {
-            let pending: Vec<(String, String)> = {
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT item_id, subject FROM mail_envelopes \
-                         WHERE normalized_subject = '' AND subject <> ''",
-                    )
-                    .map_err(|e| cosmix_mds::Error::Other(format!("prepare backfill: {e}")))?;
-                let rows = stmt
-                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-                    .map_err(|e| cosmix_mds::Error::Other(format!("query backfill: {e}")))?;
-                rows.collect::<std::result::Result<Vec<_>, _>>()
-                    .map_err(|e| cosmix_mds::Error::Other(format!("row backfill: {e}")))?
-            };
-            for (item_id, subject) in pending {
-                let norm = subject::normalize_subject(&subject);
-                if norm.is_empty() {
-                    continue;
-                }
-                conn.execute(
-                    "UPDATE mail_envelopes SET normalized_subject = ?1 WHERE item_id = ?2",
-                    rusqlite::params![norm, item_id],
-                )
-                .map_err(|e| cosmix_mds::Error::Other(format!("update backfill: {e}")))?;
-            }
-            Ok(())
-        }
-
-        fn count_pending_subjects(conn: &rusqlite::Connection) -> cosmix_mds::Result<i64> {
-            conn.query_row(
-                "SELECT COUNT(*) FROM mail_envelopes \
-                 WHERE normalized_subject = '' AND subject <> ''",
-                [],
-                |r| r.get(0),
-            )
-            .map_err(|e| cosmix_mds::Error::Other(format!("count pending subjects: {e}")))
-        }
-
-        // Reads take no write gate, so a query never queues behind
-        // deliveries or flag writes. The backfill is the only write, and it
-        // runs only while rows still need it.
-        if want_subject {
-            let pending = self
-                .mds
-                .with_set_read(&set, |conn| count_pending_subjects(conn))
-                .map_err(|e| anyhow!(e))?;
-            if pending > 0 {
-                self.mds
-                    .with_set_tx(&set, |tx| backfill_normalized_subjects(tx.tx()))
-                    .map_err(|e| anyhow!(e))?;
-            }
-        }
-
+        // Queries are read-only. Subject sort uses the stored
+        // `normalized_subject`, so rows written before migration v1.7 (empty
+        // default) sort as an empty subject. Their threading is unaffected:
+        // the thread lookup reads the same column, and a query must never
+        // change it. Backfilling those rows is an explicit admin action.
         let (ids, total) = self
             .mds
             .with_set_read(&set, |conn| {
