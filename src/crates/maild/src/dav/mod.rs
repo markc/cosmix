@@ -105,9 +105,33 @@ async fn well_known() -> Response {
     (StatusCode::MOVED_PERMANENTLY, [(header::LOCATION, "/dav/")]).into_response()
 }
 
+/// Access-log wrapper around [`dispatch_inner`]: one `info` line per `/dav/…`
+/// request with method, path, User-Agent and response status. Target
+/// `maild::dav::access` so it can be toggled on its own via `RUST_LOG`.
+async fn dispatch(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_owned();
+    let user_agent = req
+        .headers()
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-")
+        .to_owned();
+    let resp = dispatch_inner(State(state), req).await;
+    tracing::info!(
+        target: "maild::dav::access",
+        method = %method,
+        path = %path,
+        user_agent = %user_agent,
+        status = resp.status().as_u16(),
+        "DAV request",
+    );
+    resp
+}
+
 /// Single entry point for every `/dav/…` request: authenticate, parse the
 /// path, bind the account, then branch on method.
-async fn dispatch(State(state): State<Arc<AppState>>, req: Request) -> Response {
+async fn dispatch_inner(State(state): State<Arc<AppState>>, req: Request) -> Response {
     let (parts, body) = req.into_parts();
 
     // OPTIONS is an unauthenticated capability probe (RFC 4918 §9.1):
