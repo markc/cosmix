@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! vtoken registry — the maild-owned store + per-message resolver for
 //! opaque (`<token>@<domain>`) sender-locked addresses.
 //!

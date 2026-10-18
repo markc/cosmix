@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! MIME view selection — `match.view = "plain"` should not match
 //! HTML content and vice versa. Plus malformed-MIME → mime_parse_error
 //! implicit rule.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! JMAP Email methods (RFC 8621).
 
 use std::sync::Arc;

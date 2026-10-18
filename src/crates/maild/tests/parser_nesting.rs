@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Direct dependency tests: deliberately bypass maild's MIME preflight.
 use mail_parser::{Message, MessageParser, PartType};
 

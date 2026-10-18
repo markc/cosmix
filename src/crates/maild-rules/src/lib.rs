@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! `maild-rules` — deterministic rule engine, second stage of
 //! maild's inbound DATA filter pipeline.
 //!

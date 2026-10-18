@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Tests verdict-shape priority: allowlist > blocklist > mail-auth
 //! hard-fail > structural anomaly > score breach > continue. Plus
 //! shadow-mode downgrade behavior.

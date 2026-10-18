@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! `maild.stats.*` Bus action handlers — read-only admin/observability
 //! surface for the maild human and Bus manager.
 //!

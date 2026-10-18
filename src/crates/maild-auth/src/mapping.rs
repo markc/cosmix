@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Pure-function mappers from `mail_auth` output types to our public
 //! `maild-auth` types.
 //!

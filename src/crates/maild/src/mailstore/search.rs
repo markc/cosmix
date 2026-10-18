@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! mail_search FTS5 projection — Phase 8e gate 2.
 //!
 //! The `mail_search` virtual table is a contentless FTS5 sidecar

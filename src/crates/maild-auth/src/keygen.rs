@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! DKIM keypair generation — RSA-2048 (PKCS1 PEM) and Ed25519 (PKCS8 PEM).
 //!
 //! Thin wrapper around `mail_auth::dkim::generate::DkimKeyPair` that

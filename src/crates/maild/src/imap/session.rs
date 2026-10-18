@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Per-connection IMAP session driver.
 //!
 //! Phase 1 dispatch: CAPABILITY / NOOP / LOGOUT / ID / LOGIN /

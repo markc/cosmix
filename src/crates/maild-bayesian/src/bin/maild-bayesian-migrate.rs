@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Phase 0 placeholder for the migration tool. The full tool, which
 //! converts a spamlite v0.4.1 database into the maild-bayesian
 //! v2 schema (adding `model_version` + `seeded_from` columns), lands

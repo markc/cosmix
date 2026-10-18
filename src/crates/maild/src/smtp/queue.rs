@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Outbound SMTP queue — SQLite-backed message queue.
 //!
 //! Task 5.4b: queue rows now carry `blob_hash` (hex-encoded

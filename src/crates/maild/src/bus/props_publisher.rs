@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Maild's [`DispatchPublisher`] bridge to `noded`.
 //!
 //! The substrate's per-namespace fan-out task asks this publisher to

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Per-verb command handlers.
 //!
 //! Phase 1 shipped CAPABILITY, NOOP, LOGOUT, ID, LOGIN, AUTHENTICATE.

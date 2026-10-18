@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Golden-score regression for maild's policy wrapper around spamlite.
 //!
 //! The first 52 fixture lines pin the pre-engine-swap scores bit-for-bit at the

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! RFC 5256 §2.1 "base subject" normalization.
 //!
 //! Used as the threading-key fallback after In-Reply-To / References

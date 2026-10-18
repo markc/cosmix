@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! `NAMESPACE` — RFC 2342, also referenced by RFC 9051 capability
 //! advertisement.
 //!

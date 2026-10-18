@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! HTTP Basic auth helper — shared between JMAP, SMTP, and the token
 //! issue endpoint. The `Authorization`-header dispatch (Basic vs Bearer)
 //! lives in [`super::authenticate`]; this module owns the Basic half.

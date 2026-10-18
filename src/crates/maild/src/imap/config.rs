@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! IMAP server configuration (Phase 1).
 //!
 //! Mirrors the Phase-1 TOML surface in `_doc/maild/imap.md`. Defaults

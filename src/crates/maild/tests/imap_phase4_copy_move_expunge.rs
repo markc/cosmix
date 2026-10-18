@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! End-to-end Phase 4 IMAP tests — COPY / MOVE / EXPUNGE (RFC 9051
 //! §6.4.3 / §6.4.7, RFC 6851, RFC 4315 §2.1 + §3 COPYUID).
 //!

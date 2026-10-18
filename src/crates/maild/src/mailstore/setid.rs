@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! `Account.id` ↔ `cosmix-mds::SetId` binding.
 //!
 //! We derive each account's MDS `SetId` deterministically from its

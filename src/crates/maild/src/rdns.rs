@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Cached reverse-DNS (PTR) lookups for mail logging.
 //!
 //! ## Why this module exists

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! JMAP Calendar + CalendarEvent methods (JSCalendar, RFC 8984).
 
 use anyhow::Result;

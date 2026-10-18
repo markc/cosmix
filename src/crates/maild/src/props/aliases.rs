@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! SPEC 12 property-substrate namespace `maild.aliases` — Phase 1
 //! local-target single-hop email aliases.
 //!

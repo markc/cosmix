@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! JMAP change tracking (modification sequences).
 
 use std::sync::{Arc, Mutex};

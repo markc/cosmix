@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! PROPFIND (RFC 4918 §9.1) — discovery + collection listing.
 //!
 //! M1 returns a fixed, server-chosen property set for each resource kind

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! `maild.verdict` topic — one event per durably delivered inbound
 //! recipient.
 //!

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! The vtoken HMAC server secret + keyed-token hashing.
 //!
 //! The opaque capability token is looked up by `HMAC-SHA256(server_secret,

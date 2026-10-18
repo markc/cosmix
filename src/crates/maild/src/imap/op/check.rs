@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! `CHECK` (RFC 3501 §6.4.1 / RFC 9051 §6.4.1).
 //!
 //! CHECK requests a checkpoint of the currently selected mailbox —

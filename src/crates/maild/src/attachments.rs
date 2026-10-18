@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Bounded MIME inspection and account-bound, hash-bound part identifiers.
 //!
 //! Download bytes come from transfer-decoding raw ranges, never from the

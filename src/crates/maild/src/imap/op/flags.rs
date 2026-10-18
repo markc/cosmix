@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Shared IMAP flag-atom parsing + rendering for STORE / APPEND / FETCH — the
 //! single implementation that replaces the hand-synced copies these ops
 //! previously each carried.

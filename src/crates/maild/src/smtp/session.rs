@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! SMTP session state machine.
 //!
 //! Handles the SMTP conversation: EHLO → STARTTLS → AUTH → MAIL FROM → RCPT TO → DATA.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Bearer-token auth end-to-end (SSR PIM Phase 2, Slice 1).
 //!
 //! Stands up an in-process maild and walks the token lifecycle:

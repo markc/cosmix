@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Inbound verification surface — DNS-coupled implementation.
 //!
 //! The pipeline is intentionally serial (with timeouts), not parallel:

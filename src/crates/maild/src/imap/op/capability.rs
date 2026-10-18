@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! `CAPABILITY` — legal in any state per RFC 9051.
 
 use crate::imap::capabilities;

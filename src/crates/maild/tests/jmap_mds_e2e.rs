@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! JMAP→MDS Phase 7 end-to-end smoke test (plan Task 7.1–7.3).
 //!
 //! Stands up an in-process maild via `maild::runtime::build_runtime`

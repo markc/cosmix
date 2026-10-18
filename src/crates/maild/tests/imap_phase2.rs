@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! End-to-end Phase 2 IMAP tests — LIST / LSUB / NAMESPACE.
 //!
 //! Uses the same in-process `handle_connection` harness as Phase 1

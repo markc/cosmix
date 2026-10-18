@@ -2,7 +2,7 @@
 name = "maild-auth"
 version = "0.2.1"
 edition.workspace = true
-license.workspace = true
+license = "MIT OR Apache-2.0"
 repository.workspace = true
 description = "SPF / DKIM / DMARC / ARC / iprev verification + DKIM signing + ARC sealing for maild"
 

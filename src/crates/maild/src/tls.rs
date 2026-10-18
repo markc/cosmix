@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! TLS surface for maild — re-exports the shared SNI resolver from
 //! `cosmix_daemon::tls::sni`, plus the [`ServerConfigCache`] and
 //! [`TlsSlot`] hot-swap primitives that the SMTP and IMAPS listeners

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! PUT + DELETE on object resources — ETag-guarded writes (RFC 4791 §5.3
 //! / RFC 6352 §6.3).
 //!

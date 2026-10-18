@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Public types — frozen R4 surface per spec §Public API.
 //!
 //! `Domain` is a borrowed-from-future `cosmix-lib-mail-types` shape;

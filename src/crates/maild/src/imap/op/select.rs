@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! `SELECT` / `EXAMINE` — RFC 9051 §6.3.1 / §6.3.2.
 //!
 //! Phase 2 T4 v1: resolve the wire mailbox name through

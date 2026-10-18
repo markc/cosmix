@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Production wiring for the maild HTTP/SMTP stack.
 //!
 //! `build_runtime(cfg, opts)` performs the long startup sequence that

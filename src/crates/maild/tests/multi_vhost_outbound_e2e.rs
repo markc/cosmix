@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Per-domain outbound DKIM signing and HELO selection via fake MX.
 //!
 //! Multi-vhost wire e2e for the *outbound* leg: the `multi_vhost_e2e`

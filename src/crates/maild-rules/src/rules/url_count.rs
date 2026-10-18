@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! `url_count` — fires when the extracted URL count exceeds the
 //! configured `gt` threshold (subject to
 //! `EngineConfig.url_extraction_cap` in `MatchInputs::url_count`).

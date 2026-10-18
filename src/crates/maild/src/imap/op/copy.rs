@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! `COPY` / `UID COPY` — RFC 9051 §6.4.7 with RFC 4315 `COPYUID`.
 //!
 //! Adds a new membership in the destination mailbox for every message

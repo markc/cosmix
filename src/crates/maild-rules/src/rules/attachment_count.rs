@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! `attachment_count` — fires when MIME attachment count crosses the
 //! threshold. With `executable_only`, only attachments matching the
 //! executable extension/content-type list are counted.

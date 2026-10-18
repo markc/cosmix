@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Outbound delivery worker — polls queue, delivers via SMTP with STARTTLS, handles retries.
 
 use std::collections::HashMap;

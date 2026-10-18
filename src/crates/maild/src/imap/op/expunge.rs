@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! `EXPUNGE` / `UID EXPUNGE` — RFC 9051 §6.4.3 / RFC 4315 §2.1.
 //!
 //! Permanently remove every message in the selected mailbox that has

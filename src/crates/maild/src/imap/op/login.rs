@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! `LOGIN <user> <password>` — RFC 9051 §6.2.3.
 //!
 //! Legal only in `NotAuthenticated`. Phase 1 accepts the simple

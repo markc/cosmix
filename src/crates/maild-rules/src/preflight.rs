@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! DNSBL preflight — per-classify async I/O gathered into one bounded
 //! step before the synchronous rule matcher loop runs.
 //!

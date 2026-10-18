@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Syslog-style, postfix/dovecot-compatible session + auth logging.
 //!
 //! ## Why this module exists

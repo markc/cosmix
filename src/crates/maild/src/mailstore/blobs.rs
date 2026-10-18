@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Account-scoped CAS ownership. Global byte presence is not authorisation.
 
 use super::{AccountId, BlobId, SqliteMailStore, account_id_to_setid};

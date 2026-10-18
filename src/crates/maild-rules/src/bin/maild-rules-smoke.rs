@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Smoke binary. Reads a single RFC 5322 message from stdin, runs it
 //! through the engine loaded with the v1.0 default pack, and prints
 //! the verdict + per-rule explanation.

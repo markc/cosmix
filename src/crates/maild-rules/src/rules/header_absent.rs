@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! `header_absent` — matches when the named header is missing.
 
 use crate::compiled::MatchInputs;

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Isolated actual noded → maild ABP submission. Never contacts an external MX.
 //! Run ignored with COSMIX_NATIVE_MAIL_NODED and COSMIX_NATIVE_MAIL_FIXTURE_DIR.
 

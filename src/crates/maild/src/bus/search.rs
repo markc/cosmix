@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! `maild.search.*` Bus action handlers.
 //!
 //! One action today: `maild.search.rebuild` — Phase 8e gate 3 admin

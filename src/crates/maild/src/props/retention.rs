@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! SPEC 12 property-substrate namespace for `maild.retention`.
 //!
 //! Singleton-cardinality namespace carrying the global mail-retention

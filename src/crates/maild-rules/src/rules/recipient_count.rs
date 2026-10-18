@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! `recipient_count` — fires when `RuleContext::envelope_to.len()`
 //! exceeds the configured `gt`.
 

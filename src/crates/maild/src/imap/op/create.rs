@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! `CREATE` — RFC 9051 §6.3.4.
 //!
 //! Phase 2 T5 v1: walk the hierarchical name top-down, creating

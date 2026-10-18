@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! IMAPS listener — implicit TLS on port 993 (RFC 8314).
 //!
 //! Mirrors the SMTP listener pattern (`crate::smtp::start`):

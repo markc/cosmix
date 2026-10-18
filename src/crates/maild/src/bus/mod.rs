@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Bus integration for maild.
 //!
 //! Phase 1: broker registration + dispatch skeleton.

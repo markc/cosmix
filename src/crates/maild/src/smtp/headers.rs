@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Header parsing helpers for the SMTP path. Currently exists solely
 //! to host `from_header_domain`, used by the outbound DKIM dispatch
 //! to align `d=` with the message's first `From:` address.

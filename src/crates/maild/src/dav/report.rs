@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! REPORT (RFC 4791 §7 / RFC 6352 §8) — multiget + query.
 //!
 //! v1 handles `calendar-multiget` / `addressbook-multiget` (return the

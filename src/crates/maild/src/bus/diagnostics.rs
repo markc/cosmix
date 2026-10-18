@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Exactly one diagnostic input, bounded before decoding or lane use. The
 //! legacy message_b64 carrier is the explicit compatibility exception to
 //! reference-only Bus traffic; new clients should use blob references.

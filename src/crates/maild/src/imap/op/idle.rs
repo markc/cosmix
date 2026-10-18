@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! `IDLE` — RFC 2177 (carried into RFC 9051 §6.3.13 as a normative
 //! reference).
 //!

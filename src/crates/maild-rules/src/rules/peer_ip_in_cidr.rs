@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! `peer_ip_in_cidr` — matches when `RuleContext::peer_ip` falls in any
 //! of the configured CIDR blocks.
 //!

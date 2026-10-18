@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! `MOVE` / `UID MOVE` — RFC 6851 (extension layered on RFC 9051).
 //!
 //! Atomic per-item move: remove the membership of `item_id` in `src`

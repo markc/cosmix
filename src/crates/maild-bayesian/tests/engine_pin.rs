@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Standing guard for the spamlite engine pin.
 //!
 //! maild consumes the engine as a git dependency pinned by `rev` in this

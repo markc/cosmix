@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Scoring arithmetic — composite raw_score from multi-match, threshold
 //! recorded on Explanation, per-account threshold override.
 

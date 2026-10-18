@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! IMAP server — IMAPS (implicit TLS, port 993) per RFC 9051.
 //!
 //! Phase 1 scope (per `_doc/maild/imap.md` §"Phase 1"):

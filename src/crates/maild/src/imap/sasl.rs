@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! SASL mechanism parsers (Phase 1: PLAIN, LOGIN; OAUTHBEARER stub).
 //!
 //! Phase 1 supports two mechanism families:

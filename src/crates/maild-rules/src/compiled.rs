@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Compiled rule pack — what the engine sees after the loader has
 //! parsed `default.conf.mix` and dispatched on the `match` `kind`.
 //!

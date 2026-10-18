@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! End-to-end Phase 4 IMAP tests — STORE / UID STORE flag mutation.
 //!
 //! Mirrors the `imap_phase3.rs` harness: in-process duplex socket, no

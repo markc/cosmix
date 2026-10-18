@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! `maild-bayesian` — the async, per-account wrapper around the
 //! [spamlite](https://github.com/markc/spamlite) engine used by the third stage
 //! of `maild`'s inbound DATA filter pipeline.

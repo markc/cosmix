@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! IMAP response builders.
 //!
 //! Phase 1 needs only tagged status responses, untagged

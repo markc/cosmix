@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! `maild.tls.reload` Bus verb — Phase 5a-commit-2 hot-swap entry
 //! point. Walks the substrate's `maild.domains` rows, merges every
 //! row's `tls_identity_name` with the **startup-snapshot**

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! DAV tombstones — retain `(collection_id, uid)` for deleted objects so
 //! RFC 6578 sync-collection can report a removed member's href after its
 //! live row is gone. Written in the same DB transaction as the delete.

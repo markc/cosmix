@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Opaque bearer tokens for JMAP auth (SSR PIM Phase 2).
 //!
 //! Three HTTP endpoints on the maild router, beside the `/jmap` service

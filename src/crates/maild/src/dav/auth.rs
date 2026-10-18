@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! DAV auth — reuses `auth::authenticate` (Basic or Bearer) and adds the
 //! `WWW-Authenticate` challenge a DAV client needs (the JMAP path returns
 //! 401 JSON with no challenge header, so a DAV client never prompts for

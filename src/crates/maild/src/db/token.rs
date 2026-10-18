@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! `account_tokens` storage — opaque bearer tokens for JMAP auth.
 //!
 //! Only the **SHA-256 (hex)** of a token is persisted; the plaintext is

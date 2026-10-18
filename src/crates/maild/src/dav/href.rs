@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! DAV URL ⇆ resource parsing + account binding.
 //!
 //! All DAV resources live under `/dav/…`. The `{account}` segment is the

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! `MailStore`-facing record types.
 //!
 //! These shapes are the adapter's externally-visible row types

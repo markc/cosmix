@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! `AUTHENTICATE <mechanism> [<initial-response>]` — RFC 9051 §6.2.2.
 //!
 //! Phase 1 parses the AUTHENTICATE command line and surfaces the

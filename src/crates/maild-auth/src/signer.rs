@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Outbound DKIM signing + ARC sealing surface.
 //!
 //! `sign_dkim` is fully implemented (design doc Phase 3): it looks up

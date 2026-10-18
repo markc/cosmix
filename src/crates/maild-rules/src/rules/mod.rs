@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Rule kinds. One module per kind; each exposes a `Rule` struct +
 //! a `match_against(ctx) -> bool` (or `-> u32` for count-based kinds)
 //! method. Phase 0 only declares the modules so the public surface

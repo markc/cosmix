@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! `APPEND` — RFC 9051 §6.3.12 / RFC 4315 (UIDPLUS APPENDUID).
 //!
 //! Phase 4 T14 ships APPEND with a single trailing literal (sync or

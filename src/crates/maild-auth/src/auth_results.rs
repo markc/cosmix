@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Authentication-Results header composer (RFC 8601).
 //!
 //! Phase 0: empty surface; the actual builder lands in Phase 2 once

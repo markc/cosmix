@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Authentication module.
 //!
 //! [`authenticate`] is the single entry point for the JMAP/DAV surfaces:

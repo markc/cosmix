@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! `mail_auth` — fires when `maild-auth`'s `VerifyResult`
 //! matches the configured outcome predicates. Each `Option<…>` field
 //! that is `Some` adds an AND-clause; the rule fires when all

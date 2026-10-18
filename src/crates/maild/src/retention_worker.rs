@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! In-process retention worker — periodically trims aged Junk/Trash
 //! memberships across every account, the dovecot `expunge … savedbefore
 //! Nd` cron analog. Mirrors the [`crate::mailstore::expiry::ExpiryWorker`]

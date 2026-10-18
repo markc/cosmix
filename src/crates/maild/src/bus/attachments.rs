@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! MIME inspection and exports. Resolve account ownership before touching the
 //! lane or consulting export bookkeeping; references do not grant mail access.
 

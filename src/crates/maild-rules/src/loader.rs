@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Rule pack loader (`.conf.mix`).
 //!
 //! Reads a `default.conf.mix` (or operator-supplied) file, dispatches

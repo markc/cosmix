@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Validated blobd references. No DB lock survives an HTTP await. Concurrent
 //! exporters converge on one row; blobd's owner/hash pin is idempotent too.
 

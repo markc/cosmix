@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! End-to-end IMAP IDLE (RFC 2177) tests — Phase 5 T18.
 //!
 //! Mirrors the harness in `imap_phase4_copy_move_expunge.rs`: in-

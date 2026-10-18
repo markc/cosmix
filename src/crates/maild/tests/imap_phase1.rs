@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! End-to-end Phase 1 IMAP tests against an in-process session.
 //!
 //! Bypasses TLS by feeding `handle_connection` a `tokio::io::duplex`

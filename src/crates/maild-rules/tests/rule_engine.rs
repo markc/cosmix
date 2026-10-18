@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Per-kind smoke tests. One positive case per kind, plus a few
 //! negative controls to confirm matchers don't fire on clean ham.
 

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! `LOGOUT` — RFC 9051 §6.1.3.
 //!
 //! Returns `* BYE` then tagged `OK LOGOUT completed`. The caller

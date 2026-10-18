@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Rule engine — `RuleEngine` trait + `DefaultRuleEngine`.
 //!
 //! Phase 1 wires real classification: parse the message into MIME

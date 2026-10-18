@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! IMAP junk-boundary retrain drain worker.
 //!
 //! `move_message` / `copy_message` enqueue a `mail_retrain_outbox`

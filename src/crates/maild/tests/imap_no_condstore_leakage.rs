@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Regression guards against accidental CONDSTORE / QRESYNC leakage.
 //!
 //! The v1 capability subset deliberately omits CONDSTORE (RFC 7162)

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Local blobd byte lane. Bus carries discovery and references, never new byte
 //! payloads. Origin in an input reference is provenance, not a routing target.
 

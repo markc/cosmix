@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! `ID` (RFC 2971) — client/server identification exchange.
 //!
 //! Phase 1 acceptance does not require parsing the client's `ID`

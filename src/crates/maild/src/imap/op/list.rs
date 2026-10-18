@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! `LIST` — RFC 9051 §6.3.9.
 //!
 //! Phase 2 T3 v1: walk the per-account MailboxRecord set,

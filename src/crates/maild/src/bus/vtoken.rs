@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! `maild.vtoken.*` Bus verbs — the vtoken registry's operator control surface
 //! (plan `_plan/2026-06-21-vtoken-dispatch-implementation.md` Stage C). Replaces
 //! the hand-SQL seeding: an operator can `add` / `list` / `rotate` / `disable` /

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! DAV multistatus XML — hand-rolled writer (RFC 4918 §14).
 //!
 //! M1 emits discovery responses only (principal, home-sets, collection

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! `STORE` / `UID STORE` — RFC 9051 §6.4.6 / §6.4.8.
 //!
 //! Mutates per-message system flags on the selected mailbox.

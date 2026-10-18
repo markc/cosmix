@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! `LSUB` — RFC 9051 §6.3.10 (preserved for legacy clients).
 //!
 //! Same pipeline as [`crate::imap::op::list`] but filtered to rows

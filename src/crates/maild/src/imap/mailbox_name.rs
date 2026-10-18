@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Mailbox-name encoder / decoder for IMAP Phase 2 (T3).
 //!
 //! Bridges the gap between [`crate::mailstore::MailboxRecord`] —

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! SPEC 12 Phase 3 C2 — `DefaultRuleEngine::set_config` atomic swap.
 //!
 //! The engine's nine globals now live behind `Arc<RwLock<EngineConfig>>`.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Phase 8d.4 — MailStore + expiry-worker integration tests.
 //!
 //! Acceptance bar (per `_doc/2026-04-29-cosmix-mds-plan.md` §8d):

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! DNSBL lookup — RFC 5782 reverse-IP query against a zone, with a
 //! per-(ip,zone) cache for cacheable verdicts and a leader/follower
 //! single-flight gate so a burst of mail from the same peer fans into

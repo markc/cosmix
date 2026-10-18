@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Reconstruct the per-domain DKIM `MailAuthSigner` from current state.
 //!
 //! Phase 4 introduces a second source of truth for DKIM signer rows

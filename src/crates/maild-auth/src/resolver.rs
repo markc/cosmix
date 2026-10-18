@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! DNS resolver coordination.
 //!
 //! Per spec §DNS resolver the default is `hickory-resolver` configured

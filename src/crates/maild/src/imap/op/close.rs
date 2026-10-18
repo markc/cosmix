@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! `CLOSE` (RFC 9051 §6.4.2) / `UNSELECT` (RFC 3691 §2).
 //!
 //! Phase 2 T4: both verbs transition `Selected(_)` → `Authenticated`

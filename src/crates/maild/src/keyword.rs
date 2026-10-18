@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Canonical user-keyword (IMAP "Tags" / JMAP custom `keywords`) parsing,
 //! validation, and normalisation — the single source of truth shared by the
 //! IMAP (`imap::op`) and JMAP (`jmap::email`) wire layers.

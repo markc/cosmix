@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Upload-staging expiry worker.
 //!
 //! v1.1 amendment §1 ("TTL policy"): JMAP `blob/upload` and

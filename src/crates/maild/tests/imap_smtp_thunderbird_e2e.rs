@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! T20 — Thunderbird MVP end-to-end smoke.
 //!
 //! Stands up the *real* maild binary surface end-to-end:

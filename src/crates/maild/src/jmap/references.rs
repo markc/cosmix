@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! JMAP ResultReferences (RFC 8620 §3.7).
 //!
 //! A method argument named with a leading `#` is a back-reference to an earlier

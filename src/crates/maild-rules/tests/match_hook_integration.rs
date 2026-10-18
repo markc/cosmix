@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Integration test for the per-rule match-hook plumbing (commit 3 of
 //! `_doc/planned/maild-rules-phase2.md`).
 //!

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! End-to-end integration test for the DNSBL preflight + matcher
 //! path. Builds a `DefaultRuleEngine` with a fake `DnsblLookup`
 //! installed and a rule pack containing `peer_ip_in_dnsbl` rules,

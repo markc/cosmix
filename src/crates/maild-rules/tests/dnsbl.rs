@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! DNSBL wrapper integration tests — exercises [`Dnsbl<R>`] cache +
 //! single-flight against a counting fake resolver. The hickory-backed
 //! production impl is behind the `dnsbl` feature and not exercised

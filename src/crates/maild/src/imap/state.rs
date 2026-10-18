@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! IMAP session state machine per RFC 9051 §3.
 //!
 //! `NotAuthenticated` → `Authenticated` → `Selected(SelectedMailbox)`

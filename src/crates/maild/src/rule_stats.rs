@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! Process-lifetime monotonic counters for the rule engine, shared
 //! between the inbound DATA path and the Bus `maild.rules.stats`
 //! action.

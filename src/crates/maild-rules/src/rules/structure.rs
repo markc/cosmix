@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 Mark Constable <mc@mixos.dev>
+
 //! `structure` — composite structural-anomaly checks (HTML-only,
 //! deep nesting, missing Message-ID, executable attachments).
 
